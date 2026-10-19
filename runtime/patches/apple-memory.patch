@@ -1,0 +1,55 @@
+--- a/runtime/include/nx/cpu.h
++++ b/runtime/include/nx/cpu.h
+@@ -19,8 +19,14 @@
+ // mappings there fail) and puts the dyld shared cache at 0x1_8000_0000..0x3_0000_0000, so the guest address space
+ // moves to 0x3_0000_0000..0xF_FFFF_FFFF there, still inside Horizon's 39 bits. Generated code adds each module's
+ // offset to this.
++#if defined(__APPLE__) && defined(NX_APPLE_HIGH_MEMORY) && defined(NX_BASE)
++#error NX_APPLE_HIGH_MEMORY requires its profile NX_BASE
++#endif
+ #ifndef NX_BASE
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && defined(NX_APPLE_HIGH_MEMORY)
++// Explicit apple-high-v1 profile: rebuild runtime AND every generated module.
++#define NX_BASE 0x0000007000000000ull
++#elif defined(__APPLE__)
+ #define NX_BASE 0x0000000300000000ull
+ #else
+ #define NX_BASE 0x0000004000000000ull
+--- a/runtime/include/nx/runtime.h
++++ b/runtime/include/nx/runtime.h
+@@ -26,7 +26,15 @@
+ constexpr uint64_t kStackSize = 0x100000000ull;
+ constexpr uint64_t kKernelSize = 0x100000000ull;
+ constexpr uint64_t kThunkSize = 0x100000ull;
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && defined(NX_APPLE_HIGH_MEMORY)
++// apple-high-v1: no fallback or relocation; all pointers remain direct host pointers.
++constexpr uint64_t kHeapBase = 0x7100000000ull;
++constexpr uint64_t kAliasBase = 0x7300000000ull;
++constexpr uint64_t kAliasSize = 0x400000000ull;
++constexpr uint64_t kStackBase = 0x7800000000ull;
++constexpr uint64_t kKernelBase = 0x7900000000ull;
++constexpr uint64_t kThunkBase = 0x7B00000000ull;
++#elif defined(__APPLE__)
+ // macOS: only 0x3_0000_0000..0xF_FFFF_FFFF is free below 0x70_0000_0000 (see NX_BASE).
+ constexpr uint64_t kHeapBase = 0x400000000ull;
+ constexpr uint64_t kAliasBase = 0x600000000ull;
+--- a/runtime/src/platform_mac.cpp
++++ b/runtime/src/platform_mac.cpp
+@@ -122,6 +122,13 @@
+     }
+     if (addr < lo) std::memset(reinterpret_cast<void*>(addr), 0, lo - addr);
+     if (hi < addr + size) std::memset(reinterpret_cast<void*>(hi), 0, addr + size - hi);
+-    madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_FREE);
+-    mprotect(reinterpret_cast<void*>(lo), hi - lo, PROT_NONE);
++    // MADV_FREE may retain old bytes indefinitely. Zero before lazy reclamation;
++    // either retained zeros or newly faulted anonymous zeros are safe on reuse.
++    // Only complete host pages lose access; shared 4 KiB edge neighbours stay RW.
++    // decommit has no error return: never silently report an unprotected guard.
++    if (mprotect(reinterpret_cast<void*>(lo), hi - lo, PROT_READ | PROT_WRITE) != 0) std::abort();
++    std::memset(reinterpret_cast<void*>(lo), 0, hi - lo);
++    // Advice is optional after explicit zeroing; protection is mandatory.
++    (void)madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_FREE);
++    if (mprotect(reinterpret_cast<void*>(lo), hi - lo, PROT_NONE) != 0) std::abort();
+ }

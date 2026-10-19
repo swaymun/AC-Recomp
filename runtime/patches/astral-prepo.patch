@@ -1,0 +1,160 @@
+diff --git a/runtime/src/svc_misc.cpp b/runtime/src/svc_misc.cpp
+--- a/runtime/src/svc_misc.cpp
++++ b/runtime/src/svc_misc.cpp
+@@ -1,5 +1,12 @@
+ // Miscellaneous services; Astral parental context and logging are validated adapters.
+ #include <cstdlib>
++#include <filesystem>
++#include "platform.h"
++#if defined(_WIN32)
++#include <io.h>
++#else
++#include <unistd.h>
++#endif
+ #include "ipc.h"
+
+ namespace nx {
+@@ -71,6 +78,143 @@
+     s.cmds[0] = [](IpcCtx& c) { c.push_object(parental_control(c, true)); return 0u; };
+     s.cmds[1] = [](IpcCtx& c) { c.push_object(parental_control(c, false)); return 0u; };
+ }
++
++// Local SaveReport storage only. Transmission is deliberately unsupported.
++// Wire evidence: SDK SaveReport(10102), SaveReportWithUser(10103).
++bool prepo_readable(Buffer b) {
++    if (!b.addr || !b.size || b.size > UINT64_MAX - b.addr) return false;
++    const auto end = b.addr + b.size;
++    while (b.addr < end) {
++        const auto v = vm_query(b.addr);
++        if (!(v.perm & 1) || v.addr > b.addr || !v.size ||
++            v.size > UINT64_MAX - v.addr || v.addr + v.size <= b.addr) return false;
++        b.addr = std::min(end, v.addr + v.size);
++    }
++    return true;
++}
++void prepo_report(const std::vector<uint8_t>& data) {
++    size_t p = 0;
++    auto take = [&](size_t n) {
++        if (n > data.size() - p) fatal("prepo: truncated report");
++        auto old = p; p += n; return old;
++    };
++    auto number = [&](size_t n) {
++        auto pos = take(n); uint32_t v = 0;
++        for (size_t i = 0; i < n; ++i) v = (v << 8) | data[pos + i];
++        return v;
++    };
++    auto string = [&](uint8_t tag) {
++        uint32_t n;
++        if ((tag & 0xe0) == 0xa0) n = tag & 31;
++        else if (tag == 0xd9) n = number(1);
++        else if (tag == 0xda) n = number(2);
++        else if (tag == 0xdb) n = number(4);
++        else { fatal("prepo: expected string"); }
++        if (n > 63) fatal("prepo: string exceeds supported report bound");
++        auto start = take(n);
++        // UTF-8 validation, including overlong encodings, surrogates and >U+10FFFF.
++        for (size_t i = start; i < start + n;) {
++            auto c = data[i++]; if (c < 0x80) continue;
++            unsigned count; uint32_t cp, minimum;
++            if (c >= 0xc2 && c <= 0xdf) { count=1; cp=c&31; minimum=0x80; }
++            else if (c >= 0xe0 && c <= 0xef) { count=2; cp=c&15; minimum=0x800; }
++            else if (c >= 0xf0 && c <= 0xf4) { count=3; cp=c&7; minimum=0x10000; }
++            else fatal("prepo: invalid UTF-8");
++            if (count > start+n-i) fatal("prepo: truncated UTF-8");
++            while (count--) { auto b=data[i++]; if ((b&0xc0)!=0x80) fatal("prepo: invalid UTF-8"); cp=(cp<<6)|(b&63); }
++            if (cp<minimum || cp>0x10ffff || (cp>=0xd800 && cp<=0xdfff)) fatal("prepo: invalid UTF-8");
++        }
++        return std::string(reinterpret_cast<const char*>(data.data()+start), n);
++    };
++    const auto tag = data[take(1)];
++    uint32_t count;
++    if ((tag & 0xf0) == 0x80) count = tag & 15;
++    else if (tag == 0xde) count = number(2);
++    else if (tag == 0xdf) count = number(4);
++    else fatal("prepo: expected report map");
++    if (count > 100) fatal("prepo: too many report fields");
++    std::map<std::string, bool> keys;
++    for (uint32_t i=0; i<count; ++i) {
++        auto key = string(data[take(1)]);
++        if (key.empty()) fatal("prepo: empty key");
++        for (size_t j=0; j<key.size(); ++j) {
++            char c=key[j];
++            if (!((c>='a'&&c<='z') || (c>='A'&&c<='Z') || c=='_' || (j && c>='0'&&c<='9')))
++                fatal("prepo: invalid key");
++            if (c>='A'&&c<='Z') key[j]=char(c+('a'-'A'));
++        }
++        if (!keys.emplace(key,true).second) fatal("prepo: duplicate key");
++        auto t = data[take(1)];
++        if (t <= 0x7f || t >= 0xe0 || t == 0xc2 || t == 0xc3) continue;
++        if ((t & 0xe0) == 0xa0 || t == 0xd9 || t == 0xda || t == 0xdb) { string(t); continue; }
++        if (t >= 0xcc && t <= 0xcf) { take(size_t(1) << (t-0xcc)); continue; }
++        if (t >= 0xd0 && t <= 0xd3) { take(size_t(1) << (t-0xd0)); continue; }
++        fatal("prepo: unsupported report value type");
++    }
++    if (p != data.size()) fatal("prepo: trailing report bytes");
++}
++struct PrepoService final : Service {
++    uint64_t pid = 0;
++    std::shared_ptr<const ControlMetadata> owner;
++    PrepoService() : Service("prepo:u") {}
++    uint32_t handle(IpcCtx& c) override {
++        if (c.cmd != 10102 && c.cmd != 10103)
++            fatal("strict IPC missing command: service=prepo:u command=%u",c.cmd);
++        const bool user = c.cmd == 10103;
++        if ((c.type != 4 && c.type != 6) || !c.in || c.in_size != (user?24u:8u) ||
++            c.arg<uint64_t>(user?16:0) || !c.has_pid_descriptor() || !c.pid() ||
++            c.pid() != c.authenticated_pid() || !c.in_copy.empty() || !c.in_move.empty() ||
++            !c.in_objects.empty() || c.x.size()!=1 || c.a.size()!=1 ||
++            !c.b.empty() || !c.c.empty() || !c.w.empty()) fatal("prepo: malformed SaveReport request");
++        auto metadata = process_control_metadata(c.pid());
++        if (!metadata || (pid && (pid!=c.pid() || owner!=metadata))) fatal("prepo: invalid process lifetime");
++        const auto event=c.x[0], report=c.a[0];
++        if (event.size<2 || event.size>32 || report.size<3 || report.size>13003 ||
++            !prepo_readable(event) || !prepo_readable(report)) fatal("prepo: invalid report buffer");
++        std::vector<uint8_t> e(event.size), r(report.size);
++        std::memcpy(e.data(),reinterpret_cast<const void*>(event.addr),e.size());
++        std::memcpy(r.data(),reinterpret_cast<const void*>(report.addr),r.size());
++        if (e.back()!=0) fatal("prepo: unterminated event");
++        for (size_t i=0;i+1<e.size();++i)
++            if (!((e[i]>='a'&&e[i]<='z') || (e[i]>='0'&&e[i]<='9') || e[i]=='_')) fatal("prepo: invalid event");
++        prepo_report(r);
++        // Save and transmit are separate SDK operations. Persist exactly these
++        // bytes locally; no upload queue, external sends or delivery assertion.
++        auto root=std::filesystem::path(plat::data_root());
++        std::error_code ec;
++        if (std::filesystem::is_symlink(root) || !std::filesystem::is_directory(root)) fatal("prepo: unsafe data root");
++        for (const auto& part : {std::filesystem::path("user"),std::filesystem::path("prepo")}) {
++            root/=part;
++            std::filesystem::create_directory(root,ec);
++            if (ec || std::filesystem::is_symlink(root) || !std::filesystem::is_directory(root)) fatal("prepo: unsafe local store");
++        }
++        std::filesystem::path slot;
++        for (unsigned i=0;i<64;++i) {
++            auto trial=root/std::to_string(i);
++            if (std::filesystem::create_directory(trial,ec)) { slot=trial; break; }
++            if (ec) fatal("prepo: local store allocation failed");
++        }
++        if (slot.empty()) fatal("prepo: local store capacity exhausted (64 reports)");
++        auto path=slot/"report.bin";
++        FILE* f=plat::fopen_utf8(path.string(),"wb");
++        if (!f) fatal("prepo: local store open failed");
++        uint64_t header[]={1,c.cmd,c.pid(),user?c.arg<uint64_t>(0):0,user?c.arg<uint64_t>(8):0,e.size(),r.size()};
++        bool ok=std::fwrite(header,1,sizeof header,f)==sizeof header &&
++                std::fwrite(e.data(),1,e.size(),f)==e.size() && std::fwrite(r.data(),1,r.size(),f)==r.size();
++        if (std::fflush(f)!=0) ok=false;
++#if defined(_WIN32)
++        if (_commit(_fileno(f))!=0) ok=false;
++#else
++        if (::fsync(fileno(f))!=0) ok=false;
++#endif
++        if (std::fclose(f)!=0) ok=false;
++        if (!ok) fatal("prepo: local store write/flush failed; report not acknowledged");
++        pid=c.pid(); owner=std::move(metadata);
++        log("prepo: saved local report command=%u bytes=%zu; no transmission",c.cmd,r.size());
++        return 0;
++    }
++};
++ServiceRegistrar r_prepo_u("prepo:u", [] { return std::make_shared<PrepoService>(); });
+
+ ServiceRegistrar r_pctl("pctl", [] { return make("pctl", pctl); });
+ ServiceRegistrar r_pctl_s("pctl:s", [] { return make("pctl:s", pctl); });

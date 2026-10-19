@@ -1,0 +1,89 @@
+diff --git a/runtime/src/nvn/nvn_texture_layout.cpp b/runtime/src/nvn/nvn_texture_layout.cpp
+--- a/runtime/src/nvn/nvn_texture_layout.cpp
++++ b/runtime/src/nvn/nvn_texture_layout.cpp
+@@ -9,6 +9,10 @@
+ // 64-byte aligned in width and block-aligned in height. Pre-tiled data (BNTX) is laid out the same way, so the
+ // sizes must not come out smaller than the real driver's.
+ #include <algorithm>
++#if defined(NX_ASTRAL_STRICT)
++#include <cstdlib>
++#include <fstream>
++#endif
+
+ #include "nvn.h"
+
+@@ -23,7 +27,66 @@
+     uint32_t block_w = 1, block_h = 1, bytes = 4;
+ };
+
++#if defined(NX_ASTRAL_STRICT)
++// Original Astral adapter; upstream code remains under its existing license.
++// SDK-specific offsets and records live only in a privately validated profile.
++// The fingerprint detects stale/mismatched metadata; it is not authentication.
++struct FormatProfile {
++    uint64_t offset, count, stride, width, height, bytes, flags, mask, fingerprint;
++    const uint8_t* table;
++};
++
++void readable_format_range(const LoadedModule& m, uint64_t offset, uint64_t size) {
++    if (offset > m.size || size > m.size - offset || m.base > UINT64_MAX - m.size)
++        fatal("strict NVN format metadata: range outside SDK");
++    uint64_t at = m.base + offset, end = at + size;
++    while (at < end) {
++        VmInfo v = vm_query(at);
++        if (!(v.perm & 1) || v.addr > at || v.size > UINT64_MAX - v.addr || v.addr + v.size <= at)
++            fatal("strict NVN format metadata: unreadable SDK range");
++        at = std::min(end, v.addr + v.size);
++    }
++}
++
++const FormatProfile& format_profile() {
++    static const FormatProfile profile = [] {
++        const char* path = std::getenv("NX_NVN_FORMAT_PROFILE");
++        if (!path || !*path) fatal("strict NVN format metadata: profile required");
++        std::ifstream input(path);
++        std::string magic, extra;
++        FormatProfile p{};
++        if (!(input >> magic) || magic != "NX_FORMAT_PROFILE_V1" ||
++            !(input >> std::hex >> p.offset >> p.count >> p.stride >> p.width >> p.height
++                    >> p.bytes >> p.flags >> p.mask >> p.fingerprint) || (input >> extra))
++            fatal("strict NVN format metadata: malformed profile");
++        if (!p.count || p.count > 65536 || !p.stride || p.stride > 4096 ||
++            p.width >= p.stride || p.height >= p.stride || p.bytes >= p.stride ||
++            p.flags >= p.stride || !p.mask || p.mask > 255)
++            fatal("strict NVN format metadata: invalid record geometry");
++        const LoadedModule* m = module_at(find_symbol("nvnBootstrapLoader"));
++        if (!m) fatal("strict NVN format metadata: SDK not loaded");
++        uint64_t size = p.count * p.stride;
++        readable_format_range(*m, p.offset, size);
++        p.table = reinterpret_cast<const uint8_t*>(m->base + p.offset);
++        uint64_t hash = 14695981039346656037ull;
++        for (uint64_t i = 0; i < size; ++i) hash = (hash ^ p.table[i]) * 1099511628211ull;
++        if (hash != p.fingerprint) fatal("strict NVN format metadata: fingerprint mismatch");
++        return p;
++    }();
++    return profile;
++}
++#endif
++
+ FormatInfo format_info(uint32_t format) {
++#if defined(NX_ASTRAL_STRICT)
++    const auto& p = format_profile();
++    if (format >= p.count) fatal("strict NVN format: unmapped format %u", format);
++    const uint8_t* e = p.table + uint64_t(format) * p.stride;
++    FormatInfo f{e[p.width], e[p.height], e[p.bytes]};
++    if ((e[p.flags] & p.mask) != p.mask || !f.block_w || !f.block_h || !f.bytes)
++        fatal("strict NVN format: invalid texture format %u", format);
++    return f;
++#else
+     static uint64_t sdk = [] {
+         uint64_t loader = find_symbol("nvnBootstrapLoader");
+         const LoadedModule* m = module_at(loader);
+@@ -35,6 +98,7 @@
+     uint32_t bw = e[2] & 0xFF, bh = (e[2] >> 8) & 0xFF, bytes = e[4] & 0xFF;
+     if (bw && bh && bytes) f = {bw, bh, bytes};
+     return f;
++#endif
+ }
+
+ uint32_t div_up(uint32_t a, uint32_t b) { return (a + b - 1) / b; }

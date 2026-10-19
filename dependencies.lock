@@ -1,0 +1,196 @@
+{
+  "schema": 1,
+  "unit": "PIN-004",
+  "date": "2026-10-18",
+  "purpose": "Source provenance and bootstrap candidate pins, not a complete resolved build environment",
+  "references": [
+    {
+      "name": "SuperMarioWonderRecomp",
+      "repository": "https://github.com/BelmanteGu/SuperMarioWonderRecomp",
+      "revision": "010ed7a596a621c15d3a8dfa5795ca8c3668b066",
+      "role": "primary original runtime",
+      "checkout": ".local/references/SuperMarioWonderRecomp",
+      "license": "MIT",
+      "license_evidence": {
+        "path": "LICENSE",
+        "url": "https://github.com/BelmanteGu/SuperMarioWonderRecomp/blob/010ed7a596a621c15d3a8dfa5795ca8c3668b066/LICENSE",
+        "sha256": "6466066caf0162b4af89a3108a778843fa21f98dc8a0bc254fe08ededd04faa3"
+      },
+      "status": "detached checkout and source/license inspected"
+    },
+    {
+      "name": "LASRecomp",
+      "repository": "https://github.com/peiikai/LASRecomp",
+      "revision": "b7903f0dcde0732014b8aada56d0640fe4adef54",
+      "role": "comparison only; not combined",
+      "checkout": ".local/references/LASRecomp",
+      "license": "MIT",
+      "license_evidence": {
+        "path": "LICENSE",
+        "url": "https://github.com/peiikai/LASRecomp/blob/b7903f0dcde0732014b8aada56d0640fe4adef54/LICENSE",
+        "sha256": "31e2e8c10f4461ff75bd2f95e26125f6126ee88828bf29233f4d9f14e90630d6"
+      },
+      "status": "detached checkout and source/license inspected"
+    }
+  ],
+  "dependencies": [
+    {
+      "name": "SDL3",
+      "repository": "https://github.com/libsdl-org/SDL",
+      "version": "release-3.2.24",
+      "revision": "a8589a84226a6202831a3d49ff4edda4acab9acd",
+      "license": "Zlib",
+      "license_evidence": [
+        {
+          "path": "LICENSE.txt",
+          "url": "https://raw.githubusercontent.com/libsdl-org/SDL/a8589a84226a6202831a3d49ff4edda4acab9acd/LICENSE.txt",
+          "sha256": "97f35b302b361680ec1e891e95d2d52097bb95abff361434916d99dc1305f127"
+        }
+      ],
+      "status": "source pin and license inspected; build not verified"
+    },
+    {
+      "name": "Vulkan-Headers",
+      "repository": "https://github.com/KhronosGroup/Vulkan-Headers",
+      "version": "v1.4.357",
+      "revision": "e3b1eec08173d6b825cd3ac88c885a63b621504a",
+      "license": "Apache-2.0 OR MIT for most files; per-file exceptions in LICENSE.md",
+      "license_evidence": [
+        {
+          "path": "LICENSE.md",
+          "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Headers/e3b1eec08173d6b825cd3ac88c885a63b621504a/LICENSE.md",
+          "sha256": "95ad366d23fadf701d355bc45fb8b82ae2d700239471d35d41286ac3b08ff903"
+        }
+      ],
+      "status": "source pin and license inspected; build not verified"
+    },
+    {
+      "name": "Vulkan-Loader",
+      "repository": "https://github.com/KhronosGroup/Vulkan-Loader",
+      "version": "v1.4.357",
+      "revision": "5f157b62e333c63260d05d81bf66faa216ab0fb8",
+      "license": "Apache-2.0 with per-file permissive exceptions",
+      "license_evidence": [
+        {
+          "path": "LICENSE.txt",
+          "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Loader/5f157b62e333c63260d05d81bf66faa216ab0fb8/LICENSE.txt",
+          "sha256": "43c0a37e6a0fa7ff3c843b3ec5a4fac84b712558ddac103fbd4c1649662a9ece"
+        }
+      ],
+      "status": "source pin and license inspected; build not verified"
+    },
+    {
+      "name": "MoltenVK",
+      "repository": "https://github.com/KhronosGroup/MoltenVK",
+      "version": "v1.3.0",
+      "revision": "49b97f26ae013b9e5bfb3098ee5dea5e4f58e9e8",
+      "license": "Apache-2.0",
+      "license_evidence": [
+        {
+          "path": "LICENSE",
+          "url": "https://raw.githubusercontent.com/KhronosGroup/MoltenVK/49b97f26ae013b9e5bfb3098ee5dea5e4f58e9e8/LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ],
+      "status": "source pin and license inspected; build not verified",
+      "selection": "candidate host dependency, not an upstream-proven version; transitive ExternalRevisions audit pending"
+    },
+    {
+      "name": "capstone",
+      "version": "5.0.6",
+      "source_url": "https://files.pythonhosted.org/packages/d5/b0/1f126035a4cbc6f488b97e4bd57a46a28b6ba29ca8b938cbda840601a18a/capstone-5.0.6.tar.gz",
+      "sha256": "b11a87d67751b006b9b44428d59c99512e6d6c89cf7dff8cdd92d9065628b5a0",
+      "license_evidence": [
+        {
+          "path": "capstone-5.0.6/LICENSE.TXT",
+          "sha256": "65e9ed46a59976eda8f5bd1ea79a680dea38dd299c760bc9a8d87a764ef5029b"
+        },
+        {
+          "path": "capstone-5.0.6/src/LICENSE.TXT",
+          "sha256": "65e9ed46a59976eda8f5bd1ea79a680dea38dd299c760bc9a8d87a764ef5029b"
+        },
+        {
+          "path": "capstone-5.0.6/src/LICENSE_LLVM.TXT",
+          "sha256": "dfdca2d7fdbabfd937f9dc41b7f61647b0e6cb1f9ee767ecb4520f979ebe91da"
+        }
+      ],
+      "status": "sdist hash and license files inspected; install not tested",
+      "license": "BSD-3-Clause AND NCSA"
+    },
+    {
+      "name": "lz4",
+      "version": "4.4.4",
+      "source_url": "https://files.pythonhosted.org/packages/c6/5a/945f5086326d569f14c84ac6f7fcc3229f0b9b1e8cc536b951fd53dfb9e1/lz4-4.4.4.tar.gz",
+      "sha256": "070fd0627ec4393011251a094e08ed9fdcc78cb4e7ab28f507638eee4e39abda",
+      "license_evidence": [
+        {
+          "path": "lz4-4.4.4/LICENSE",
+          "sha256": "e2ac43d6eb80eb4e52141817c812437e0b981b1d7b2dc7cc86c7ef5524044c6f"
+        },
+        {
+          "path": "lz4-4.4.4/docs/license.rst",
+          "sha256": "d57c432c4d31bf68554429de38a7d342211e694ed781055d2ba977007590d530"
+        }
+      ],
+      "status": "sdist hash and license files inspected; install not tested",
+      "license": "BSD-3-Clause; bundled LZ4 BSD-2-Clause (per-file notice audit pending)"
+    },
+    {
+      "name": "zstandard",
+      "version": "0.24.0",
+      "source_url": "https://files.pythonhosted.org/packages/09/1b/c20b2ef1d987627765dcd5bf1dadb8ef6564f00a87972635099bb76b7a05/zstandard-0.24.0.tar.gz",
+      "sha256": "fe3198b81c00032326342d973e526803f183f97aa9e9a98e3f897ebafe21178f",
+      "license_evidence": [
+        {
+          "path": "zstandard-0.24.0/LICENSE",
+          "sha256": "788fe85e53724a40b299051c4abc9cf74d42b27e7968325b80891c25f79adb4b"
+        },
+        {
+          "path": "zstandard-0.24.0/zstd/COPYING",
+          "sha256": "f9c375a1be4a41f7b70301dd83c91cb89e41567478859b77eef375a52d782505"
+        },
+        {
+          "path": "zstandard-0.24.0/zstd/LICENSE",
+          "sha256": "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8"
+        }
+      ],
+      "status": "sdist hash and license files inspected; install not tested",
+      "license": "BSD-3-Clause; bundled zstd BSD-3-Clause OR GPL-2.0-only"
+    },
+    {
+      "name": "Ryubing",
+      "repository": "https://codeberg.org/Software_arch/Ryubing.git",
+      "revision": "a82350bb774f70fcbd41c9987bf67a3775409963",
+      "license": "MIT",
+      "license_evidence": [
+        {
+          "path": "LICENSE.txt",
+          "url": "https://codeberg.org/Software_arch/Ryubing/raw/commit/a82350bb774f70fcbd41c9987bf67a3775409963/LICENSE.txt",
+          "sha256": "781bbdf040b7d0286c47cca6bffdb9148dfe751c0c9cabdf1a1752412a2e56b4"
+        }
+      ],
+      "status": "resolved via API and git ls-remote; license inspected; translator source not cloned or built"
+    }
+  ],
+  "tool_requirements": {
+    "compiler": "C++20 for runtime; C++17 for standalone importer",
+    "cmake": ">=3.25 runtime; >=3.16 importer; absent on current PATH",
+    "ninja": "optional build generator; absent on current PATH",
+    "python": ">=3.11 with local venv",
+    "dotnet": "upstream uses 10.0.401 / net10.0; archive checksum and transitive NuGet locks pending",
+    "spirv_tools": "spirv-val Vulkan 1.2 target; executable version/build not pinned yet",
+    "fonttools": "optional Wonder font tooling; not required for Astral host smoke; not selected"
+  },
+  "unresolved": [
+    "Ryubing shader/Common/Spv.Generator build and transitive NuGet packages not verified",
+    "MoltenVK transitive dependencies and actual Metal device/pipeline not verified",
+    "No Astral Chain title/version/module/import/shader inventory yet",
+    "No full runtime or simulator host build yet"
+  ],
+  "policy": {
+    "vendored_source": false,
+    "references_ignored": true,
+    "game_inputs_processed": false,
+    "generated_game_code_allowed_in_git": false
+  }
+}

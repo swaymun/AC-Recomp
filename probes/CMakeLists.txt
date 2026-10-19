@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.25)
+project(ACSAppleMemoryPreflight LANGUAGES CXX)
+if(NOT APPLE OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    message(FATAL_ERROR "This target is native macOS. Use scripts/check-apple-memory --simulators for signed simulator apps.")
+endif()
+add_executable(apple_memory apple_memory.cpp)
+target_compile_features(apple_memory PRIVATE cxx_std_17)
+target_compile_options(apple_memory PRIVATE -Wall -Wextra -Werror)

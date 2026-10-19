@@ -1,0 +1,990 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -188,6 +188,10 @@ list(APPEND NX_RUNTIME_SOURCES ${NX_GAME_SOURCES})
+ if(NX_GAME STREQUAL "astral")
+     list(APPEND NX_RUNTIME_SOURCES runtime/src/hle_swkbd.cpp)
+ endif()
++# Astral strict: the optional performance HUD (NX_PERF_HUD=1, F3 toggles; docs/ASTRAL_PERF_HUD.md).
++if(NX_GAME STREQUAL "astral")
++    list(APPEND NX_RUNTIME_SOURCES runtime/src/perf_hud.cpp runtime/src/nvn/nvn_hud.cpp)
++endif()
+ 
+ # Explicit opt-in: ordinary targets retain their dependencies and services.
+ option(NX_HWOPUS "Enable the host single-stream hwopus service" OFF)
+diff --git a/runtime/src/font8x8_basic.h b/runtime/src/font8x8_basic.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/font8x8_basic.h
+@@ -0,0 +1,109 @@
++// font8x8_basic: an 8x8 bitmap font for the printable ASCII range U+0020..U+007E, for the performance HUD
++// (perf_hud.cpp). Public domain: Daniel Hepper's font8x8 (https://github.com/dhepper/font8x8, font8x8_basic.h), based
++// on Marcel Sondaar's font8x8 and the IBM public domain VGA fonts. See runtime/patches/astral-perf-hud.NOTICE.
++// Each glyph is 8 rows, top first; bit n of a row (least significant first) is the pixel in column n.
++#pragma once
++
++#include <cstdint>
++
++namespace nx::hud {
++
++inline constexpr uint8_t kFont8x8[95][8] = {
++    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},  // U+0020 (space)
++    {0x18, 0x3c, 0x3c, 0x18, 0x18, 0x00, 0x18, 0x00},  // U+0021 !
++    {0x36, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},  // U+0022 "
++    {0x36, 0x36, 0x7f, 0x36, 0x7f, 0x36, 0x36, 0x00},  // U+0023 #
++    {0x0c, 0x3e, 0x03, 0x1e, 0x30, 0x1f, 0x0c, 0x00},  // U+0024 $
++    {0x00, 0x63, 0x33, 0x18, 0x0c, 0x66, 0x63, 0x00},  // U+0025 %
++    {0x1c, 0x36, 0x1c, 0x6e, 0x3b, 0x33, 0x6e, 0x00},  // U+0026 &
++    {0x06, 0x06, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00},  // U+0027 '
++    {0x18, 0x0c, 0x06, 0x06, 0x06, 0x0c, 0x18, 0x00},  // U+0028 (
++    {0x06, 0x0c, 0x18, 0x18, 0x18, 0x0c, 0x06, 0x00},  // U+0029 )
++    {0x00, 0x66, 0x3c, 0xff, 0x3c, 0x66, 0x00, 0x00},  // U+002A *
++    {0x00, 0x0c, 0x0c, 0x3f, 0x0c, 0x0c, 0x00, 0x00},  // U+002B +
++    {0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c, 0x06},  // U+002C ,
++    {0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x00},  // U+002D -
++    {0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c, 0x00},  // U+002E .
++    {0x60, 0x30, 0x18, 0x0c, 0x06, 0x03, 0x01, 0x00},  // U+002F /
++    {0x3e, 0x63, 0x73, 0x7b, 0x6f, 0x67, 0x3e, 0x00},  // U+0030 0
++    {0x0c, 0x0e, 0x0c, 0x0c, 0x0c, 0x0c, 0x3f, 0x00},  // U+0031 1
++    {0x1e, 0x33, 0x30, 0x1c, 0x06, 0x33, 0x3f, 0x00},  // U+0032 2
++    {0x1e, 0x33, 0x30, 0x1c, 0x30, 0x33, 0x1e, 0x00},  // U+0033 3
++    {0x38, 0x3c, 0x36, 0x33, 0x7f, 0x30, 0x78, 0x00},  // U+0034 4
++    {0x3f, 0x03, 0x1f, 0x30, 0x30, 0x33, 0x1e, 0x00},  // U+0035 5
++    {0x1c, 0x06, 0x03, 0x1f, 0x33, 0x33, 0x1e, 0x00},  // U+0036 6
++    {0x3f, 0x33, 0x30, 0x18, 0x0c, 0x0c, 0x0c, 0x00},  // U+0037 7
++    {0x1e, 0x33, 0x33, 0x1e, 0x33, 0x33, 0x1e, 0x00},  // U+0038 8
++    {0x1e, 0x33, 0x33, 0x3e, 0x30, 0x18, 0x0e, 0x00},  // U+0039 9
++    {0x00, 0x0c, 0x0c, 0x00, 0x00, 0x0c, 0x0c, 0x00},  // U+003A :
++    {0x00, 0x0c, 0x0c, 0x00, 0x00, 0x0c, 0x0c, 0x06},  // U+003B ;
++    {0x18, 0x0c, 0x06, 0x03, 0x06, 0x0c, 0x18, 0x00},  // U+003C <
++    {0x00, 0x00, 0x3f, 0x00, 0x00, 0x3f, 0x00, 0x00},  // U+003D =
++    {0x06, 0x0c, 0x18, 0x30, 0x18, 0x0c, 0x06, 0x00},  // U+003E >
++    {0x1e, 0x33, 0x30, 0x18, 0x0c, 0x00, 0x0c, 0x00},  // U+003F ?
++    {0x3e, 0x63, 0x7b, 0x7b, 0x7b, 0x03, 0x1e, 0x00},  // U+0040 @
++    {0x0c, 0x1e, 0x33, 0x33, 0x3f, 0x33, 0x33, 0x00},  // U+0041 A
++    {0x3f, 0x66, 0x66, 0x3e, 0x66, 0x66, 0x3f, 0x00},  // U+0042 B
++    {0x3c, 0x66, 0x03, 0x03, 0x03, 0x66, 0x3c, 0x00},  // U+0043 C
++    {0x1f, 0x36, 0x66, 0x66, 0x66, 0x36, 0x1f, 0x00},  // U+0044 D
++    {0x7f, 0x46, 0x16, 0x1e, 0x16, 0x46, 0x7f, 0x00},  // U+0045 E
++    {0x7f, 0x46, 0x16, 0x1e, 0x16, 0x06, 0x0f, 0x00},  // U+0046 F
++    {0x3c, 0x66, 0x03, 0x03, 0x73, 0x66, 0x7c, 0x00},  // U+0047 G
++    {0x33, 0x33, 0x33, 0x3f, 0x33, 0x33, 0x33, 0x00},  // U+0048 H
++    {0x1e, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x1e, 0x00},  // U+0049 I
++    {0x78, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1e, 0x00},  // U+004A J
++    {0x67, 0x66, 0x36, 0x1e, 0x36, 0x66, 0x67, 0x00},  // U+004B K
++    {0x0f, 0x06, 0x06, 0x06, 0x46, 0x66, 0x7f, 0x00},  // U+004C L
++    {0x63, 0x77, 0x7f, 0x7f, 0x6b, 0x63, 0x63, 0x00},  // U+004D M
++    {0x63, 0x67, 0x6f, 0x7b, 0x73, 0x63, 0x63, 0x00},  // U+004E N
++    {0x1c, 0x36, 0x63, 0x63, 0x63, 0x36, 0x1c, 0x00},  // U+004F O
++    {0x3f, 0x66, 0x66, 0x3e, 0x06, 0x06, 0x0f, 0x00},  // U+0050 P
++    {0x1e, 0x33, 0x33, 0x33, 0x3b, 0x1e, 0x38, 0x00},  // U+0051 Q
++    {0x3f, 0x66, 0x66, 0x3e, 0x36, 0x66, 0x67, 0x00},  // U+0052 R
++    {0x1e, 0x33, 0x07, 0x0e, 0x38, 0x33, 0x1e, 0x00},  // U+0053 S
++    {0x3f, 0x2d, 0x0c, 0x0c, 0x0c, 0x0c, 0x1e, 0x00},  // U+0054 T
++    {0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x3f, 0x00},  // U+0055 U
++    {0x33, 0x33, 0x33, 0x33, 0x33, 0x1e, 0x0c, 0x00},  // U+0056 V
++    {0x63, 0x63, 0x63, 0x6b, 0x7f, 0x77, 0x63, 0x00},  // U+0057 W
++    {0x63, 0x63, 0x36, 0x1c, 0x1c, 0x36, 0x63, 0x00},  // U+0058 X
++    {0x33, 0x33, 0x33, 0x1e, 0x0c, 0x0c, 0x1e, 0x00},  // U+0059 Y
++    {0x7f, 0x63, 0x31, 0x18, 0x4c, 0x66, 0x7f, 0x00},  // U+005A Z
++    {0x1e, 0x06, 0x06, 0x06, 0x06, 0x06, 0x1e, 0x00},  // U+005B [
++    {0x03, 0x06, 0x0c, 0x18, 0x30, 0x60, 0x40, 0x00},  // U+005C (backslash)
++    {0x1e, 0x18, 0x18, 0x18, 0x18, 0x18, 0x1e, 0x00},  // U+005D ]
++    {0x08, 0x1c, 0x36, 0x63, 0x00, 0x00, 0x00, 0x00},  // U+005E ^
++    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff},  // U+005F _
++    {0x0c, 0x0c, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00},  // U+0060 `
++    {0x00, 0x00, 0x1e, 0x30, 0x3e, 0x33, 0x6e, 0x00},  // U+0061 a
++    {0x07, 0x06, 0x06, 0x3e, 0x66, 0x66, 0x3b, 0x00},  // U+0062 b
++    {0x00, 0x00, 0x1e, 0x33, 0x03, 0x33, 0x1e, 0x00},  // U+0063 c
++    {0x38, 0x30, 0x30, 0x3e, 0x33, 0x33, 0x6e, 0x00},  // U+0064 d
++    {0x00, 0x00, 0x1e, 0x33, 0x3f, 0x03, 0x1e, 0x00},  // U+0065 e
++    {0x1c, 0x36, 0x06, 0x0f, 0x06, 0x06, 0x0f, 0x00},  // U+0066 f
++    {0x00, 0x00, 0x6e, 0x33, 0x33, 0x3e, 0x30, 0x1f},  // U+0067 g
++    {0x07, 0x06, 0x36, 0x6e, 0x66, 0x66, 0x67, 0x00},  // U+0068 h
++    {0x0c, 0x00, 0x0e, 0x0c, 0x0c, 0x0c, 0x1e, 0x00},  // U+0069 i
++    {0x30, 0x00, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1e},  // U+006A j
++    {0x07, 0x06, 0x66, 0x36, 0x1e, 0x36, 0x67, 0x00},  // U+006B k
++    {0x0e, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x1e, 0x00},  // U+006C l
++    {0x00, 0x00, 0x33, 0x7f, 0x7f, 0x6b, 0x63, 0x00},  // U+006D m
++    {0x00, 0x00, 0x1f, 0x33, 0x33, 0x33, 0x33, 0x00},  // U+006E n
++    {0x00, 0x00, 0x1e, 0x33, 0x33, 0x33, 0x1e, 0x00},  // U+006F o
++    {0x00, 0x00, 0x3b, 0x66, 0x66, 0x3e, 0x06, 0x0f},  // U+0070 p
++    {0x00, 0x00, 0x6e, 0x33, 0x33, 0x3e, 0x30, 0x78},  // U+0071 q
++    {0x00, 0x00, 0x3b, 0x6e, 0x66, 0x06, 0x0f, 0x00},  // U+0072 r
++    {0x00, 0x00, 0x3e, 0x03, 0x1e, 0x30, 0x1f, 0x00},  // U+0073 s
++    {0x08, 0x0c, 0x3e, 0x0c, 0x0c, 0x2c, 0x18, 0x00},  // U+0074 t
++    {0x00, 0x00, 0x33, 0x33, 0x33, 0x33, 0x6e, 0x00},  // U+0075 u
++    {0x00, 0x00, 0x33, 0x33, 0x33, 0x1e, 0x0c, 0x00},  // U+0076 v
++    {0x00, 0x00, 0x63, 0x6b, 0x7f, 0x7f, 0x36, 0x00},  // U+0077 w
++    {0x00, 0x00, 0x63, 0x36, 0x1c, 0x36, 0x63, 0x00},  // U+0078 x
++    {0x00, 0x00, 0x33, 0x33, 0x33, 0x3e, 0x30, 0x1f},  // U+0079 y
++    {0x00, 0x00, 0x3f, 0x19, 0x0c, 0x26, 0x3f, 0x00},  // U+007A z
++    {0x38, 0x0c, 0x0c, 0x07, 0x0c, 0x0c, 0x38, 0x00},  // U+007B {
++    {0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x18, 0x00},  // U+007C |
++    {0x07, 0x0c, 0x0c, 0x38, 0x0c, 0x0c, 0x07, 0x00},  // U+007D }
++    {0x6e, 0x3b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},  // U+007E ~
++};
++
++}  // namespace nx::hud
+diff --git a/runtime/src/nvn/nvn_debug.cpp b/runtime/src/nvn/nvn_debug.cpp
+--- a/runtime/src/nvn/nvn_debug.cpp
++++ b/runtime/src/nvn/nvn_debug.cpp
+@@ -13,6 +13,9 @@
+ 
+ #include "nvn_vk.h"
+ #include "platform.h"
++#if defined(NX_ASTRAL_STRICT)
++#include "perf_hud.h"
++#endif
+ 
+ namespace nx::nvn {
+ 
+@@ -311,6 +314,10 @@ bool frame_dump_record(VkCommandBuffer cb, GpuImage& img) {
+ void frame_dump_write(const GpuImage& img, uint64_t frame) {
+     void* p = nullptr;
+     if (p_vkMapMemory(vk_device(), g_readback.memory, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) return;
++#if defined(NX_ASTRAL_STRICT)
++    // NX_PERF_HUD: drawn into the read-back pixels (ours until the next dump), top right, as on the display.
++    hud::composite_frame(static_cast<uint8_t*>(p), img.width, img.height, img.format == VK_FORMAT_B8G8R8A8_UNORM);
++#endif
+     std::string dir = plat::data_root() + "/frames";
+     plat::make_dirs(dir);
+     char name[64];
+diff --git a/runtime/src/nvn/nvn_hud.cpp b/runtime/src/nvn/nvn_hud.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/nvn/nvn_hud.cpp
+@@ -0,0 +1,53 @@
++// NX_PERF_HUD on the display (perf_hud.h, docs/ASTRAL_PERF_HUD.md): the HUD bitmap, rasterised on the CPU, is put in
++// the present's upload memory (which lives until that submit retires, in every submit mode) and copied into the
++// top-right corner of the swapchain image after the game's image was drawn or blitted into it. Astral strict only.
++#if defined(NX_ASTRAL_STRICT)
++#include <cstring>
++
++#include "nvn_vk.h"
++#include "perf_hud.h"
++
++namespace nx::nvn {
++
++using namespace vk;
++
++void hud_record(VkCommandBuffer cb, VkImage image, VkFormat format, VkExtent2D extent) {
++    if (!hud::enabled() || !cb || !image) return;
++    const bool bgra = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
++    const bool rgba = format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB ||
++                      format == VK_FORMAT_A8B8G8R8_UNORM_PACK32 || format == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
++    if (!bgra && !rgba) return;  // a 4-byte 8-bit-per-channel swapchain only (what make_swapchain picks)
++    std::shared_ptr<const hud::Bitmap> b = hud::bitmap(extent.height, bgra);
++    uint32_t x = 0, y = 0;
++    if (!b || !hud::corner(*b, extent.width, extent.height, hud::scale_for(extent.height), x, y)) return;
++    Upload u = upload_alloc(b->px.size(), 16);
++    if (!u.ptr) return;
++    std::memcpy(u.ptr, b->px.data(), b->px.size());
++
++    VkImageMemoryBarrier bar{};
++    bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++    bar.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++    bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    bar.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++    bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    bar.srcQueueFamilyIndex = bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    bar.image = image;
++    bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++    p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
++                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
++    VkBufferImageCopy r{};
++    r.bufferOffset = u.offset;
++    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++    r.imageOffset = {int32_t(x), int32_t(y), 0};
++    r.imageExtent = {b->width, b->height, 1};
++    p_vkCmdCopyBufferToImage(cb, u.buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
++    bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    bar.dstAccessMask = 0;
++    bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    bar.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++    p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0,
++                           nullptr, 1, &bar);
++}
++
++}  // namespace nx::nvn
++#endif
+diff --git a/runtime/src/nvn/nvn_queue.cpp b/runtime/src/nvn/nvn_queue.cpp
+--- a/runtime/src/nvn/nvn_queue.cpp
++++ b/runtime/src/nvn/nvn_queue.cpp
+@@ -25,6 +25,9 @@
+ #include "nvn.h"
+ #include "nvn_ultrawide.h"
+ #include "platform.h"
++#if defined(NX_ASTRAL_STRICT)
++#include "perf_hud.h"
++#endif
+ 
+ namespace nx {
+ void svc_profile_mark(int role);
+@@ -528,6 +531,9 @@ void QueuePresentTexture(CPU& c) {
+             next_slot ^= 1;
+         }
+         pace_present(w->interval);
++#if defined(NX_ASTRAL_STRICT)
++        hud::note_interval(w->interval);  // NX_PERF_HUD's game speed (perf_hud.cpp)
++#endif
+     }
+     work_from = plat::monotonic_ns();
+     uint64_t n = ++g_presents;
+diff --git a/runtime/src/nvn/nvn_vk.cpp b/runtime/src/nvn/nvn_vk.cpp
+--- a/runtime/src/nvn/nvn_vk.cpp
++++ b/runtime/src/nvn/nvn_vk.cpp
+@@ -21,6 +21,9 @@
+ 
+ #include "nvn_vk.h"
+ #include "platform.h"
++#if defined(NX_ASTRAL_STRICT)
++#include "perf_hud.h"
++#endif
+ 
+ #include <nx/game.h>
+ 
+@@ -147,6 +150,9 @@ bool init() {
+     p_vkGetPhysicalDeviceProperties(g_physical, &props);
+     p_vkGetPhysicalDeviceMemoryProperties(g_physical, &g_memory);
+     g_integrated = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
++#if defined(NX_ASTRAL_STRICT)
++    hud::set_gpu(props.deviceName);  // NX_PERF_HUD (perf_hud.cpp)
++#endif
+     // An integrated GPU shares the package's power budget with the CPU: ask the desktop for its performance profile
+     // (NX_POWER_PROFILE=1: also with a discrete GPU; 0: never). frame_stats.cpp.
+     if (g_integrated || (std::getenv("NX_POWER_PROFILE") && std::getenv("NX_POWER_PROFILE")[0] == '1'))
+@@ -607,6 +613,9 @@ void present_headless(uint64_t texture) {
+     GpuImage* src = image_of(texture);  // made here if new, as before (the targets rendered into it share it, #44)
+     static uint64_t presents = 0;
+     presents++;
++#if defined(NX_ASTRAL_STRICT)
++    hud::on_present(src ? src->width : 0, src ? src->height : 0, 0, 0);  // NX_PERF_HUD: dumped frames show it
++#endif
+     if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
+     if (presents % 60 == 0) log_timing(60), gpu_profile_log(60);
+     if (presents % 300 == 0) zero_draws_log();
+@@ -692,6 +701,10 @@ void gpu_present(uint64_t texture, const int32_t* crop) {
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+     }
+     if (!drawn) transition(g_cb, dst, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
++#if defined(NX_ASTRAL_STRICT)
++    hud::on_present(src ? src->width : 0, src ? src->height : 0, g_sc_extent.width, g_sc_extent.height);
++    hud_record(g_cb, dst.image, g_sc_format, g_sc_extent);  // NX_PERF_HUD, top right (nvn_hud.cpp)
++#endif
+     static uint64_t presents = 0;
+     presents++;
+     if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
+diff --git a/runtime/src/nvn/nvn_vk.h b/runtime/src/nvn/nvn_vk.h
+--- a/runtime/src/nvn/nvn_vk.h
++++ b/runtime/src/nvn/nvn_vk.h
+@@ -58,6 +58,10 @@ bool present_pass_targets(VkFormat format, const std::vector<VkImage>& images, V
+                           VkSurfaceTransformFlagBitsKHR transform);
+ bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop, uint32_t index);
+ void present_pass_release();  // its views of the swapchain images, before the swapchain is destroyed
++#if defined(NX_ASTRAL_STRICT)
++// nvn_hud.cpp: NX_PERF_HUD into the top-right corner of a swapchain image in PRESENT_SRC layout (left in it).
++void hud_record(VkCommandBuffer cb, VkImage image, VkFormat format, VkExtent2D extent);
++#endif
+ bool present_pass_failed();   // the pass could not be made: frames are blitted, upright
+ GpuImage* present_pass_test_target();  // NX_PRESENT_TEST: an offscreen "display" for the pass (headless dumps)
+ // nvn_bc.cpp: BC textures decoded on the CPU where the GPU has no textureCompressionBC (NX_FORCE_BC_DECODE=1 anyway).
+diff --git a/runtime/src/perf_hud.cpp b/runtime/src/perf_hud.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/perf_hud.cpp
+@@ -0,0 +1,448 @@
++// Optional on-screen performance HUD (perf_hud.h, docs/ASTRAL_PERF_HUD.md): the 1 s statistics window, the host
++// probes (process CPU time, resident memory, thermal state), the text and its CPU rasteriser, and the hand-over to a
++// native overlay (Apple's Metal Performance HUD, MangoHud). Astral strict only; the
++// default profile compiles this file to nothing. frame_stats.cpp logs histograms of the same present intervals every
++// 600 presents; the HUD keeps its own 1 s window so that what it shows is current.
++#if defined(NX_ASTRAL_STRICT)
++#include "perf_hud.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cctype>
++#include <climits>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <mutex>
++#include <thread>
++
++#include <nx/runtime.h>
++
++#include "font8x8_basic.h"
++#include "platform.h"
++
++#if defined(_WIN32)
++#include <windows.h>
++#include <psapi.h>
++#else
++#include <sys/resource.h>
++#include <sys/time.h>
++#include <unistd.h>
++#endif
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#include <libkern/OSThermalNotification.h>
++#include <mach/mach.h>
++#include <notify.h>
++#endif
++
++namespace nx::hud {
++
++// ---- text rasteriser ----
++
++Bitmap rasterise(const std::vector<std::string>& lines, uint32_t scale, bool bgra) {
++    Bitmap b;
++    size_t cols = 0;
++    for (const std::string& l : lines) cols = std::max(cols, l.size());
++    if (lines.empty() || !scale) return b;
++    const uint32_t n = uint32_t(lines.size());
++    b.width = (2 * kPad + uint32_t(cols) * kGlyph) * scale;
++    b.height = (2 * kPad + n * kGlyph + (n - 1) * kLineGap) * scale;
++    b.px.resize(size_t(b.width) * b.height * 4);
++    const uint8_t bg[4] = {bgra ? kBackground[2] : kBackground[0], kBackground[1], bgra ? kBackground[0] : kBackground[2],
++                           0xff};
++    const uint8_t fg[4] = {bgra ? kText[2] : kText[0], kText[1], bgra ? kText[0] : kText[2], 0xff};
++    for (size_t k = 0; k < b.px.size(); k += 4) std::memcpy(&b.px[k], bg, 4);
++    for (uint32_t row = 0; row < n; row++) {
++        const std::string& l = lines[row];
++        for (size_t col = 0; col < l.size(); col++) {
++            unsigned char ch = static_cast<unsigned char>(l[col]);
++            const uint8_t* glyph = kFont8x8[(ch >= 0x20 && ch <= 0x7e ? ch : '?') - 0x20];
++            uint32_t x0 = (kPad + uint32_t(col) * kGlyph) * scale, y0 = (kPad + row * (kGlyph + kLineGap)) * scale;
++            for (uint32_t gy = 0; gy < kGlyph; gy++)
++                for (uint32_t gx = 0; gx < kGlyph; gx++) {
++                    if (!(glyph[gy] >> gx & 1)) continue;
++                    for (uint32_t sy = 0; sy < scale; sy++)
++                        for (uint32_t sx = 0; sx < scale; sx++)
++                            std::memcpy(&b.px[(size_t(y0 + gy * scale + sy) * b.width + x0 + gx * scale + sx) * 4], fg, 4);
++                }
++        }
++    }
++    return b;
++}
++
++uint32_t scale_for(uint32_t height) { return std::max(1u, (height + 270) / 540); }
++
++bool corner(const Bitmap& b, uint32_t w, uint32_t h, uint32_t scale, uint32_t& x, uint32_t& y) {
++    uint32_t margin = kPad * scale;
++    if (!b.width || uint64_t(b.width) + margin > w || uint64_t(b.height) + margin > h) return false;
++    x = w - b.width - margin, y = margin;
++    return true;
++}
++
++bool composite(const Bitmap& b, uint32_t scale, uint8_t* px, uint32_t w, uint32_t h) {
++    uint32_t x = 0, y = 0;
++    if (!px || !corner(b, w, h, scale, x, y)) return false;
++    for (uint32_t row = 0; row < b.height; row++)
++        std::memcpy(px + (size_t(y + row) * w + x) * 4, &b.px[size_t(row) * b.width * 4], size_t(b.width) * 4);
++    return true;
++}
++
++// ---- text ----
++
++double speed_pct(double fps, int interval) { return fps * double(std::max(interval, 1)) / 60.0 * 100.0; }
++
++std::vector<std::string> format(const Sample& s) {
++    char b[160];
++    std::vector<std::string> out;
++    auto add = [&](int n) { out.emplace_back(b, size_t(std::clamp(n, 0, int(sizeof b) - 1))); };
++    int target = 60 / std::max(s.interval, 1);
++    add(std::snprintf(b, sizeof b, "FPS %.1f", s.fps));
++    add(std::snprintf(b, sizeof b, "Frame %.1f ms avg, %.1f max", s.avg_ms, s.max_ms));
++    add(std::snprintf(b, sizeof b, "Speed %.0f%% of %d fps", speed_pct(s.fps, s.interval), target));
++    if (s.cpu_pct < 0) add(std::snprintf(b, sizeof b, "CPU n/a"));
++    else add(std::snprintf(b, sizeof b, "CPU %.0f%% (%u cores)", s.cpu_pct, s.cores));
++    if (s.rss_mb < 0) add(std::snprintf(b, sizeof b, "RAM n/a"));
++    else add(std::snprintf(b, sizeof b, "RAM %.0f MB", s.rss_mb));
++    add(std::snprintf(b, sizeof b, "Thermal %s", s.thermal.c_str()));
++    add(std::snprintf(b, sizeof b, "GPU %.40s", s.gpu.c_str()));
++    if (s.out_w && s.out_h)
++        add(std::snprintf(b, sizeof b, "%ux%u, game %ux%u", s.out_w, s.out_h, s.game_w, s.game_h));
++    else
++        add(std::snprintf(b, sizeof b, "headless, game %ux%u", s.game_w, s.game_h));
++    return out;
++}
++
++// ---- host probes ----
++
++double process_cpu_seconds() {
++#if defined(_WIN32)
++    FILETIME created, exited, kernel, user;
++    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return -1;
++    auto secs = [](const FILETIME& f) { return double((uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime) * 1e-7; };
++    return secs(kernel) + secs(user);
++#else
++    rusage u{};
++    if (getrusage(RUSAGE_SELF, &u) != 0) return -1;
++    return double(u.ru_utime.tv_sec + u.ru_stime.tv_sec) + double(u.ru_utime.tv_usec + u.ru_stime.tv_usec) * 1e-6;
++#endif
++}
++
++int64_t resident_bytes() {
++#if defined(__APPLE__)
++    mach_task_basic_info_data_t info{};
++    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
++    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS)
++        return -1;
++    return int64_t(info.resident_size);
++#elif defined(_WIN32)
++    PROCESS_MEMORY_COUNTERS pmc{};
++    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) return -1;
++    return int64_t(pmc.WorkingSetSize);
++#elif defined(__linux__)
++    long long pages_total = 0, pages_resident = 0;
++    FILE* f = std::fopen("/proc/self/statm", "r");
++    if (!f) return -1;
++    int got = std::fscanf(f, "%lld %lld", &pages_total, &pages_resident);
++    std::fclose(f);
++    return got == 2 ? int64_t(pages_resident) * int64_t(sysconf(_SC_PAGESIZE)) : -1;
++#else
++    return -1;
++#endif
++}
++
++std::string thermal_state() {
++#if defined(__APPLE__)
++    // The system's thermal pressure (what NSProcessInfo.thermalState follows), through notify(3): no Objective-C.
++    static int token = -1;
++    static bool registered = notify_register_check(kOSThermalNotificationPressureLevelName, &token) == NOTIFY_STATUS_OK;
++    uint64_t level = 0;
++    if (!registered || notify_get_state(token, &level) != NOTIFY_STATUS_OK) return "n/a";
++    switch (level) {
++    case kOSThermalPressureLevelNominal: return "nominal";
++#if !TARGET_OS_OSX
++    case kOSThermalPressureLevelLight: return "light";
++#endif
++    case kOSThermalPressureLevelModerate: return "moderate";
++    case kOSThermalPressureLevelHeavy: return "heavy";
++    case kOSThermalPressureLevelTrapping: return "trapping";
++    case kOSThermalPressureLevelSleeping: return "sleeping";
++    default: return "level " + std::to_string(level);
++    }
++#elif defined(__linux__)
++    // The hottest thermal zone the kernel exposes (millidegrees Celsius); none readable: n/a.
++    long hottest = LONG_MIN;
++    for (int k = 0; k < 16; k++) {
++        char path[64];
++        std::snprintf(path, sizeof path, "/sys/class/thermal/thermal_zone%d/temp", k);
++        FILE* f = std::fopen(path, "r");
++        if (!f) continue;
++        long t = 0;
++        if (std::fscanf(f, "%ld", &t) == 1) hottest = std::max(hottest, t);
++        std::fclose(f);
++    }
++    if (hottest == LONG_MIN) return "n/a";
++    char b[32];
++    std::snprintf(b, sizeof b, "%.0f C (hottest zone)", double(hottest) / 1000.0);
++    return b;
++#else
++    return "n/a";  // Windows: no thermal state for an unprivileged process
++#endif
++}
++
++// ---- state ----
++
++namespace {
++
++struct State {
++    std::mutex lock;
++    std::string gpu = "n/a";
++    uint64_t window_from = 0, last = 0, frames = 0, intervals = 0, sum_ns = 0, max_ns = 0;
++    double cpu_from = 0;
++    uint32_t game_w = 0, game_h = 0, out_w = 0, out_h = 0;
++    std::vector<std::string> text;
++    uint64_t version = 1;  // of `text`
++    std::shared_ptr<const Bitmap> bitmap;
++    uint64_t bitmap_version = 0;
++    uint32_t bitmap_scale = 0;
++    bool bitmap_bgra = false;
++};
++
++State& state() {
++    static State s;
++    return s;
++}
++
++std::atomic<bool>& on_flag() {
++    static std::atomic<bool> on = [] {
++        const char* e = std::getenv("NX_PERF_HUD");
++        return e && e[0] && e[0] != '0';
++    }();
++    return on;
++}
++
++std::atomic<int> g_interval{1};
++
++}  // namespace
++
++bool enabled() { return on_flag().load(std::memory_order_relaxed); }
++
++// ---- native overlays ----
++
++namespace {
++std::atomic<NativeShow> g_native{nullptr};
++std::atomic<bool> g_native_on{false};
++std::atomic<const char*> g_native_name{nullptr};
++}  // namespace
++
++static bool is_ac(const char* e) { return e && (e[0] == 'a' || e[0] == 'A') && (e[1] == 'c' || e[1] == 'C') && !e[2]; }
++
++bool builtin_forced() { return is_ac(std::getenv("NX_PERF_HUD")); }
++
++bool native_wanted_at_start(const char* env, const std::string& settings_ini) {
++    if (env) return env[0] && env[0] != '0' && !is_ac(env);
++    // The launcher's settings.ini (input_map.cpp writes it): "perf_hud = 1" in any section, case-insensitive keys.
++    bool on = false;
++    size_t at = 0;
++    while (at < settings_ini.size()) {
++        size_t end = settings_ini.find('\n', at);
++        if (end == std::string::npos) end = settings_ini.size();
++        std::string line = settings_ini.substr(at, end - at);
++        at = end + 1;
++        size_t eq = line.find('=');
++        if (eq == std::string::npos) continue;
++        auto trim = [](std::string s) {
++            size_t a = s.find_first_not_of(" \t\r"), b = s.find_last_not_of(" \t\r");
++            s = a == std::string::npos ? "" : s.substr(a, b - a + 1);
++            for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
++            return s;
++        };
++        if (trim(line.substr(0, eq)) != "perf_hud") continue;
++        std::string v = trim(line.substr(eq + 1));
++        on = v == "1" || v == "on" || v == "true" || v == "yes";
++    }
++    return on;
++}
++
++bool use_native(NativeShow show, const char* name) {
++    if (!show || builtin_forced() || g_native.load()) return false;
++    bool on = on_flag().exchange(false);  // the built-in HUD stops measuring and drawing
++    if (!show(on) && on) {
++        on_flag().store(true);
++        nx::log("perf hud: %s could not be shown; the built-in HUD stays", name);
++        return false;
++    }
++    g_native_on.store(on);
++    g_native_name.store(name);
++    g_native.store(show);
++    nx::log("perf hud: %s instead of the built-in HUD (%s)", name, on ? "on" : "off");
++    return true;
++}
++
++const char* native_name() { return g_native_name.load(); }
++bool native_on() { return g_native_on.load(); }
++
++bool mangohud_installed(const std::vector<std::string>& dirs) {
++    for (const std::string& d : dirs) {
++        std::error_code ec;
++        for (std::filesystem::directory_iterator it(d, ec), end; !ec && it != end; it.increment(ec)) {
++            std::string n = it->path().filename().string();
++            if (n.rfind("MangoHud", 0) == 0 && n.size() > 5 && n.compare(n.size() - 5, 5, ".json") == 0) return true;
++        }
++    }
++    return false;
++}
++
++std::vector<std::string> vulkan_implicit_layer_dirs() {
++    // The Vulkan loader's implicit-layer search path on Linux (the loader's LoaderLayerInterface documentation).
++    std::vector<std::string> out;
++    auto each = [&](const char* list, const char* fallback) {
++        std::string s = list && *list ? list : fallback;
++        for (size_t at = 0; at <= s.size();) {
++            size_t end = s.find(':', at);
++            if (end == std::string::npos) end = s.size();
++            if (end > at) out.push_back(s.substr(at, end - at) + "/vulkan/implicit_layer.d");
++            at = end + 1;
++        }
++    };
++    const char* home = std::getenv("HOME");
++    const char* config_home = std::getenv("XDG_CONFIG_HOME");
++    if (config_home && *config_home) out.push_back(std::string(config_home) + "/vulkan/implicit_layer.d");
++    else if (home && *home) out.push_back(std::string(home) + "/.config/vulkan/implicit_layer.d");
++    each(std::getenv("XDG_CONFIG_DIRS"), "/etc/xdg");
++    out.push_back("/etc/vulkan/implicit_layer.d");
++    const char* data_home = std::getenv("XDG_DATA_HOME");
++    if (data_home && *data_home) out.push_back(std::string(data_home) + "/vulkan/implicit_layer.d");
++    else if (home && *home) out.push_back(std::string(home) + "/.local/share/vulkan/implicit_layer.d");
++    each(std::getenv("XDG_DATA_DIRS"), "/usr/local/share:/usr/share");
++    return out;
++}
++
++bool start_mangohud(const std::vector<std::string>& dirs) {
++    if (!enabled() || builtin_forced() || g_native.load()) return false;  // off at start: no layer, F3 = built-in
++    const char* user = std::getenv("MANGOHUD");
++    if ((user && user[0] == '0') || !mangohud_installed(dirs)) return false;
++#if defined(_WIN32)
++    return false;  // MangoHud is a Linux layer (and Windows has no setenv)
++#else
++    setenv("MANGOHUD", "1", 0);  // the layer's enable_environment, read by the loader at vkCreateInstance
++    if (!std::getenv("MANGOHUD_CONFIG") && !std::getenv("MANGOHUD_CONFIGFILE"))
++        setenv("MANGOHUD_CONFIG", kMangoHudConfig, 0);
++    // MangoHud reads F3 itself (toggle_hud=F3): our F3 only keeps the state in step.
++    return use_native([](bool) { return true; }, "MangoHud");
++#endif
++}
++
++bool capture_run(const std::string& data_root) {
++    for (const char* name : {"NX_DUMP_FRAMES", "NX_INPUT_SCRIPT", "NX_AUDIO_DUMP"}) {
++        const char* v = std::getenv(name);
++        if (v && v[0] && v[0] != '0') return true;
++    }
++    std::error_code ec;
++    return !data_root.empty() && std::filesystem::exists(data_root + "/dump_frames", ec);
++}
++
++bool start_mangohud_for_run(bool headless, const std::string& data_root, const std::vector<std::string>& dirs) {
++    // Headless and capture runs keep the built-in HUD: it is the one in the dumped frames.
++    return !headless && !capture_run(data_root) && start_mangohud(dirs);
++}
++
++bool prepare_native_overlay() {
++#if defined(__linux__) && !defined(__ANDROID__)
++    return start_mangohud_for_run(plat::headless(), plat::data_root(), vulkan_implicit_layer_dirs());
++#else
++    return false;
++#endif
++}
++
++void toggle() {
++    if (NativeShow show = g_native.load()) {
++        bool now = !g_native_on.load();
++        if (!show(now)) return;  // it could not (show says why): the state stays
++        g_native_on.store(now);
++        nx::log("perf hud: %s %s", g_native_name.load(), now ? "on" : "off");
++        return;
++    }
++    bool now = !on_flag().load();
++    on_flag().store(now);
++    nx::log("perf hud: %s", now ? "on" : "off");
++}
++
++void set_gpu(const char* name) {
++    std::lock_guard lk(state().lock);
++    state().gpu = name && *name ? name : "n/a";
++}
++
++void note_interval(int interval) { g_interval.store(interval, std::memory_order_relaxed); }
++
++void on_present(uint32_t game_w, uint32_t game_h, uint32_t out_w, uint32_t out_h) {
++    State& s = state();
++    std::lock_guard lk(s.lock);
++    if (!enabled()) {
++        s.window_from = s.last = 0;  // a fresh window when it is turned on again
++        return;
++    }
++    uint64_t now = plat::monotonic_ns();
++    s.game_w = game_w, s.game_h = game_h, s.out_w = out_w, s.out_h = out_h;
++    if (!s.window_from) {
++        s.window_from = s.last = now;
++        s.frames = s.intervals = s.sum_ns = s.max_ns = 0;
++        s.cpu_from = process_cpu_seconds();
++        if (s.text.empty()) {
++            Sample first;
++            first.interval = g_interval.load(std::memory_order_relaxed), first.gpu = s.gpu;
++            first.out_w = out_w, first.out_h = out_h, first.game_w = game_w, first.game_h = game_h;
++            s.text = format(first);
++            s.version++;
++        }
++        return;
++    }
++    uint64_t dt = now - s.last;
++    s.last = now;
++    s.frames++, s.intervals++, s.sum_ns += dt, s.max_ns = std::max(s.max_ns, dt);
++    uint64_t wall = now - s.window_from;
++    if (wall < 1'000'000'000ull) return;
++    Sample x;
++    x.fps = double(s.frames) * 1e9 / double(wall);
++    x.avg_ms = s.intervals ? double(s.sum_ns) / double(s.intervals) / 1e6 : 0;
++    x.max_ms = double(s.max_ns) / 1e6;
++    x.interval = g_interval.load(std::memory_order_relaxed);
++    double cpu = process_cpu_seconds();
++    x.cpu_pct = cpu >= 0 && s.cpu_from >= 0 ? (cpu - s.cpu_from) * 1e9 / double(wall) * 100.0 : -1;
++    x.cores = std::thread::hardware_concurrency();
++    int64_t rss = resident_bytes();
++    x.rss_mb = rss >= 0 ? double(rss) / (1024.0 * 1024.0) : -1;
++    x.thermal = thermal_state();
++    x.gpu = s.gpu;
++    x.out_w = out_w, x.out_h = out_h, x.game_w = game_w, x.game_h = game_h;
++    s.text = format(x);
++    s.version++;
++    s.window_from = now, s.cpu_from = cpu;
++    s.frames = s.intervals = s.sum_ns = s.max_ns = 0;
++}
++
++std::vector<std::string> lines() {
++    std::lock_guard lk(state().lock);
++    return state().text;
++}
++
++std::shared_ptr<const Bitmap> bitmap(uint32_t height, bool bgra) {
++    State& s = state();
++    std::lock_guard lk(s.lock);
++    uint32_t scale = scale_for(height);
++    if (!s.bitmap || s.bitmap_version != s.version || s.bitmap_scale != scale || s.bitmap_bgra != bgra) {
++        s.bitmap = std::make_shared<const Bitmap>(rasterise(s.text, scale, bgra));
++        s.bitmap_version = s.version, s.bitmap_scale = scale, s.bitmap_bgra = bgra;
++    }
++    return s.bitmap;
++}
++
++bool composite_frame(uint8_t* px, uint32_t w, uint32_t h, bool bgra) {
++    if (!enabled()) return false;
++    std::shared_ptr<const Bitmap> b = bitmap(h, bgra);
++    return b && composite(*b, scale_for(h), px, w, h);
++}
++
++}  // namespace nx::hud
++#endif
+diff --git a/runtime/src/perf_hud.h b/runtime/src/perf_hud.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/perf_hud.h
+@@ -0,0 +1,106 @@
++// Optional on-screen performance HUD, Astral strict builds only (perf_hud.cpp, docs/ASTRAL_PERF_HUD.md).
++// NX_PERF_HUD=1 shows it from the start; F3 toggles it on desktop. Where the platform has its own overlay (Apple's
++// Metal Performance HUD on macOS, MangoHud on Linux) that is shown instead, unless NX_PERF_HUD=ac. The built-in text
++// is rasterised on the CPU with an 8x8 public domain font into a 4-byte-per-pixel bitmap with an opaque dark
++// background. nvn_hud.cpp copies the bitmap into the top-right corner of the swapchain image before present;
++// nvn_debug.cpp draws it into NX_DUMP_FRAMES dumps.
++#pragma once
++
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace nx::hud {
++
++// ---- text rasteriser ----
++constexpr uint32_t kGlyph = 8;    // font cell, pixels (before scaling)
++constexpr uint32_t kLineGap = 2;  // between lines
++constexpr uint32_t kPad = 4;      // background border around the text
++constexpr uint8_t kBackground[3] = {0x10, 0x10, 0x18};  // R, G, B; alpha 255
++constexpr uint8_t kText[3] = {0xff, 0xff, 0xff};
++
++struct Bitmap {
++    uint32_t width = 0, height = 0;
++    std::vector<uint8_t> px;  // width * height * 4 bytes, rows top first; R,G,B,A (or B,G,R,A when bgra)
++};
++// Lines of ASCII (anything else is drawn as '?'), each font pixel `scale` x `scale`. Empty input: an empty bitmap.
++Bitmap rasterise(const std::vector<std::string>& lines, uint32_t scale, bool bgra);
++// The scale for an output `height` pixels high: 1 at 720p, 2 at 1080p, 4 at 2160p.
++uint32_t scale_for(uint32_t height);
++// Where `b` goes in a `w` x `h` image: the top-right corner, `kPad * scale` from the edges. False: does not fit.
++bool corner(const Bitmap& b, uint32_t w, uint32_t h, uint32_t scale, uint32_t& x, uint32_t& y);
++// Copies `b` into the top-right corner of a `w` x `h` image (4 bytes per pixel, tightly packed, same channel order).
++bool composite(const Bitmap& b, uint32_t scale, uint8_t* px, uint32_t w, uint32_t h);
++
++// ---- what it shows ----
++struct Sample {
++    double fps = 0, avg_ms = 0, max_ms = 0;  // presents per second and the intervals between them, over 1 s
++    int interval = 1;                        // the NVN window's present interval (vsyncs at 60 Hz)
++    double cpu_pct = -1;                     // process CPU time over wall time (100 = one core busy); < 0: n/a
++    unsigned cores = 0;
++    double rss_mb = -1;                      // resident memory; < 0: n/a
++    std::string thermal = "n/a", gpu = "n/a";
++    uint32_t out_w = 0, out_h = 0;           // presented image (0: headless)
++    uint32_t game_w = 0, game_h = 0;         // the game's presented texture
++};
++std::vector<std::string> format(const Sample& s);
++// Game speed in percent: frames per second times the frames each one stands for (interval / 60 s).
++double speed_pct(double fps, int interval);
++
++// ---- state (thread-safe) ----
++bool enabled();  // NX_PERF_HUD=1 at start; F3 toggles
++void toggle();
++void set_gpu(const char* name);
++void note_interval(int interval);  // nvnQueuePresentTexture: the window's present interval
++// One present (windowed or headless): the game texture's size, the output's (0 x 0: headless). Each full second
++// the sample is taken and the text re-made. Does nothing while the HUD is off.
++void on_present(uint32_t game_w, uint32_t game_h, uint32_t out_w, uint32_t out_h);
++std::vector<std::string> lines();
++// The bitmap for an output `height` pixels high, re-rasterised only when the text, scale or channel order changed.
++std::shared_ptr<const Bitmap> bitmap(uint32_t height, bool bgra);
++// Into a dumped frame (CPU, nvn_debug.cpp): false when off or it does not fit.
++bool composite_frame(uint8_t* px, uint32_t w, uint32_t h, bool bgra);
++
++// ---- native overlays (docs/ASTRAL_PERF_HUD.md) ----
++// Where the platform has its own overlay, NX_PERF_HUD shows that instead of the built-in HUD: Apple's Metal
++// Performance HUD on macOS (platform_mac.cpp), MangoHud on Linux when installed (prepare_native_overlay). Windows has
++// none. NX_PERF_HUD=ac (any case) always uses the built-in HUD; headless and capture runs (capture_run) keep it too.
++// A native overlay is drawn when the frame is presented, so it is never in the dumped pixels.
++bool builtin_forced();  // NX_PERF_HUD=ac
++// `show(on)` shows or hides a native overlay (false: it could not). use_native hands it the HUD's on/off state (one
++// show(state) call at once) and F3; the built-in HUD is then off and does no work. Refused (false) with
++// NX_PERF_HUD=ac, without `show`, when another overlay already took over, or when `show(true)` fails (the built-in
++// HUD stays on).
++using NativeShow = bool (*)(bool on);
++bool use_native(NativeShow show, const char* name);
++const char* native_name();  // nullptr: the built-in HUD
++bool native_on();
++// Whether the HUD is on when the process starts: NX_PERF_HUD (`env`, nullptr: unset) not empty, 0 or ac; unset: the
++// launcher's settings.ini says perf_hud = 1/on/true/yes. macOS asks before any Metal device exists (MTL_HUD_ENABLED).
++bool native_wanted_at_start(const char* env, const std::string& settings_ini);
++// MangoHud: its implicit Vulkan layer manifest (MangoHud*.json) in one of `dirs`.
++bool mangohud_installed(const std::vector<std::string>& dirs);
++std::vector<std::string> vulkan_implicit_layer_dirs();  // the Linux loader's implicit-layer search path
++// MANGOHUD_CONFIG when the player set neither it nor MANGOHUD_CONFIGFILE: the player's MangoHud.conf still loads
++// (read_cfg); on top of it F3 toggles, top right, and the rows the built-in HUD has.
++constexpr const char* kMangoHudConfig =
++    "read_cfg,toggle_hud=F3,position=top-right,fps,frametime,frame_timing,cpu_stats,gpu_stats,gpu_name,ram,vram,resolution";
++// HUD on at start, not NX_PERF_HUD=ac, MANGOHUD not 0 and MangoHud in `dirs`: sets MANGOHUD=1 (and MANGOHUD_CONFIG)
++// and hands the HUD to MangoHud. Must run before vkCreateInstance, while no other thread reads the environment.
++bool start_mangohud(const std::vector<std::string>& dirs);
++// A run whose output is captured: NX_DUMP_FRAMES, NX_INPUT_SCRIPT or NX_AUDIO_DUMP set (not empty or 0), or a
++// dump_frames file in `data_root`. Native overlays are skipped there (dumps contain only the built-in HUD).
++bool capture_run(const std::string& data_root);
++// start_mangohud unless `headless` or capture_run(data_root).
++bool start_mangohud_for_run(bool headless, const std::string& data_root, const std::vector<std::string>& dirs);
++// platform_linux.cpp main, right after the launcher exported the settings and before the game thread starts:
++// start_mangohud on Linux desktop runs that are neither headless nor capture runs; elsewhere nothing.
++bool prepare_native_overlay();
++
++// ---- host probes ("n/a" / negative where the platform has none) ----
++double process_cpu_seconds();
++int64_t resident_bytes();
++std::string thermal_state();
++
++}  // namespace nx::hud
+diff --git a/runtime/src/platform_linux.cpp b/runtime/src/platform_linux.cpp
+--- a/runtime/src/platform_linux.cpp
++++ b/runtime/src/platform_linux.cpp
+@@ -44,6 +44,9 @@
+ 
+ #include "kernel.h"
+ #include "platform.h"
++#if defined(NX_ASTRAL_STRICT)
++#include "perf_hud.h"
++#endif
+ 
+ namespace nx {
+ void boot();
+@@ -544,6 +547,9 @@ int main() {
+                 if ((e.key.scancode == SDL_SCANCODE_F11 ||
+                      (e.key.scancode == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))) && g_window)
+                     SDL_SetWindowFullscreen(g_window, !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN));
++#if defined(NX_ASTRAL_STRICT)
++                if (e.key.scancode == SDL_SCANCODE_F3 && !e.key.repeat) nx::hud::toggle();  // NX_PERF_HUD
++#endif
+                 break;
+             default:
+                 break;
+diff --git a/runtime/src/platform_mac.cpp b/runtime/src/platform_mac.cpp
+--- a/runtime/src/platform_mac.cpp
++++ b/runtime/src/platform_mac.cpp
+@@ -46,6 +46,9 @@
+ 
+ #include "kernel.h"
+ #include "platform.h"
++#if defined(NX_ASTRAL_STRICT)
++#include "perf_hud.h"
++#endif
+ 
+ namespace nx {
+ void boot();
+@@ -89,6 +92,44 @@ std::atomic<uint32_t> g_pixel_w{0}, g_pixel_h{0};
+ std::mutex g_pad_lock;
+ PadState g_pad;
+ 
++#if defined(NX_ASTRAL_STRICT)
++// NX_PERF_HUD on macOS: Apple's Metal Performance HUD (perf_hud.h, docs/ASTRAL_PERF_HUD.md). Metal loads its HUD
++// library only when MTL_HUD_ENABLED=1 is set before the first Metal device exists (the launcher's renderer makes
++// one), so preload() decides at the start of main from NX_PERF_HUD, or without it from settings.ini's perf_hud. Once
++// loaded it draws on every Metal layer at present, the game's (MoltenVK's) included, and the process cannot switch it
++// off or on again: checked on macOS 26, neither CAMetalLayer.developerHUDProperties nor the HUD's ToggleEnabled
++// notification changed it. Its own menu (Metal HUD > Enable HUD) can; F3 only says so. HUD off at start: nothing is
++// loaded and F3 toggles the built-in HUD for that run. Dumps (NX_DUMP_FRAMES) never contain Apple's HUD.
++namespace metal_hud {
++bool g_loaded = false;   // MTL_HUD_ENABLED=1 before any Metal device: the HUD library is in and shown
++void preload() {
++    if (headless() || nx::hud::capture_run(data_root())) return;  // dumps keep the built-in HUD
++    const char* user = std::getenv("MTL_HUD_ENABLED");
++    if (user && *user) {
++        g_loaded = *user != '0';
++        return;
++    }
++    std::string text;
++    if (FILE* f = std::fopen((data_root() + "/settings.ini").c_str(), "rb")) {
++        char buf[4096];
++        size_t n = std::fread(buf, 1, sizeof buf, f);
++        text.assign(buf, n);
++        std::fclose(f);
++    }
++    if (!nx::hud::native_wanted_at_start(std::getenv("NX_PERF_HUD"), text)) return;
++    setenv("MTL_HUD_ENABLED", "1", 1);
++    g_loaded = true;
++}
++// It stays as loaded: shown. Asking for anything else fails, with a hint.
++bool show(bool on) {
++    if (g_loaded && on) return true;
++    nx::log("perf hud: Apple's Metal HUD cannot be switched while the game runs: use its menu (Metal HUD > Enable "
++            "HUD), or change the Performance HUD setting and restart");
++    return false;
++}
++}  // namespace metal_hud
++#endif
++
+ }  // namespace
+ 
+ // ---- memory ---------------------------------------------------------------------------------------------------
+@@ -259,6 +300,10 @@ void* create_window() {
+         int pw = 0, ph = 0;
+         SDL_GetWindowSizeInPixels(g_window, &pw, &ph);
+         g_pixel_w = uint32_t(pw), g_pixel_h = uint32_t(ph);
++#if defined(NX_ASTRAL_STRICT)
++        // NX_PERF_HUD and F3: Apple's Metal HUD from here on when preload() let Metal load it.
++        if (!headless() && metal_hud::g_loaded) nx::hud::use_native(metal_hud::show, "Apple Metal HUD");
++#endif
+     });
+     return g_layer;  // the Vulkan surface is made from the CAMetalLayer, from any thread
+ }
+@@ -496,6 +541,9 @@ int main() {
+     sigaction(SIGBUS, &sa, nullptr);
+     sigaction(SIGILL, &sa, nullptr);
+     sigaction(SIGFPE, &sa, nullptr);
++#if defined(NX_ASTRAL_STRICT)
++    nx::plat::metal_hud::preload();  // NX_PERF_HUD: MTL_HUD_ENABLED=1 before any Metal device exists
++#endif
+ 
+     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
+         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+@@ -530,6 +578,9 @@ int main() {
+             case SDL_EVENT_KEY_DOWN:
+                 if (e.key.scancode == SDL_SCANCODE_F11 && g_window)
+                     SDL_SetWindowFullscreen(g_window, !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN));
++#if defined(NX_ASTRAL_STRICT)
++                if (e.key.scancode == SDL_SCANCODE_F3 && !e.key.repeat) nx::hud::toggle();  // NX_PERF_HUD
++#endif
+                 break;
+             default:
+                 break;
+diff --git a/runtime/src/platform_win.cpp b/runtime/src/platform_win.cpp
+--- a/runtime/src/platform_win.cpp
++++ b/runtime/src/platform_win.cpp
+@@ -22,6 +22,9 @@
+ 
+ #include "kernel.h"
+ #include "platform.h"
++#if defined(NX_ASTRAL_STRICT)
++#include "perf_hud.h"
++#endif
+ 
+ namespace nx {
+ HWND g_window = nullptr;
+@@ -153,6 +156,9 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+             ExitProcess(0);
+         case WM_KEYDOWN:
+             if (w == VK_F11) toggle_fullscreen(h);
++#if defined(NX_ASTRAL_STRICT)
++            if (w == VK_F3 && !(l & (1 << 30))) hud::toggle();  // NX_PERF_HUD; bit 30: an auto-repeat
++#endif
+             break;
+         case WM_SYSKEYDOWN:
+             if (w == VK_RETURN) {  // Alt+Enter

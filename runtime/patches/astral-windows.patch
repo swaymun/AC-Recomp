@@ -1,0 +1,195 @@
+# Windows x64 overlay, applied after the whole of series.linux (series.windows). Win32-fiber host continuations,
+# fiber retirement on Windows, libopus from its CMake package, host-cached upload ring, high-resolution sleep.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -207,7 +207,11 @@
+ 
+ # Explicit opt-in: ordinary targets retain their dependencies and services.
+ option(NX_HWOPUS "Enable the host single-stream hwopus service" OFF)
+-if(NX_HWOPUS)
++if(NX_HWOPUS AND WIN32)
++    # Windows: libopus's own CMake package (a static build installed under a CMAKE_PREFIX_PATH entry).
++    find_package(Opus 1.3 CONFIG REQUIRED)
++    list(APPEND NX_RUNTIME_SOURCES runtime/src/svc_hwopus.cpp)
++elseif(NX_HWOPUS)
+     find_package(PkgConfig REQUIRED)
+     pkg_check_modules(NX_OPUS REQUIRED IMPORTED_TARGET opus>=1.3)
+     list(APPEND NX_RUNTIME_SOURCES runtime/src/svc_hwopus.cpp)
+@@ -265,7 +269,8 @@
+     # The executable (PIE) loads near 0x55_5555_0000_0000, far above the guest ranges (0x40_0000_0000 and up). The
+     # game runs on its own thread with a 64 MiB stack (platform_linux.cpp).
+ else()
+-    add_executable(${NX_GAME} ${NX_RUNTIME_SOURCES} runtime/src/platform_win.cpp runtime/src/memguard_win.cpp)
++    add_executable(${NX_GAME} ${NX_RUNTIME_SOURCES} runtime/src/platform_win.cpp runtime/src/memguard_win.cpp
++        runtime/src/hle_fiber.cpp)
+     target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}" "${NX_VULKAN_SDK}/Include")
+     target_link_libraries(${NX_GAME} PRIVATE game_main game_sdk xinput xaudio2 ole32 psapi)
+     # The runtime uses the portable C library (getenv, fopen, ...) on every host: no "_s" variants.
+@@ -277,7 +282,9 @@
+     endif()
+ endif()
+ 
+-if(NX_HWOPUS)
++if(NX_HWOPUS AND WIN32)
++    target_link_libraries(${NX_GAME} PRIVATE Opus::opus)
++elseif(NX_HWOPUS)
+     target_link_libraries(${NX_GAME} PRIVATE "$<LINK_ONLY:PkgConfig::NX_OPUS>")
+ endif()
+ 
+diff --git a/runtime/src/hle_fiber.cpp b/runtime/src/hle_fiber.cpp
+--- a/runtime/src/hle_fiber.cpp
++++ b/runtime/src/hle_fiber.cpp
+@@ -2,16 +2,21 @@
+ #include <nx/runtime.h>
+ #include "kernel.h"
+ #include "platform.h"
++#if defined(_WIN32)
++#include <windows.h>
++#else
+ #include <sys/mman.h>
+ #include <unistd.h>
++#endif
+ #include <map>
+ #include <algorithm>
+ #include <memory>
+ #include <mutex>
+ #include <cstring>
+ 
+-#if !(defined(__APPLE__) && defined(__aarch64__)) && !(defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__)))
+-#error The fiber adapter requires the Apple arm64, Linux x86-64 or Linux arm64 backend
++#if !(defined(__APPLE__) && defined(__aarch64__)) && !(defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))) && \
++    !(defined(_WIN32) && defined(_M_X64))
++#error The fiber adapter requires the Apple arm64, Linux x86-64, Linux arm64 or Windows x64 backend
+ #endif
+ namespace nx {
+ const char* fiber_exchange_hle_name(const char*);
+@@ -20,7 +25,14 @@
+ constexpr size_t host_stack_bytes = 8 * 1024 * 1024;
+ constexpr const char* dispatch_name = "_ZN2nn2os6detail20DispatchFiberContextEPPNS1_22FiberContextForHorizonES4_";
+ constexpr const char* finalize_name = "_ZN2nn2os13FinalizeFiberEPNS0_9FiberTypeE";
+-#if defined(__aarch64__)
++#if defined(_WIN32)
++// Windows x64: each continuation is a Win32 fiber (CreateFiberEx/SwitchToFiber), which saves the MS x64 callee-saved
++// registers (rbx rbp rdi rsi r12-r15 xmm6-xmm15), MXCSR and the x87 control word (FIBER_FLAG_FLOAT_SWITCH) and keeps
++// the TEB stack bounds, SEH chain and fiber-local storage consistent. The thread's own fiber is the root.
++struct HostContext {
++    void* fiber{};
++};
++#elif defined(__aarch64__)
+ struct alignas(16) HostContext {
+     uint64_t x[12]{}; // x19..x30
+     uint64_t sp{}, reserved{};
+@@ -35,9 +47,21 @@
+ };
+ static_assert(offsetof(HostContext, sp)==0);
+ #endif
++[[noreturn]] void enter(void*);
++#if defined(_WIN32)
++void WINAPI fiber_main(void*) { enter(nullptr); }
++void nx_fiber_swap(HostContext* from, const HostContext* to) {
++    if (!from->fiber) {
++        // The root continuation: the thread itself, converted once (a thread that is already a fiber keeps its own).
++        from->fiber = IsThreadAFiber() ? GetCurrentFiber() : ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH);
++        if (!from->fiber) fatal("fiber: thread conversion failed");
++    }
++    if (from->fiber != GetCurrentFiber() || !to->fiber) fatal("fiber: host fiber mismatch");
++    SwitchToFiber(to->fiber);
++}
++#else
+ extern "C" void nx_fiber_swap(HostContext*, const HostContext*);
+ extern "C" void nx_fiber_enter();
+-[[noreturn]] void enter(void*);
+ // A fresh host stack whose first swap runs nx_fiber_enter, which calls enter(nullptr).
+ void prepare_entry(HostContext& h, uintptr_t top) {
+ #if defined(__aarch64__)
+@@ -58,6 +82,7 @@
+     h.sp=reinterpret_cast<uint64_t>(&s[-11]);
+ #endif
+ }
++#endif
+ struct Context {
+     HostContext host;
+     uint64_t slot{}, saved{}, pc{}, object{};
+@@ -65,7 +90,11 @@
+     void* allocation = nullptr;
+     size_t allocation_bytes = 0;
+     bool suspended = false;
++#if defined(_WIN32)
++    ~Context() { if (allocation) DeleteFiber(allocation); } // a created fiber, never the running one or the root
++#else
+     ~Context() { if (allocation) munmap(allocation, allocation_bytes); }
++#endif
+ };
+ struct ThreadState {
+     CPU* cpu = nullptr;
+@@ -157,6 +186,12 @@
+         fatal("fiber: first continuation is not an entry");
+     if (state.contexts.size()>=1024) fatal("fiber: context capacity exceeded");
+     auto d=std::make_unique<Context>();d->slot=slot;d->object=object;
++#if defined(_WIN32)
++    d->allocation_bytes=host_stack_bytes;
++    d->allocation=CreateFiberEx(64*1024,host_stack_bytes,FIBER_FLAG_FLOAT_SWITCH,&fiber_main,nullptr);
++    if (!d->allocation) fatal("fiber: stack reservation failed");
++    d->host.fiber=d->allocation;
++#else
+     const size_t page=size_t(sysconf(_SC_PAGESIZE));
+     d->allocation_bytes=host_stack_bytes+2*page;
+     d->allocation=mmap(nullptr,d->allocation_bytes,PROT_NONE,MAP_PRIVATE|MAP_ANON,-1,0);
+@@ -164,6 +199,7 @@
+     auto start=reinterpret_cast<uintptr_t>(d->allocation)+page;
+     if (mprotect(reinterpret_cast<void*>(start),host_stack_bytes,PROT_READ|PROT_WRITE)) fatal("fiber: stack commit failed");
+     prepare_entry(d->host,start+host_stack_bytes);
++#endif
+     claim(slot);auto* result=d.get();state.contexts.emplace(slot,std::move(d));return result;
+ }
+ void clear() {
+diff --git a/runtime/src/kernel.cpp b/runtime/src/kernel.cpp
+--- a/runtime/src/kernel.cpp
++++ b/runtime/src/kernel.cpp
+@@ -24,7 +24,7 @@
+ #endif
+ 
+ namespace nx {
+-#if ((defined(__APPLE__) && defined(__aarch64__)) || (defined(__linux__) && !defined(__ANDROID__))) && \
++#if ((defined(__APPLE__) && defined(__aarch64__)) || (defined(__linux__) && !defined(__ANDROID__)) || defined(_WIN32)) && \
+     !defined(NX_IOS_RUNTIME)
+ void fiber_retire_thread();
+ #else
+diff --git a/runtime/src/nvn/nvn_caps.cpp b/runtime/src/nvn/nvn_caps.cpp
+--- a/runtime/src/nvn/nvn_caps.cpp
++++ b/runtime/src/nvn/nvn_caps.cpp
+@@ -93,8 +93,8 @@
+ uint32_t upload_memory_type(uint32_t bits) {
+     const VkMemoryPropertyFlags plain = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+     const char* e = std::getenv("NX_RING_CACHED");
+-#if defined(__linux__) && !defined(__ANDROID__)
+-    // Linux desktop GPUs: compute results are read back from the ring (apply_write_back, ~35 MB a frame on the
++#if (defined(__linux__) && !defined(__ANDROID__)) || defined(_WIN32)
++    // Linux and Windows desktop GPUs: compute results are read back from the ring (apply_write_back, ~35 MB a frame on the
+     // title screen). Reading write-combined memory held the title at 1.5 fps on a discrete GPU; host-cached is
+     // the default here (NX_RING_CACHED=0: the plain type).
+     if (!e) e = "1";
+diff --git a/runtime/src/platform_win.cpp b/runtime/src/platform_win.cpp
+--- a/runtime/src/platform_win.cpp
++++ b/runtime/src/platform_win.cpp
+@@ -67,7 +67,18 @@
+ 
+ void exit_thread() { ExitThread(0); }
+ void exit_process(int code) { ExitProcess(UINT(code)); }
+-void sleep_ns(int64_t ns) { std::this_thread::sleep_for(std::chrono::nanoseconds(ns)); }
++void sleep_ns(int64_t ns) {
++    // A high-resolution waitable timer: sleep_for rounds up to the 15.6 ms system tick, which would make the 60 Hz
++    // vsync thread (hle_vi.cpp) tick about every 31 ms.
++    thread_local HANDLE timer =
++        CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++    LARGE_INTEGER due{};
++    due.QuadPart = -std::max<int64_t>(1, ns / 100);  // relative, in 100 ns units
++    if (ns > 0 && timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
++        WaitForSingleObject(timer, INFINITE);
++    else
++        std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
++}
+ void yield() { SwitchToThread(); }
+ void set_thread_name(const char*) {}
+ float default_render_scale() { return 1.0f; }

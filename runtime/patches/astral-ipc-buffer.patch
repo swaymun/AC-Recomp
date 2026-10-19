@@ -1,0 +1,136 @@
+diff --git a/runtime/src/ipc.h b/runtime/src/ipc.h
+--- a/runtime/src/ipc.h
++++ b/runtime/src/ipc.h
+@@ -16,6 +16,27 @@
+     uint64_t addr = 0, size = 0;
+ };
+
++// Packet-owned views are valid only during dispatch, before reply serialization.
++struct IpcFraming {
++    const uint8_t* raw_data = nullptr;
++    size_t raw_offset = 0, raw_size = 0, aligned_offset = 0, packet_size = 0;
++    size_t receive_list_offset = 0;
++    uint32_t receive_mode = 0;
++    bool domain = false;
++    size_t domain_data_size = 0, domain_object_count = 0;
++};
++
++struct ReceiveSizeTable {
++    size_t offset = 0;  // relative to the packet, never to the aligned CMIF header
++    std::vector<uint16_t> values;
++};
++
++enum class ReceiveDescriptor { None, B, C };
++struct ReceiveSelection {
++    ReceiveDescriptor source = ReceiveDescriptor::None;
++    Buffer buffer;
++};
++
+ struct Service;
+
+ struct IpcCtx {
+@@ -26,6 +47,7 @@
+     size_t in_size = 0;
+     std::vector<uint32_t> in_copy, in_move;
+ private:
++    IpcFraming framing_;
+     uint64_t caller_pid_ = 0;
+     uint64_t kernel_pid_ = 0;
+     bool pid_descriptor_ = false;
+@@ -36,6 +58,16 @@
+     uint64_t authenticated_pid() const { return kernel_pid_; }
+     bool has_pid_descriptor() const { return pid_descriptor_; }
+     std::vector<Buffer> a, b, x, c, w;  // send, receive, pointer (X), receive list (C)
++    const IpcFraming& framing() const { return framing_; }
++    // The signature supplies argument bytes and VARIABLE receive-pointer count.
++    // HIPC does not encode either; fixed C pointers need no size-table entry.
++    // False leaves table empty; no read occurs outside the declared raw span.
++    bool receive_size_table(size_t argument_bytes, size_t count, ReceiveSizeTable& table) const;
++    ReceiveSelection receive_selection(size_t n) const {
++        if (n < b.size() && b[n].addr) return {ReceiveDescriptor::B, b[n]};
++        if (n < c.size()) return {ReceiveDescriptor::C, c[n]};
++        return {};
++    }
+     std::vector<uint32_t> in_objects;  // domain objects passed in
+
+     std::vector<uint8_t> out;
+@@ -45,7 +77,7 @@
+     template <typename T>
+     T arg(size_t off) const {
+         T v{};
+-        if (off + sizeof(T) <= in_size) std::memcpy(&v, in + off, sizeof(T));
++        if (off <= in_size && sizeof(T) <= in_size - off) std::memcpy(&v, in + off, sizeof(T));
+         return v;
+     }
+     template <typename T>
+diff --git a/runtime/src/ipc.cpp b/runtime/src/ipc.cpp
+--- a/runtime/src/ipc.cpp
++++ b/runtime/src/ipc.cpp
+@@ -52,6 +52,33 @@
+ #endif
+     log("ipc: %s cmd %u not implemented (stub ok)", name.c_str(), ctx.cmd);
+     return 0;
++}
++
++bool IpcCtx::receive_size_table(size_t argument_bytes, size_t count, ReceiveSizeTable& table) const {
++    table = {};
++    const auto& f = framing_;
++    // These limits also bound all following additions and multiplications.
++    if (!f.raw_data || type >= 16 || count > c.size() || count > 13 ||
++        f.raw_size > 4092 || argument_bytes > f.raw_size ||
++        f.domain_object_count > 255) return false;
++    if (f.domain && (f.domain_data_size < 16 || argument_bytes != f.domain_data_size - 16)) return false;
++    const size_t objects = f.domain_object_count * 4;
++    const size_t cmif_header = f.domain ? 32 : 16;
++    // CMIF reserves 16 bytes for alignment, independently of the actual pad.
++    const size_t relative = (16 + cmif_header + argument_bytes + objects + 1) & ~size_t(1);
++    const size_t bytes = count * 2;
++    if (relative > f.raw_size || bytes > f.raw_size - relative) return false;
++    if (((relative + bytes + 3) & ~size_t(3)) != f.raw_size) return false;
++    // The table must follow arguments AND domain object IDs, not overlap them.
++    if (f.aligned_offset < f.raw_offset ||
++        f.aligned_offset - f.raw_offset + cmif_header + argument_bytes + objects > relative) return false;
++    table.offset = f.raw_offset + relative;
++    for (size_t i = 0; i < count; ++i) {
++        uint16_t value;
++        std::memcpy(&value, f.raw_data + relative + i * 2, sizeof value);
++        table.values.push_back(value);
++    }
++    return true;
+ }
+
+ // ---- sm: ------------------------------------------------------------------------------------------------------
+@@ -148,6 +175,15 @@
+     size_t data_start = p;
+     if (!words_fit(data_start, ndata)) framing();
+     const size_t raw_end = (data_start + ndata) * 4;
++    ctx.framing_.raw_data = reinterpret_cast<const uint8_t*>(buf + data_start * 4);
++    ctx.framing_.raw_offset = data_start * 4;
++    ctx.framing_.raw_size = ndata * 4;
++    ctx.framing_.packet_size = size;
++    ctx.framing_.receive_mode = cflags;
++    ctx.framing_.receive_list_offset = raw_end;
++    // Inline receive mode and explicit noncanonical list offsets are unsupported.
++    // Refuse them rather than silently projecting a different layout.
++    if (cflags == 1 || ((w[1] >> 20) & 0x7ff)) framing();
+     // C descriptors (receive list) after the raw data.
+     if (cflags >= 2) {
+         size_t q = data_start + ndata;
+@@ -209,6 +245,7 @@
+     // libnx cmifGetAlignedDataStart aligns the offset relative to the message.
+     const size_t raw_offset = (data_start * 4 + 15) & ~size_t(15);
+     if (raw_offset > raw_end) framing();
++    ctx.framing_.aligned_offset = raw_offset;
+     uint64_t raw = buf + raw_offset;
+     size_t cmif_size = raw_end - raw_offset;
+     std::shared_ptr<Service> target = sess->svc;
+@@ -220,6 +257,9 @@
+         const size_t nobj = ld<uint8_t>(raw + 1);
+         const size_t dsize = ld<uint16_t>(raw + 2);
+         domain_obj = ld<uint32_t>(raw + 4);
++        ctx.framing_.domain = true;
++        ctx.framing_.domain_data_size = dsize;
++        ctx.framing_.domain_object_count = nobj;
+         // CmifDomainInHeader is 16 bytes; data_size includes CmifInHeader,
+         // excludes the domain header and the immediately following object IDs.
+         // Subtraction after checking avoids underflow; bounded fields avoid sums

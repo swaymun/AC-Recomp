@@ -1,0 +1,160 @@
+diff --git a/runtime/src/nvn/nvn.h b/runtime/src/nvn/nvn.h
+--- a/runtime/src/nvn/nvn.h
++++ b/runtime/src/nvn/nvn.h
+@@ -231,6 +231,10 @@ struct Window : Object {
+     std::vector<uint64_t> textures;  // guest NVNtexture*
+     int active = 0, next = 0, interval = 1;
+     int32_t crop[4] = {};  // nvnWindowSetCrop: x, y, width, height of the texture shown (0 wide: all of it)
++#if defined(NX_ASTRAL_STRICT)
++    int32_t guest_crop[4] = {};  // what the game set, before NX_ULTRAWIDE widening (nvnWindowGetCrop returns it)
++    bool crop_set = false;
++#endif
+ };
+ 
+ // ---- samplers and descriptor pools --------------------------------------------------------------------------------
+@@ -407,6 +411,15 @@ uint64_t gpu_write_back_serial();  // the last submit that writes guest memory (
+ struct ShaderInfo;
+ const std::vector<const ShaderInfo*>* program_shaders(uint64_t program);
+ 
++#if defined(NX_ASTRAL_STRICT)
++// nvnDeviceSetDepthMode (nvn_queue.cpp): 0 NEAR_IS_MINUS_W (clip z -w..w, the default), 1 NEAR_IS_ZERO (0..w).
++// pipeline_depth_mode() is read by pipeline creation and freezes the mode: pipelines are not rebuilt, so a later
++// change is fatal. A strict depth-mode 1 with NX_CLIP_Z_PATCH=1 (depth_remap, nvn_spirv_clip.cpp) is fatal as well.
++int device_depth_mode();
++int pipeline_depth_mode();
++bool depth_remap();
++#endif
++
+ // A format's block (width, height in texels; bytes), from the SDK driver's format table (nvn_texture_layout.cpp).
+ void format_block(uint32_t format, uint32_t& block_w, uint32_t& block_h, uint32_t& bytes);
+ 
+diff --git a/runtime/src/nvn/nvn_pipeline.cpp b/runtime/src/nvn/nvn_pipeline.cpp
+--- a/runtime/src/nvn/nvn_pipeline.cpp
++++ b/runtime/src/nvn/nvn_pipeline.cpp
+@@ -225,6 +225,12 @@ VkImageView view_of(GpuImage& img, VkImageViewType type, const ViewInfo& view) {
+ 
+ // R11G11B10F (0x3f) has no alpha, stored here as RGBA16F: sampling reads alpha 1 and blending takes destination
+ // alpha as 1, as Maxwell does (G4, docs/nvn/DEBUG.md #50). NX_R11G11B10_RAW=1: the stored alpha (bisecting).
++#if defined(NX_ASTRAL_STRICT)
++// VK_EXT_depth_clip_control (clip z -w..w) only for NVN depth mode 0. Astral sets mode 1, NEAR_IS_ZERO: clip z is
++// already 0..w, Vulkan's own convention, and must not be remapped.
++bool depth_clip_control(int depth_mode) { return vk_depth_clip_control() && !depth_remap() && depth_mode == 0; }
++#endif
++
+ bool ufloat_raw() {
+     static const bool raw = std::getenv("NX_R11G11B10_RAW") != nullptr;
+     return raw;
+@@ -298,6 +304,9 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
+     Key k;
+     std::memcpy(k.b, &key, sizeof key);
+     if (auto it = cache.find(k); it != cache.end()) return (last = &*it)->second;
++#if defined(NX_ASTRAL_STRICT)
++    const bool clip_control = depth_clip_control(pipeline_depth_mode());  // freezes the mode before any module
++#endif
+ 
+     VkPipelineShaderStageCreateInfo stages[2]{};
+     VkSpecializationInfo spec_info{};
+@@ -374,7 +383,11 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
+     clip.negativeOneToOne = VK_TRUE;  // NVN depth mode 0 (Wonder): clip-space z in -1..1
+     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+     vp.viewportCount = vp.scissorCount = 1;
++#if defined(NX_ASTRAL_STRICT)
++    if (clip_control) vp.pNext = &clip;
++#else
+     if (vk_depth_clip_control() && !depth_remap()) vp.pNext = &clip;
++#endif
+ 
+     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+     rs.polygonMode = key.polygon.mode == 0 ? VK_POLYGON_MODE_POINT : key.polygon.mode == 1 ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
+@@ -656,6 +669,9 @@ VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgramLayout& layout) {
+     static std::map<std::pair<const ShaderInfo*, VkPipelineLayout>, VkPipeline> cache;
+     auto& p = cache[{cs, layout.layout}];
+     if (!p) {
++#if defined(NX_ASTRAL_STRICT)
++        pipeline_depth_mode();  // any pipeline freezes the depth mode
++#endif
+         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+         ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+diff --git a/runtime/src/nvn/nvn_queue.cpp b/runtime/src/nvn/nvn_queue.cpp
+--- a/runtime/src/nvn/nvn_queue.cpp
++++ b/runtime/src/nvn/nvn_queue.cpp
+@@ -549,6 +549,9 @@ void QueuePresentTexture(CPU& c) {
+ void WindowSetCrop(CPU& c) {
+     if (auto* w = get<Window>(c.x[0])) {
+         int32_t v[4] = {int32_t(c.x[1]), int32_t(c.x[2]), int32_t(c.x[3]), int32_t(c.x[4])};
++#if defined(NX_ASTRAL_STRICT)
++        std::memcpy(w->guest_crop, v, sizeof v), w->crop_set = true;
++#endif
+         uw_crop(v);  // NX_ULTRAWIDE
+         if (std::memcmp(v, w->crop, sizeof v) != 0) {
+             static int logged = 0;
+@@ -558,9 +561,68 @@ void WindowSetCrop(CPU& c) {
+     }
+ }
+ 
++#if defined(NX_ASTRAL_STRICT)
++// Astral sets the depth mode once at start-up, before any pipeline exists. Pipelines are not rebuilt for another
++// mode, so a change once one was created (pipeline_depth_mode) is refused rather than half applied.
++std::mutex g_depth_lock;
++int g_depth_mode = 0;  // NVN's default, NEAR_IS_MINUS_W
++bool g_depth_frozen = false, g_depth_changed = false;
++
++// void (NVNdevice*, NVNdepthMode). One device: the mode is global.
++void DeviceSetDepthMode(CPU& c) {
++    const int mode = int32_t(c.x[1]);
++    if (mode != 0 && mode != 1) fatal("strict NVN: nvnDeviceSetDepthMode with an unknown mode %d", mode);
++    // NX_CLIP_Z_PATCH rewrites vertex z from -w..w to 0..w; applied to NEAR_IS_ZERO output it would halve depth.
++    if (mode == 1 && depth_remap()) fatal("strict NVN: NX_CLIP_Z_PATCH=1 conflicts with nvnDeviceSetDepthMode NEAR_IS_ZERO");
++    std::lock_guard<std::mutex> lock(g_depth_lock);
++    if (mode == g_depth_mode) return;
++    if (g_depth_frozen) fatal("strict NVN: nvnDeviceSetDepthMode changed after a pipeline was created");
++    if (g_depth_changed) fatal("strict NVN: nvnDeviceSetDepthMode changed after start-up");
++    g_depth_mode = mode, g_depth_changed = true;
++    log("nvn: device depth mode %d (%s)", mode, mode ? "near is zero" : "near is -w");
++}
++
++void DeviceGetDepthMode(CPU& c) { c.x[0] = uint64_t(device_depth_mode()); }
++
++// void (const NVNwindow*, NVNrectangle* crop): writes {int x, y, width, height}. Astral reads it every frame to size
++// its screen targets and viewports; without it the engine read an unwritten rectangle (zero/garbage viewports).
++// Before nvnWindowSetCrop the crop covers the whole of the window's first texture. It is the game's own rectangle,
++// not the NX_ULTRAWIDE-widened one the presentation uses.
++void WindowGetCrop(CPU& c) {
++    int32_t v[4] = {};
++    auto* w = get<Window>(c.x[0]);
++    if (!w) fatal("strict NVN: nvnWindowGetCrop of an unknown window");
++    if (w->crop_set) {
++        std::memcpy(v, w->guest_crop, sizeof v);
++    } else {
++        auto* t = w->textures.empty() ? nullptr : get<Texture>(w->textures[0]);
++        if (!t) fatal("strict NVN: nvnWindowGetCrop before SetCrop on a window without a known texture");
++        v[2] = int32_t(t->width), v[3] = int32_t(t->height);
++    }
++    if (c.x[1])
++        for (int k = 0; k < 4; k++) st<int32_t>(c.x[1] + 4 * uint64_t(k), v[k]);
++}
++#endif
++
+ }  // namespace
+ 
+ NX_HLE("nvnWindowSetCrop", WindowSetCrop);
++#if defined(NX_ASTRAL_STRICT)
++NX_HLE("nvnWindowGetCrop", WindowGetCrop);
++NX_HLE("nvnDeviceSetDepthMode", DeviceSetDepthMode);
++NX_HLE("nvnDeviceGetDepthMode", DeviceGetDepthMode);
++
++int device_depth_mode() {
++    std::lock_guard<std::mutex> lock(g_depth_lock);
++    return g_depth_mode;
++}
++
++int pipeline_depth_mode() {
++    std::lock_guard<std::mutex> lock(g_depth_lock);
++    g_depth_frozen = true;
++    return g_depth_mode;
++}
++#endif
+ NX_HLE("nvnSyncInitialize", SyncInitialize);
+ NX_HLE("nvnSyncFinalize", SyncFinalize);
+ NX_HLE("nvnSyncWait", SyncWait);

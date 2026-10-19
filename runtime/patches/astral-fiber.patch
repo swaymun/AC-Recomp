@@ -1,0 +1,320 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -222,7 +222,9 @@
+     # (brew install sdl3 vulkan-headers vulkan-loader molten-vk).
+     find_package(SDL3 REQUIRED CONFIG)
+     find_path(NX_VULKAN_INCLUDE vulkan/vulkan.h HINTS /opt/homebrew/include /usr/local/include)
+-    add_executable(${NX_GAME} ${NX_RUNTIME_SOURCES} runtime/src/platform_mac.cpp runtime/src/memguard_mac.cpp)
++    enable_language(ASM)
++    add_executable(${NX_GAME} ${NX_RUNTIME_SOURCES} runtime/src/platform_mac.cpp runtime/src/memguard_mac.cpp
++        runtime/src/hle_fiber.cpp runtime/src/fiber_context_mac.S)
+     target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}" "${NX_VULKAN_INCLUDE}")
+     target_link_libraries(${NX_GAME} PRIVATE game_main game_sdk SDL3::SDL3)
+     target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden)
+diff --git a/runtime/src/fiber_context_mac.S b/runtime/src/fiber_context_mac.S
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/fiber_context_mac.S
+@@ -0,0 +1,41 @@
++// Apple arm64 ABI stack switch. No guest instructions or addresses.
++.text
++.p2align 2
++.globl _nx_fiber_swap
++_nx_fiber_swap:
++    stp x19, x20, [x0, #0]
++    stp x21, x22, [x0, #16]
++    stp x23, x24, [x0, #32]
++    stp x25, x26, [x0, #48]
++    stp x27, x28, [x0, #64]
++    stp x29, x30, [x0, #80]
++    mov x9, sp
++    str x9, [x0, #96]
++    stp q8, q9, [x0, #112]
++    stp q10, q11, [x0, #144]
++    stp q12, q13, [x0, #176]
++    stp q14, q15, [x0, #208]
++    mrs x9, fpcr
++    mrs x10, fpsr
++    stp x9, x10, [x0, #240]
++    ldp x19, x20, [x1, #0]
++    ldp x21, x22, [x1, #16]
++    ldp x23, x24, [x1, #32]
++    ldp x25, x26, [x1, #48]
++    ldp x27, x28, [x1, #64]
++    ldp x29, x30, [x1, #80]
++    ldr x9, [x1, #96]
++    mov sp, x9
++    ldp q8, q9, [x1, #112]
++    ldp q10, q11, [x1, #144]
++    ldp q12, q13, [x1, #176]
++    ldp q14, q15, [x1, #208]
++    ldp x9, x10, [x1, #240]
++    msr fpcr, x9
++    msr fpsr, x10
++    ret
++.globl _nx_fiber_enter
++_nx_fiber_enter:
++    mov x0, x19
++    blr x20
++    brk #0
+diff --git a/runtime/src/hle_fiber.cpp b/runtime/src/hle_fiber.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/hle_fiber.cpp
+@@ -0,0 +1,209 @@
++// Original stackful bridge. Guest lifecycle and TLS remain SDK-owned.
++#include <nx/runtime.h>
++#include "kernel.h"
++#include "platform.h"
++#include <sys/mman.h>
++#include <unistd.h>
++#include <map>
++#include <algorithm>
++#include <memory>
++#include <mutex>
++#include <cstring>
++
++#if !defined(__APPLE__) || !defined(__aarch64__)
++#error The fiber adapter requires the Apple arm64 backend
++#endif
++namespace nx {
++const char* fiber_exchange_hle_name(const char*);
++namespace {
++constexpr size_t frame_bytes = 240;
++constexpr size_t host_stack_bytes = 8 * 1024 * 1024;
++constexpr const char* dispatch_name = "_ZN2nn2os6detail20DispatchFiberContextEPPNS1_22FiberContextForHorizonES4_";
++constexpr const char* finalize_name = "_ZN2nn2os13FinalizeFiberEPNS0_9FiberTypeE";
++struct alignas(16) HostContext {
++    uint64_t x[12]{}; // x19..x30
++    uint64_t sp{}, reserved{};
++    V128 q[8]{};
++    uint64_t fpcr{}, fpsr{};
++};
++static_assert(offsetof(HostContext, sp)==96 && offsetof(HostContext,q)==112 && offsetof(HostContext,fpcr)==240);
++extern "C" void nx_fiber_swap(HostContext*, const HostContext*);
++extern "C" void nx_fiber_enter();
++struct Context {
++    HostContext host;
++    uint64_t slot{}, saved{}, pc{}, object{};
++    const char* hle_name = nullptr;
++    void* allocation = nullptr;
++    size_t allocation_bytes = 0;
++    bool suspended = false;
++    ~Context() { if (allocation) munmap(allocation, allocation_bytes); }
++};
++struct ThreadState {
++    CPU* cpu = nullptr;
++    KThread* thread = nullptr;
++    uint64_t tls{}, ro{};
++    Context root;
++    Context* active = &root;
++    bool exiting = false;
++    std::map<uint64_t,std::unique_ptr<Context>> contexts;
++};
++thread_local ThreadState state;
++std::mutex owners_lock;
++std::map<uint64_t,ThreadState*> owners;
++
++void range(uint64_t p, uint64_t n, uint32_t perm, uint64_t alignment) {
++    if (!p || (p & (alignment-1)) || !n || p>UINT64_MAX-n) fatal("fiber: invalid range/alignment");
++    for (uint64_t at=p,end=p+n; at<end;) {
++        auto v=vm_query(at);
++        if (!v.state || (v.perm & perm)!=perm || at<v.addr || at-v.addr>=v.size || v.addr>UINT64_MAX-v.size)
++            fatal("fiber: unmapped or protected range");
++        at=std::min(end,v.addr+v.size);
++    }
++}
++void bind(CPU& c) {
++    auto* t=self_thread();
++    if (!t || &t->ctx!=&c || t->exited) fatal("fiber: invalid thread/CPU owner");
++    if (!state.cpu) { state.cpu=&c; state.thread=t; state.tls=c.tpidr; state.ro=c.tpidrro; }
++    if (state.cpu!=&c || state.thread!=t || state.tls!=c.tpidr || state.ro!=c.tpidrro)
++        fatal("fiber: changed thread/TLS owner");
++}
++void claim(uint64_t slot) {
++    std::lock_guard lock(owners_lock);
++    auto [it,inserted]=owners.emplace(slot,&state);
++    if (!inserted && it->second!=&state) fatal("fiber: foreign context");
++}
++void release(uint64_t slot) {
++    std::lock_guard lock(owners_lock);
++    auto it=owners.find(slot);
++    if (it!=owners.end() && it->second==&state) owners.erase(it);
++}
++void restore(CPU& c, uint64_t p) {
++    c.x[2]=p; c.x[0]=ld<uint64_t>(p);
++    for (int i=19;i<=30;++i) c.x[i]=ld<uint64_t>(p+8*(i-18));
++    for (int i=8;i<=15;++i) c.v[i]=ld<V128>(p+112+16*(i-8));
++    c.x[31]=p+frame_bytes;
++}
++void save(CPU& c, Context& from, uint64_t slot) {
++    uint64_t p=c.x[31]-frame_bytes;
++    st<uint64_t>(p,0);
++    for(int i=19;i<=30;++i) st<uint64_t>(p+8*(i-18),c.x[i]);
++    st<uint64_t>(p+104,0);
++    for(int i=8;i<=15;++i) st<V128>(p+112+16*(i-8),c.v[i]);
++    st<uint64_t>(slot,p);
++    from.saved=p; from.pc=c.x[30]; from.suspended=true;
++}
++[[noreturn]] void enter(void*) {
++    auto& c=*state.cpu;
++    // Only first entry is table-dispatched. Resumption always uses the host stack.
++    call(c,c.x[30]);
++    fatal("fiber: SDK trampoline returned without a context transfer");
++}
++Context* destination(uint64_t slot) {
++    { std::lock_guard lock(owners_lock); auto it=owners.find(slot);
++      if(it!=owners.end() && it->second!=&state) fatal("fiber: foreign context"); }
++    if (slot==state.root.slot) {
++        if (!state.root.suspended) fatal("fiber: inactive root");
++        return &state.root;
++    }
++    auto it=state.contexts.find(slot);
++    if (it!=state.contexts.end()) {
++        auto* d=it->second.get();
++        if (!d->suspended || d==state.active || ld<uint64_t>(slot)!=d->saved || ld<uint64_t>(d->saved+96)!=d->pc)
++            fatal("fiber: stale or active continuation");
++        range(d->object,88,3,8);
++        if (ld<uint8_t>(d->object+32)!=2) fatal("fiber: destination lifecycle");
++        return d;
++    }
++    const uint64_t p=ld<uint64_t>(slot), object=ld<uint64_t>(p);
++    range(object,88,3,8);
++    if (object>UINT64_MAX-80 || object+80!=slot || ld<uint8_t>(object+32)!=2)
++        fatal("fiber: invalid first entry/lifecycle");
++    uint64_t stack=ld<uint64_t>(object+64), bytes=ld<uint64_t>(object+72);
++    if (bytes<frame_bytes || stack>UINT64_MAX-bytes || p!=stack+bytes-frame_bytes)
++        fatal("fiber: invalid initial stack");
++    range(stack,bytes,3,16);
++    auto pc=ld<uint64_t>(p+96); range(pc,4,5,4);
++    auto* module=module_at(pc);
++    if (!module || pc-module->base>=module->info->text_size || !module->table[(pc-module->base)/4])
++        fatal("fiber: first continuation is not an entry");
++    if (state.contexts.size()>=1024) fatal("fiber: context capacity exceeded");
++    auto d=std::make_unique<Context>();d->slot=slot;d->object=object;
++    const size_t page=size_t(sysconf(_SC_PAGESIZE));
++    d->allocation_bytes=host_stack_bytes+2*page;
++    d->allocation=mmap(nullptr,d->allocation_bytes,PROT_NONE,MAP_PRIVATE|MAP_ANON,-1,0);
++    if (d->allocation==MAP_FAILED) {d->allocation=nullptr;fatal("fiber: stack reservation failed");}
++    auto start=reinterpret_cast<uintptr_t>(d->allocation)+page;
++    if (mprotect(reinterpret_cast<void*>(start),host_stack_bytes,PROT_READ|PROT_WRITE)) fatal("fiber: stack commit failed");
++    d->host.sp=start+host_stack_bytes;
++    d->host.x[0]=0;d->host.x[1]=reinterpret_cast<uint64_t>(&enter);
++    d->host.x[11]=reinterpret_cast<uint64_t>(&nx_fiber_enter);
++    claim(slot);auto* result=d.get();state.contexts.emplace(slot,std::move(d));return result;
++}
++void clear() {
++    for(auto& item:state.contexts) release(item.first);
++    release(state.root.slot);state.contexts.clear();
++    state.root=Context{};state.active=&state.root;state.cpu=nullptr;state.thread=nullptr;
++    state.exiting=false;
++}
++void dispatch(CPU& c) {
++    bind(c);
++    const uint64_t from_slot=c.x[0],to_slot=c.x[1];
++    if(from_slot==to_slot || c.x[31]<frame_bytes) fatal("fiber: self transfer/stack underflow");
++    range(from_slot,8,3,8);range(to_slot,8,3,8);
++    range(c.x[31]-frame_bytes,frame_bytes,3,16);
++    range(ld<uint64_t>(to_slot),frame_bytes,3,16);
++    auto* from=state.active;
++    if(from==&state.root) {
++        if(from->slot!=from_slot) {release(from->slot);from->slot=from_slot;}
++    } else if(from->slot!=from_slot) fatal("fiber: source context mismatch");
++    if(from!=&state.root) {
++        range(from->object,88,3,8);
++        auto low=ld<uint64_t>(from->object+64), size=ld<uint64_t>(from->object+72);
++        if(size<frame_bytes || low>UINT64_MAX-size || c.x[31]<low+frame_bytes || c.x[31]>low+size)
++            fatal("fiber: source stack outside owned guest range");
++        auto life=ld<uint8_t>(from->object+32);
++        if(life!=1 && life!=3) fatal("fiber: source lifecycle");
++    }
++    claim(from_slot);
++    auto* to=destination(to_slot);
++    if(to==from) fatal("fiber: self continuation");
++    if(to==&state.root && (ld<uint64_t>(to_slot)!=to->saved || ld<uint64_t>(to->saved+96)!=to->pc))
++        fatal("fiber: stale root");
++    save(c,*from,from_slot);
++    restore(c,ld<uint64_t>(to_slot));
++    from->hle_name=fiber_exchange_hle_name(to->hle_name);
++    to->suspended=false;state.active=to;
++    nx_fiber_swap(&from->host,&to->host);
++    if(state.exiting) { clear();plat::exit_thread(); }
++    if(state.active!=from) fatal("fiber: host continuation ownership mismatch");
++    bind(c);
++}
++void finalize(CPU& c) {
++    bind(c);uint64_t object=c.x[0];range(object,88,3,8);uint64_t slot=object+80;
++    { std::lock_guard lock(owners_lock);auto it=owners.find(slot);
++      if(it!=owners.end() && it->second!=&state) fatal("fiber: foreign finalization"); }
++    auto it=state.contexts.find(slot);
++    if(it!=state.contexts.end() && it->second.get()==state.active) fatal("fiber: active finalization");
++    auto lifecycle=ld<uint8_t>(object+32);
++    if(lifecycle!=1 && lifecycle!=3) fatal("fiber: invalid finalization lifecycle");
++    uint64_t original=find_symbol(finalize_name);
++    if(!original || !module_at(original)) fatal("fiber: original finalizer missing");
++    call(c,original); // Keep all SDK assertions and lifecycle writes.
++    if(ld<uint8_t>(object+32)!=0) fatal("fiber: finalizer did not retire object");
++    state.contexts.erase(slot);release(slot);
++}
++} // namespace
++void fiber_retire_thread() {
++    if(!state.cpu) return;
++    if(state.active!=&state.root) {
++        if(!state.root.suspended) fatal("fiber: thread exit lacks root continuation");
++        state.exiting=true;auto* from=state.active;state.active=&state.root;
++        fiber_exchange_hle_name(state.root.hle_name);
++        nx_fiber_swap(&from->host,&state.root.host);
++        fatal("fiber: retired continuation resumed");
++    }
++    clear();
++}
++NX_HLE(dispatch_name,dispatch);
++NX_HLE(finalize_name,finalize);
++} // namespace nx
+diff --git a/runtime/src/kernel.cpp b/runtime/src/kernel.cpp
+--- a/runtime/src/kernel.cpp
++++ b/runtime/src/kernel.cpp
+@@ -24,6 +24,11 @@
+ #endif
+
+ namespace nx {
++#if defined(__APPLE__) && defined(__aarch64__) && !defined(NX_IOS_RUNTIME)
++void fiber_retire_thread();
++#else
++static void fiber_retire_thread() {}
++#endif
+
+ namespace kstate {  // kernel_state.h
+
+@@ -453,6 +458,7 @@
+     std::snprintf(name, sizeof name, "g%llx", (unsigned long long)t->id);
+     plat::set_thread_name(name);
+     call(t->ctx, t->entry);
++    fiber_retire_thread();
+     // Returning from the entry point is like svcExitThread.
+     std::lock_guard lk(g_k);
+     retire_thread(t);
+@@ -592,6 +598,7 @@
+                 retire_thread(t_self);
+                 notify_all();
+             }
++            fiber_retire_thread();
+             plat::exit_thread();
+         }
+         case 0x0B: {  // SleepThread(ns)
+diff --git a/runtime/src/loader.cpp b/runtime/src/loader.cpp
+--- a/runtime/src/loader.cpp
++++ b/runtime/src/loader.cpp
+@@ -117,6 +117,11 @@
+
+ const char* hle_current_name() { return t_missing_name; }
+
++// The thunk stack is suspended with a fiber; its diagnostic name follows it.
++const char* fiber_exchange_hle_name(const char* name) {
++    const char* previous=t_missing_name; t_missing_name=name; return previous;
++}
++
+ // ---- dispatch -------------------------------------------------------------------------------------------------
+
+ const LoadedModule* module_at(uint64_t addr) {

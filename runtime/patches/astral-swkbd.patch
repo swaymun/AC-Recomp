@@ -1,0 +1,144 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -184,6 +184,10 @@ set(NX_RUNTIME_SOURCES
+ )
+ file(GLOB NX_GAME_SOURCES CONFIGURE_DEPENDS "${NX_GAME_DIR}/*.cpp")
+ list(APPEND NX_RUNTIME_SOURCES ${NX_GAME_SOURCES})
++# Astral strict: the software keyboard answered at the API level (no keyboard applet).
++if(NX_GAME STREQUAL "astral")
++    list(APPEND NX_RUNTIME_SOURCES runtime/src/hle_swkbd.cpp)
++endif()
+ 
+ # Explicit opt-in: ordinary targets retain their dependencies and services.
+ option(NX_HWOPUS "Enable the host single-stream hwopus service" OFF)
+diff --git a/runtime/src/hle_swkbd.cpp b/runtime/src/hle_swkbd.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/hle_swkbd.cpp
+@@ -0,0 +1,125 @@
++// nn::swkbd (software keyboard) at the API level; Astral strict builds only.
++//
++// Astral's name entry (main+0x995390) uses the full keyboard applet: InitializeKeyboardConfig, MakePreset, a work
++// buffer and a 0x7d4-byte string buffer, SetInitialText, then nn::swkbd::ShowKeyboard(String* out, const
++// ShowKeyboardArg& arg) (sdk+0x371900). That would need am's CreateLibraryApplet, which strict mode does not
++// implement, so this answers at the API level with a deterministic name instead: NX_PLAYER_NAME, else "Player".
++// NX_SWKBD_CANCEL=1 takes the cancel path instead (ResultCanceled, empty text) to exercise the game's handling.
++//
++// Layout from Astral's SDK: String {u64 ptr, u64 size}; ShowKeyboardArg is the KeyboardConfig (TextMaxLength u32
++// @0x3ac, TextMinLength u32 @0x3b0, IsUseUtf8 u8 @0x3bd, IsUseTextCheck u8 @0x3d0) and the work buffer {ptr @0x4d0,
++// size @0x4d8}. The applet's output storage is {u32 CloseResult, text}; ReadCloseResultAndString (sdk+0x371540)
++// copies out->size bytes of text into out->ptr (nothing when either is 0), and ShowKeyboard returns 0 for
++// CloseResult 0 (OK) and 0x29f (ResultCanceled) otherwise. The text is UTF-16 unless IsUseUtf8, NUL-terminated.
++// Lengths are in UTF-16 code units, at most 500 (0 means 500).
++#if defined(NX_ASTRAL_STRICT)
++#include <algorithm>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include <nx/runtime.h>
++
++#include "platform.h"
++
++namespace nx {
++
++namespace {
++
++constexpr uint32_t kResultCanceled = 0x29f;
++constexpr uint32_t kMaxTextLength = 500;
++
++// Strict UTF-8 -> code points: no overlongs, surrogates or values past U+10FFFF.
++std::vector<uint32_t> utf8_code_points(const std::string& s) {
++    std::vector<uint32_t> out;
++    for (size_t i = 0; i < s.size();) {
++        const auto c = uint8_t(s[i++]);
++        uint32_t cp, minimum;
++        unsigned extra;
++        if (c < 0x80) { out.push_back(c); continue; }
++        if (c >= 0xc2 && c <= 0xdf) { extra = 1; cp = c & 0x1f; minimum = 0x80; }
++        else if (c >= 0xe0 && c <= 0xef) { extra = 2; cp = c & 0x0f; minimum = 0x800; }
++        else if (c >= 0xf0 && c <= 0xf4) { extra = 3; cp = c & 0x07; minimum = 0x10000; }
++        else fatal("swkbd: NX_PLAYER_NAME is not valid UTF-8");
++        if (extra > s.size() - i) fatal("swkbd: NX_PLAYER_NAME is not valid UTF-8");
++        while (extra--) {
++            const auto b = uint8_t(s[i++]);
++            if ((b & 0xc0) != 0x80) fatal("swkbd: NX_PLAYER_NAME is not valid UTF-8");
++            cp = (cp << 6) | (b & 0x3f);
++        }
++        if (cp < minimum || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))
++            fatal("swkbd: NX_PLAYER_NAME is not valid UTF-8");
++        out.push_back(cp);
++    }
++    return out;
++}
++
++unsigned utf16_units(uint32_t cp) { return cp >= 0x10000 ? 2 : 1; }
++
++void ShowKeyboard(CPU& c) {
++    const uint64_t out = c.x[0], arg = c.x[1];
++    if (!out || !arg) fatal("swkbd: ShowKeyboard with a null String or ShowKeyboardArg");
++    if (ld<uint8_t>(arg + 0x3d0)) fatal("swkbd: text check callbacks are not supported");
++    const uint64_t buf = ld<uint64_t>(out), size = ld<uint64_t>(out + 8);
++    const bool utf8 = ld<uint8_t>(arg + 0x3bd) != 0;
++    uint32_t max_len = ld<uint32_t>(arg + 0x3ac);
++    if (max_len == 0 || max_len > kMaxTextLength) max_len = kMaxTextLength;
++    const uint32_t min_len = std::min(ld<uint32_t>(arg + 0x3b0), max_len);
++    if (buf && size) std::memset(reinterpret_cast<void*>(buf), 0, size);
++    if (plat::setting("SWKBD_CANCEL") == "1") {
++        log("swkbd: ShowKeyboard -> canceled (NX_SWKBD_CANCEL)");
++        c.x[0] = kResultCanceled;
++        return;
++    }
++    std::string name = plat::setting("PLAYER_NAME");
++    if (name.empty()) name = "Player";
++    const auto base = utf8_code_points(name);
++    // Repeat to the minimum length (matching observed system behaviour), then keep whole characters up to the maximum.
++    std::vector<uint32_t> text;
++    uint32_t units = 0;
++    for (size_t i = 0; units < min_len; i = (i + 1) % base.size()) {
++        text.push_back(base[i]);
++        units += utf16_units(base[i]);
++    }
++    if (text.empty()) text = base;
++    std::vector<uint32_t> kept;
++    units = 0;
++    for (uint32_t cp : text) {
++        if (units + utf16_units(cp) > max_len) break;
++        kept.push_back(cp);
++        units += utf16_units(cp);
++    }
++    // Encode, leaving room for the terminator in the caller's buffer.
++    std::vector<uint8_t> bytes;
++    for (uint32_t cp : kept) {
++        uint8_t enc[4];
++        size_t n = 0;
++        if (utf8) {
++            if (cp < 0x80) enc[n++] = uint8_t(cp);
++            else if (cp < 0x800) { enc[n++] = uint8_t(0xc0 | cp >> 6); enc[n++] = uint8_t(0x80 | (cp & 0x3f)); }
++            else if (cp < 0x10000) {
++                enc[n++] = uint8_t(0xe0 | cp >> 12); enc[n++] = uint8_t(0x80 | ((cp >> 6) & 0x3f));
++                enc[n++] = uint8_t(0x80 | (cp & 0x3f));
++            } else {
++                enc[n++] = uint8_t(0xf0 | cp >> 18); enc[n++] = uint8_t(0x80 | ((cp >> 12) & 0x3f));
++                enc[n++] = uint8_t(0x80 | ((cp >> 6) & 0x3f)); enc[n++] = uint8_t(0x80 | (cp & 0x3f));
++            }
++        } else {
++            auto unit = [&](uint32_t u) { enc[n++] = uint8_t(u); enc[n++] = uint8_t(u >> 8); };
++            if (cp < 0x10000) unit(cp);
++            else { unit(0xd800 | ((cp - 0x10000) >> 10)); unit(0xdc00 | ((cp - 0x10000) & 0x3ff)); }
++        }
++        if (bytes.size() + n + (utf8 ? 1 : 2) > size) break;
++        bytes.insert(bytes.end(), enc, enc + n);
++    }
++    if (buf && size) std::memcpy(reinterpret_cast<void*>(buf), bytes.data(), bytes.size());
++    log("swkbd: ShowKeyboard -> OK, %zu %s bytes", bytes.size(), utf8 ? "UTF-8" : "UTF-16");
++    c.x[0] = 0;
++}
++
++}  // namespace
++
++NX_HLE("_ZN2nn5swkbd12ShowKeyboardEPNS0_6StringERKNS0_15ShowKeyboardArgE", ShowKeyboard);
++
++}  // namespace nx
++#endif

@@ -1,0 +1,28 @@
+diff --git a/Program.cs b/Program.cs
+--- a/Program.cs
++++ b/Program.cs
+@@ -44,11 +44,15 @@
+         static readonly TimeSpan Timeout = TimeSpan.FromSeconds(60);
+         static bool NoRetry;   // --no-retry: report attempt 1 only (the translator as Ryujinx runs it)
+         static bool Debug;     // --debug-mode: DebugMode from attempt 1 (also reports undecodable opcodes)
++        // --astral-headerless-compute: Astral Chain's compute blocks have no NVN compute header (magic 0x12345679)
++        // and their control records program start 0; graphics blocks always start after the 0x30-byte header.
++        static bool HeaderlessCompute;
+ 
+         static int Main(string[] args)
+         {
+             NoRetry = args.Contains("--no-retry");
+             Debug = args.Contains("--debug-mode");
++            HeaderlessCompute = args.Contains("--astral-headerless-compute");
+             try
+             {
+                 if (args.Length >= 2 && args[0] == "--batch") return Batch(args);
+@@ -90,7 +94,7 @@
+             int start = BitConverter.ToInt32(ctrl, 0x708);
+             int constSize = BitConverter.ToInt32(ctrl, 0x6fc);
+             int constOff = BitConverter.ToInt32(ctrl, 0x700);
+-            bool compute = BitConverter.ToUInt32(code, 0) == ComputeMagic;
++            bool compute = BitConverter.ToUInt32(code, 0) == ComputeMagic || (HeaderlessCompute && start == 0);
+             // SPH word 0 bits 10..13: 1 vertex, 5 pixel (only these exist in Wonder). Used here for binding ranges only;
+             // the translator reads the SPH itself.
+             int sphType = compute ? 0 : (BitConverter.ToInt32(code, start) >> 10) & 0xf;

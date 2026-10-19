@@ -1,0 +1,36 @@
+diff --git a/runtime/src/nvn/nvn_objects.cpp b/runtime/src/nvn/nvn_objects.cpp
+--- a/runtime/src/nvn/nvn_objects.cpp
++++ b/runtime/src/nvn/nvn_objects.cpp
+@@ -522,6 +522,22 @@ void release_kept(uint64_t key) {
+ // nvnTextureWriteTexels(const NVNtexture*, const NVNtextureView*, const NVNcopyRegion*, const void* data) and the
+ // Strided form (+ ptrdiff_t rowStride, ptrdiff_t imageStride). NVNcopyRegion: {int x, y, z, width, height, depth}.
+ // The driver would swizzle the texels into the texture's memory; we keep them for the GPU image instead.
++#if defined(NX_ASTRAL_STRICT)
++// Pending writes that `w` covers completely (same level, contained box) are dropped before `w` is queued: applying them
++// first would only be overwritten. The title's movie planes are written every frame and applied only when sampled;
++// the queue grew by ~1 GB every 30 s on Linux and the iOS simulator (docs/ASTRAL_TEXEL_COALESCE.md).
++void drop_covered_writes(std::vector<Texture::TexelWrite>& writes, const Texture::TexelWrite& w) {
++    writes.erase(std::remove_if(writes.begin(), writes.end(),
++                                [&](const Texture::TexelWrite& o) {
++                                    return o.level == w.level && o.x >= w.x && o.y >= w.y && o.z >= w.z &&
++                                           uint64_t(o.x) + o.w <= uint64_t(w.x) + w.w &&
++                                           uint64_t(o.y) + o.h <= uint64_t(w.y) + w.h &&
++                                           uint64_t(o.z) + o.d <= uint64_t(w.z) + w.d;
++                                }),
++                 writes.end());
++}
++#endif
++
+ void write_texels(CPU& c, uint64_t row_stride, uint64_t image_stride) {
+     auto* t = get<Texture>(c.x[0]);
+     uint64_t region = c.x[2], data = c.x[3];
+@@ -548,6 +564,9 @@ void write_texels(CPU& c, uint64_t row_stride, uint64_t image_stride) {
+     if (n == 1 || n == 100 || n == 1000)
+         log("nvn: WriteTexels #%llu into %llx (%ux%u fmt %#x): %ux%ux%u at %u,%u,%u level %u", (unsigned long long)n,
+             (unsigned long long)c.x[0], t->width, t->height, t->format, w.w, w.h, w.d, w.x, w.y, w.z, w.level);
++#if defined(NX_ASTRAL_STRICT)
++    drop_covered_writes(t->writes, w);
++#endif
+     t->writes.push_back(std::move(w));
+     t->has_writes.store(true, std::memory_order_release);
+ }

@@ -1,0 +1,167 @@
+diff --git a/runtime/src/hle_pl.cpp b/runtime/src/hle_pl.cpp
+--- a/runtime/src/hle_pl.cpp
++++ b/runtime/src/hle_pl.cpp
+@@ -8,12 +8,16 @@
+ // So any TrueType font works: <data root>/fonts/shared_<type>.ttf (0 standard, 1 simplified Chinese, 2 its
+ // extension, 3 traditional Chinese, 4 Korean, 5 Nintendo extension), else shared.ttf, else the host's own
+ // (NX_SHARED_FONT, or a system font on macOS, Android and Windows). The fonts on our own firmware dump can go there once decoded.
++// Astral strict builds replace this with the firmware's own BFTTF fonts and the SDK's address convention (below).
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <mutex>
+ #include <string>
+ #include <vector>
++#if defined(NX_ASTRAL_STRICT)
++#include <algorithm>
++#endif
+ 
+ #include <nx/runtime.h>
+ 
+@@ -42,6 +46,7 @@ std::vector<uint8_t> read_file(const std::string& path) {
+     return v;
+ }
+ 
++#if !defined(NX_ASTRAL_STRICT)
+ const Font& font(uint32_t type) {
+     static std::mutex lock;
+     static Font fonts[6];
+@@ -87,11 +92,138 @@ const Font& font(uint32_t type) {
+ void GetSharedFontLoadState(CPU& c) { c.x[0] = 1; }  // SharedFontLoadState_Loaded
+ void GetSharedFontAddress(CPU& c) { c.x[0] = font(uint32_t(c.x[0])).addr; }
+ void GetSharedFontSize(CPU& c) { c.x[0] = font(uint32_t(c.x[0])).size; }
++#else
++// Astral (strict): the system fonts of the owner's firmware, never a host font, and nothing loads without them.
++// Astral's main (main+0x5638f0) lists the fonts with nn::pl::GetSharedFont and loads each listed type through
++// main+0x562ac0, which passes GetSharedFontAddress(type) straight to nn::fontll::ScalableFontEngine::LoadFont
++// (FSS_load_font). Astral never calls ScalableFontEngineHelper::Decode, so the address must be the TrueType data
++// itself: the SDK's GetSharedFontAddress (sdk+0x32a560) returns the mapped shared memory plus the pl:u offset, which
++// is past each font's 8-byte header, and GetSharedFontSize (sdk+0x32a700) the TrueType size. The fonts are laid out
++// as pl does: one 0x1100000 region, types 0..5 back to back, each {plain magic, encoded size} then the TrueType.
++// Files: <NX_SHARED_FONT_DIR, else data root/shared-fonts>/<name>.bfttf, from the owner's firmware (README).
++constexpr uint64_t kSharedFontRegion = 0x1100000;
++constexpr uint32_t kBfttfMagic = 0x18029A7F, kBfttfKey = 0x49621806;
++constexpr uint32_t kBfttfAltWord = 0x1A879BD9, kBfttfAltKey = 0xA6018502;  // the SDK decoder's second key
++constexpr const char* kSharedFontFiles[6] = {
++    "nintendo_udsg-r_std_003.bfttf",        // 0 standard (JP/US/EU)
++    "nintendo_udsg-r_org_zh-cn_003.bfttf",  // 1 Chinese simplified
++    "nintendo_udsg-r_ext_zh-cn_003.bfttf",  // 2 Chinese simplified extension
++    "nintendo_udjxh-db_zh-tw_003.bfttf",    // 3 Chinese traditional
++    "nintendo_udsg-r_ko_003.bfttf",         // 4 Korean
++    "nintendo_ext_003.bfttf",               // 5 Nintendo extended
++};
++
++uint32_t bswap32(uint32_t v) { return (v >> 24) | ((v >> 8) & 0xff00) | ((v << 8) & 0xff0000) | (v << 24); }
++
++// BFTTF -> TrueType as nn::fontll::ScalableFontEngineHelper::Decode (sdk+0x18fb60): little-endian words XORed with
++// the byte-swapped key after the {magic, size} header; the first word selects the key.
++std::vector<uint8_t> decode_bfttf(const std::vector<uint8_t>& in, const std::string& path) {
++    if (in.size() < 8) fatal("pl: shared font %s is truncated", path.c_str());
++    uint32_t w0, w1;
++    std::memcpy(&w0, in.data(), 4);
++    std::memcpy(&w1, in.data() + 4, 4);
++    const uint32_t key = w0 == kBfttfAltWord ? kBfttfAltKey : kBfttfKey;
++    if ((bswap32(w0) ^ key) != bswap32(kBfttfMagic)) fatal("pl: %s is not a BFTTF font", path.c_str());
++    const uint32_t size = bswap32(w1) ^ key;
++    if (size < 12 || size > in.size() - 8) fatal("pl: shared font %s has an invalid size", path.c_str());
++    std::vector<uint8_t> out(size);
++    for (size_t i = 0; i < size; i += 4) {
++        uint32_t w = 0;
++        std::memcpy(&w, in.data() + 8 + i, std::min<size_t>(4, in.size() - 8 - i));
++        w ^= bswap32(key);
++        std::memcpy(out.data() + i, &w, std::min<size_t>(4, size - i));
++    }
++    static const char* const tags[] = {"\x00\x01\x00\x00", "OTTO", "true", "ttcf"};
++    bool ok = false;
++    for (const char* t : tags) ok |= std::memcmp(out.data(), t, 4) == 0;
++    if (!ok) fatal("pl: shared font %s does not decode to TrueType/OpenType", path.c_str());
++    return out;
++}
++
++struct SharedFonts {
++    uint64_t base = 0;
++    uint32_t offset[6] = {}, size[6] = {};  // TrueType data: offset in the region (past the header) and size
++};
++
++const SharedFonts& shared_fonts() {
++    static std::once_flag once;
++    static SharedFonts s;
++    std::call_once(once, [] {
++        std::string dir = plat::setting("SHARED_FONT_DIR");
++        if (dir.empty()) dir = plat::data_root() + "/shared-fonts";
++        std::vector<uint8_t> ttf[6];
++        uint64_t total = 0;
++        for (uint32_t t = 0; t < 6; ++t) {
++            const std::string path = dir + "/" + kSharedFontFiles[t];
++            auto raw = read_file(path);
++            if (raw.empty())
++                fatal("pl: missing shared font %s (extract the firmware's shared fonts, see README; "
++                      "NX_SHARED_FONT_DIR overrides the directory)", path.c_str());
++            ttf[t] = decode_bfttf(raw, path);
++            total += 8 + ttf[t].size();
++        }
++        if (total > kSharedFontRegion) fatal("pl: shared fonts exceed the 0x1100000-byte region");
++        s.base = kernel_alloc(kSharedFontRegion);
++        uint64_t at = 0;
++        for (uint32_t t = 0; t < 6; ++t) {
++            const uint32_t n = uint32_t(ttf[t].size());
++            st<uint32_t>(s.base + at, kBfttfMagic);
++            st<uint32_t>(s.base + at + 4, bswap32(n ^ kBfttfKey));
++            std::memcpy(reinterpret_cast<void*>(s.base + at + 8), ttf[t].data(), n);
++            s.offset[t] = uint32_t(at + 8);
++            s.size[t] = n;
++            at += 8 + n;
++        }
++        log("pl: shared fonts 0-5 from %s (%llu bytes)", dir.c_str(), (unsigned long long)total);
++    });
++    return s;
++}
++
++uint32_t font_type(uint64_t v) {
++    if (uint32_t(v) >= 6) fatal("pl: invalid SharedFontType %u", uint32_t(v));
++    return uint32_t(v);
++}
++
++void GetSharedFontLoadState(CPU& c) {
++    font_type(c.x[0]);
++    shared_fonts();
++    c.x[0] = 1;  // SharedFontLoadState_Loaded
++}
++void GetSharedFontAddress(CPU& c) {
++    const auto& s = shared_fonts();
++    c.x[0] = s.base + s.offset[font_type(c.x[0])];
++}
++void GetSharedFontSize(CPU& c) {
++    const auto& s = shared_fonts();
++    c.x[0] = s.size[font_type(c.x[0])];
++}
++// bool GetSharedFont(int* outCount, SharedFontData* out, int count, settings::LanguageCode), sdk+0x32aa70: pl:u
++// GetSharedFontInOrderOfPriority, then *outCount = the service's count (before clamping) and, for min(count, that),
++// out[i] = {u32 type @0, u64 address @8 (region + offset), u64 size @0x10}, stride 0x18; true when loaded. The order
++// is types 0..5 whatever the language, matching observed behaviour.
++void GetSharedFont(CPU& c) {
++    const auto& s = shared_fonts();
++    const uint64_t out_count = c.x[0], out = c.x[1];
++    const int32_t count = int32_t(uint32_t(c.x[2]));
++    if (!out_count || (count > 0 && !out)) fatal("pl: GetSharedFont with a null output");
++    st<int32_t>(out_count, 6);
++    for (int32_t i = 0; i < std::min<int32_t>(count, 6); ++i) {
++        const uint64_t e = out + 0x18 * uint64_t(i);
++        st<uint32_t>(e, uint32_t(i));
++        st<uint64_t>(e + 8, s.base + s.offset[i]);
++        st<uint64_t>(e + 0x10, s.size[i]);
++    }
++    c.x[0] = 1;
++}
++#endif
+ 
+ }  // namespace
+ 
+ NX_HLE("_ZN2nn2pl22GetSharedFontLoadStateENS0_14SharedFontTypeE", GetSharedFontLoadState);
+ NX_HLE("_ZN2nn2pl20GetSharedFontAddressENS0_14SharedFontTypeE", GetSharedFontAddress);
+ NX_HLE("_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE", GetSharedFontSize);
++#if defined(NX_ASTRAL_STRICT)
++NX_HLE("_ZN2nn2pl13GetSharedFontEPiPNS0_14SharedFontDataEiNS_8settings12LanguageCodeE", GetSharedFont);
++#endif
+ 
+ }  // namespace nx

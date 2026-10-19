@@ -1,0 +1,345 @@
+diff --git a/runtime/src/hle_hid.cpp b/runtime/src/hle_hid.cpp
+--- a/runtime/src/hle_hid.cpp
++++ b/runtime/src/hle_hid.cpp
+@@ -2,6 +2,9 @@
+ // Raw touch, motion sensors and controller-support applet are not supplied by plat.
+ #include <algorithm>
+ #include <array>
++#if defined(NX_ASTRAL_STRICT)
++#include <atomic>
++#endif
+ #include <cstring>
+ #include <deque>
+ #include <mutex>
+@@ -135,6 +138,116 @@
+     require_memory(c.x[0],bytes,2); std::memset(reinterpret_cast<void*>(c.x[0]),0,bytes);
+     // Zero attributes/count explicitly mean absent; no raw contacts or sensor samples are invented.
+ }
++#if defined(NX_ASTRAL_STRICT)
++// Astral strict: the touch screen from plat::read_touches (docs/ASTRAL_TOUCH.md).
++// nn::hid::TouchScreenState<N> (libnx HidTouchScreenState / HidTouchState; docs/ASTRAL_TOUCH.md):
++//   0x00 s64 sampling number, 0x08 s32 count, 0x0c reserved, 0x10 TouchState[N] of 0x28 bytes:
++//   0x00 s64 delta time (ns), 0x08 u32 attributes (bit 0 start, bit 1 end), 0x0c u32 finger id, 0x10 u32 x,
++//   0x14 u32 y (1280 x 720 screen pixels), 0x18 u32 diameter x, 0x1c u32 diameter y, 0x20 s32 rotation (degrees),
++//   0x24 reserved.
++constexpr size_t kTouchMax = 16, kTouchSize = 0x28, kTouchHeader = 0x10;
++constexpr uint32_t kTouchStart = 1, kTouchEnd = 2;
++constexpr uint32_t kTouchW = 1280, kTouchH = 720;
++struct TouchSlot {
++    bool used = false;
++    uint64_t host = 0;
++    uint64_t since = 0;  // monotonic ns of the contact's first sample
++    uint32_t x = 0, y = 0;  // its last position
++};
++std::mutex touch_lock;
++std::array<TouchSlot, kTouchMax> touch_slots;
++uint64_t touch_sampling = 0;  // the last sampling number written
++int32_t touch_last_count = 0;
++constexpr uint64_t kTouchPeriodNs = 16'666'667;  // HID samples the touch screen at 60 Hz
++// Window fraction -> Switch screen pixels. The picture is fitted into the window keeping 16:9 (nvn_present.cpp), so
++// the bars outside it clamp to the nearest edge.
++void touch_to_screen(float fx, float fy, uint32_t& x, uint32_t& y) {
++    uint32_t w = 0, h = 0;
++    window_size(w, h);
++    float bw = 1, bh = 1;
++    if (w && h) {
++        float aspect = float(w) / float(h), picture = float(kTouchW) / float(kTouchH);
++        if (aspect > picture) bw = picture / aspect;
++        else bh = aspect / picture;
++    }
++    float u = (fx - (1 - bw) / 2) / bw, v = (fy - (1 - bh) / 2) / bh;
++    x = uint32_t(std::clamp(u * float(kTouchW), 0.0f, float(kTouchW - 1)));
++    y = uint32_t(std::clamp(v * float(kTouchH), 0.0f, float(kTouchH - 1)));
++}
++// Writes TouchScreenState<n> at `out` (n <= 16) from the platform's current contacts.
++void fill_touch_state(uint8_t* out, size_t n) {
++    std::memset(out, 0, kTouchHeader + n * kTouchSize);
++    TouchPoint points[kTouchMax];
++    size_t count = std::min(read_touches(points, kTouchMax), n);
++    std::lock_guard lk(touch_lock);
++    uint64_t now = monotonic_ns();
++    std::array<bool, kTouchMax> seen{};
++    int32_t written = 0;
++    for (size_t k = 0; k < count; ++k) {
++        size_t slot = kTouchMax;
++        for (size_t s = 0; s < kTouchMax; ++s)
++            if (touch_slots[s].used && touch_slots[s].host == points[k].id) slot = s;
++        uint32_t attributes = 0;
++        if (slot == kTouchMax) {  // a new contact: the lowest free finger id
++            for (size_t s = 0; s < kTouchMax && slot == kTouchMax; ++s)
++                if (!touch_slots[s].used) slot = s;
++            if (slot == kTouchMax) continue;
++            touch_slots[slot] = TouchSlot{true, points[k].id, now, 0, 0};
++            attributes = kTouchStart;
++        }
++        seen[slot] = true;
++        uint32_t x = 0, y = 0;
++        touch_to_screen(points[k].x, points[k].y, x, y);
++        touch_slots[slot].x = x, touch_slots[slot].y = y;
++        uint8_t* t = out + kTouchHeader + size_t(written) * kTouchSize;
++        int64_t delta = int64_t(now - touch_slots[slot].since);
++        uint32_t finger = uint32_t(slot), diameter = 15;
++        std::memcpy(t + 0x00, &delta, 8);
++        std::memcpy(t + 0x08, &attributes, 4);
++        std::memcpy(t + 0x0c, &finger, 4);
++        std::memcpy(t + 0x10, &x, 4);
++        std::memcpy(t + 0x14, &y, 4);
++        std::memcpy(t + 0x18, &diameter, 4);
++        std::memcpy(t + 0x1c, &diameter, 4);
++        ++written;
++    }
++    // Contacts that went away this sample: reported once more with the end attribute, then their finger id is free.
++    for (size_t s = 0; s < kTouchMax; ++s) {
++        if (!touch_slots[s].used || seen[s]) continue;
++        if (size_t(written) < n) {
++            uint8_t* t = out + kTouchHeader + size_t(written) * kTouchSize;
++            int64_t delta = int64_t(now - touch_slots[s].since);
++            uint32_t attributes = kTouchEnd, finger = uint32_t(s), diameter = 15;
++            std::memcpy(t + 0x00, &delta, 8);
++            std::memcpy(t + 0x08, &attributes, 4);
++            std::memcpy(t + 0x0c, &finger, 4);
++            std::memcpy(t + 0x10, &touch_slots[s].x, 4);
++            std::memcpy(t + 0x14, &touch_slots[s].y, 4);
++            std::memcpy(t + 0x18, &diameter, 4);
++            std::memcpy(t + 0x1c, &diameter, 4);
++            ++written;
++        }
++        touch_slots[s] = TouchSlot{};
++    }
++    // The sampling number follows host time at the 60 Hz sampling rate, not the number of calls: polling twice in one
++    // sample period reads the same number (a new contact still gets its start attribute once).
++    uint64_t next = std::max(now / kTouchPeriodNs + 1, touch_sampling);  // never backwards
++    if (next == touch_sampling && written != touch_last_count) ++next;     // the contacts changed within one period
++    touch_sampling = next, touch_last_count = written;
++    int64_t sampling = int64_t(next);
++    std::memcpy(out, &sampling, 8);
++    std::memcpy(out + 8, &written, 4);
++}
++void GetTouchScreenState(CPU& c) {
++    require_memory(c.x[0], kTouchHeader + kTouchMax * kTouchSize, 2);
++    fill_touch_state(reinterpret_cast<uint8_t*>(c.x[0]), kTouchMax);
++    static std::atomic<bool> logged{false};
++    if (!logged.exchange(true)) log("hid: touch screen polled (TouchScreenState<16> from plat::read_touches)");
++    const int32_t count = ld<int32_t>(c.x[0] + 8);
++    static std::atomic<uint64_t> contacts{0};
++    if (count > 0 && contacts.fetch_add(1) % 300 == 0) log("hid: touch screen: %d contact(s)", count);
++}
++#endif
+ void GetMouseStates(CPU& c) {
+     if(int32_t(c.x[1])<=0) {c.x[0]=0;return;}
+     NoRawDeviceState(c); c.x[0]=1;
+@@ -222,7 +335,11 @@
+ NX_HLE("_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj", GetNpadState);
+ NX_HLE("_ZN2nn3hid13GetMouseStateEPNS0_10MouseStateE", NoRawDeviceState);
+ NX_HLE("_ZN2nn3hid21InitializeTouchScreenEv", noop);
++#if defined(NX_ASTRAL_STRICT)
++NX_HLE("_ZN2nn3hid19GetTouchScreenStateILm16EEEvPNS0_16TouchScreenStateIXT_EEE", GetTouchScreenState);
++#else
+ NX_HLE("_ZN2nn3hid19GetTouchScreenStateILm16EEEvPNS0_16TouchScreenStateIXT_EEE", NoRawDeviceState);
++#endif
+ NX_HLE("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", unsupported);
+ NX_HLE("_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE", ShowControllerSupportArg);
+
+diff --git a/runtime/src/platform.h b/runtime/src/platform.h
+--- a/runtime/src/platform.h
++++ b/runtime/src/platform.h
+@@ -73,6 +73,16 @@
+     float x, y, r, alpha;
+ };
+ size_t touch_overlay(OverlayShape* out, size_t max);
++#if defined(NX_ASTRAL_STRICT)
++// Touch screen contacts for nn::hid::GetTouchScreenState (hle_hid.cpp, docs/ASTRAL_TOUCH.md): up to `max` points,
++// x and y as fractions (0..1, left/top origin) of the window's client area, `id` stable while the contact is held.
++// iOS: touches that are not on the on-screen controller; macOS/Linux: the left mouse button; 0 elsewhere.
++struct TouchPoint {
++    uint64_t id;
++    float x, y;
++};
++size_t read_touches(TouchPoint* out, size_t max);
++#endif
+ // Performance hints (perf_hint.cpp; Android ADPF, nothing elsewhere): the calling thread takes part in making frames;
+ // a frame's work took `ns`.
+ void perf_hint_thread();
+diff --git a/runtime/src/platform_android_input.cpp b/runtime/src/platform_android_input.cpp
+--- a/runtime/src/platform_android_input.cpp
++++ b/runtime/src/platform_android_input.cpp
+@@ -212,6 +212,10 @@
+     input_script(p);  // NX_INPUT_SCRIPT (config.txt): scripted runs on the phone, as on the Mac
+ }
+
++#if defined(NX_ASTRAL_STRICT)
++size_t read_touches(TouchPoint*, size_t) { return 0; }  // no touch-screen source here yet
++
++#endif
+ // The drawn layout's buttons (brighter while pressed) and the stick under the thumb; nothing while a controller is
+ // in use or for games without a drawn layout.
+ size_t touch_overlay(OverlayShape* out, size_t max) {
+diff --git a/runtime/src/platform_linux.cpp b/runtime/src/platform_linux.cpp
+--- a/runtime/src/platform_linux.cpp
++++ b/runtime/src/platform_linux.cpp
+@@ -93,6 +93,15 @@
+
+ std::mutex g_pad_lock;
+ PadState g_pad;
++#if defined(NX_ASTRAL_STRICT)
++// The left mouse button as one touch-screen contact (read_touches), sampled with the pad. A new press gets a new id.
++struct MouseTouch {
++    bool down = false;
++    uint64_t id = 0;
++    float x = 0, y = 0;
++};
++MouseTouch g_mouse_touch;
++#endif
+
+ }  // namespace
+
+@@ -269,6 +278,23 @@
+
+ // ---- input: first SDL gamepad + keyboard (sampled on the main thread) -----------------------------------------
+
++#if defined(NX_ASTRAL_STRICT)
++static MouseTouch sample_mouse_touch() {  // main thread
++    static uint64_t presses = 0;
++    static bool was_down = false;
++    MouseTouch t;
++    float x = 0, y = 0;
++    int w = 0, h = 0;
++    if (g_window && SDL_GetMouseFocus() == g_window && (SDL_GetMouseState(&x, &y) & SDL_BUTTON_LMASK) &&
++        SDL_GetWindowSize(g_window, &w, &h) && w > 0 && h > 0) {
++        if (!was_down) ++presses;
++        t = MouseTouch{true, presses, x / float(w), y / float(h)};
++    }
++    was_down = t.down;
++    return t;
++}
++
++#endif
+ static void sample_input() {
+     PadState p;
+     static SDL_Gamepad* pad = nullptr;
+@@ -338,8 +364,14 @@
+         if (k[SDL_SCANCODE_ESCAPE]) p.buttons |= kMinus;
+     }
+ #endif
++#if defined(NX_ASTRAL_STRICT)
++    MouseTouch touch = sample_mouse_touch();
++#endif
+     std::lock_guard lk(g_pad_lock);
+     g_pad = p;
++#if defined(NX_ASTRAL_STRICT)
++    g_mouse_touch = touch;
++#endif
+ }
+
+ void read_pad(PadState& p) {
+@@ -353,7 +385,18 @@
+     }
+     input_script(p);
+ }
++#if defined(NX_ASTRAL_STRICT)
++// Mouse as touch screen (docs/ASTRAL_TOUCH.md): the left button held over the window is one contact. sample_input()
++// takes it on the main thread with the pad, under g_pad_lock; the game thread reads that copy.
++size_t read_touches(TouchPoint* out, size_t max) {
++    std::lock_guard lk(g_pad_lock);
++    if (!max || !g_mouse_touch.down) return 0;
++    out[0] = TouchPoint{g_mouse_touch.id, g_mouse_touch.x, g_mouse_touch.y};
++    return 1;
++}
+
++#endif
++
+ // ---- audio: SDL3 stream, s16 stereo 48 kHz, fed from the queue of submitted buffers ----------------------------
+
+ namespace {
+diff --git a/runtime/src/platform_mac.cpp b/runtime/src/platform_mac.cpp
+--- a/runtime/src/platform_mac.cpp
++++ b/runtime/src/platform_mac.cpp
+@@ -95,6 +95,15 @@
+
+ std::mutex g_pad_lock;
+ PadState g_pad;
++#if defined(NX_ASTRAL_STRICT)
++// The left mouse button as one touch-screen contact (read_touches), sampled with the pad. A new press gets a new id.
++struct MouseTouch {
++    bool down = false;
++    uint64_t id = 0;
++    float x = 0, y = 0;
++};
++MouseTouch g_mouse_touch;
++#endif
+
+ #if defined(NX_ASTRAL_STRICT)
+ // NX_PERF_HUD on macOS: Apple's Metal Performance HUD (perf_hud.h, docs/ASTRAL_PERF_HUD.md). Metal loads its HUD
+@@ -329,6 +338,23 @@
+
+ // ---- input: first SDL gamepad + keyboard (sampled on the main thread) -----------------------------------------
+
++#if defined(NX_ASTRAL_STRICT)
++static MouseTouch sample_mouse_touch() {  // main thread
++    static uint64_t presses = 0;
++    static bool was_down = false;
++    MouseTouch t;
++    float x = 0, y = 0;
++    int w = 0, h = 0;
++    if (g_window && SDL_GetMouseFocus() == g_window && (SDL_GetMouseState(&x, &y) & SDL_BUTTON_LMASK) &&
++        SDL_GetWindowSize(g_window, &w, &h) && w > 0 && h > 0) {
++        if (!was_down) ++presses;
++        t = MouseTouch{true, presses, x / float(w), y / float(h)};
++    }
++    was_down = t.down;
++    return t;
++}
++
++#endif
+ static void sample_input() {
+     PadState p;
+     static SDL_Gamepad* pad = nullptr;
+@@ -398,8 +424,14 @@
+         if (k[SDL_SCANCODE_ESCAPE]) p.buttons |= kMinus;
+     }
+ #endif
++#if defined(NX_ASTRAL_STRICT)
++    MouseTouch touch = sample_mouse_touch();
++#endif
+     std::lock_guard lk(g_pad_lock);
+     g_pad = p;
++#if defined(NX_ASTRAL_STRICT)
++    g_mouse_touch = touch;
++#endif
+ }
+
+ void read_pad(PadState& p) {
+@@ -411,7 +443,18 @@
+     if (g_pad.ry) p.ry = g_pad.ry;
+     input_script(p);
+ }
++#if defined(NX_ASTRAL_STRICT)
++// Mouse as touch screen (docs/ASTRAL_TOUCH.md): the left button held over the window is one contact. sample_input()
++// takes it on the main thread with the pad, under g_pad_lock; the game thread reads that copy.
++size_t read_touches(TouchPoint* out, size_t max) {
++    std::lock_guard lk(g_pad_lock);
++    if (!max || !g_mouse_touch.down) return 0;
++    out[0] = TouchPoint{g_mouse_touch.id, g_mouse_touch.x, g_mouse_touch.y};
++    return 1;
++}
+
++#endif
++
+ // ---- audio: SDL3 stream, s16 stereo 48 kHz, fed from the queue of submitted buffers ----------------------------
+
+ namespace {
+diff --git a/runtime/src/platform_win.cpp b/runtime/src/platform_win.cpp
+--- a/runtime/src/platform_win.cpp
++++ b/runtime/src/platform_win.cpp
+@@ -234,7 +234,11 @@
+     static const bool on = std::getenv("NX_HEADLESS") != nullptr;
+     return on;
+ }
++
++#if defined(NX_ASTRAL_STRICT)
++size_t read_touches(TouchPoint*, size_t) { return 0; }  // no touch-screen source here yet
+
++#endif
+ void read_pad(PadState& p) {
+     XINPUT_STATE xs{};
+     if (XInputGetState(0, &xs) == ERROR_SUCCESS) {

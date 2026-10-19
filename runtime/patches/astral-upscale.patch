@@ -1,0 +1,279 @@
+diff --git a/runtime/src/hle_vi.cpp b/runtime/src/hle_vi.cpp
+index 4efb54a..f37713a 100644
+--- a/runtime/src/hle_vi.cpp
++++ b/runtime/src/hle_vi.cpp
+@@ -132,12 +132,25 @@ void SetLayerScalingMode(CPU& c) {  // Result (Layer*, ScalingMode); no output p
+     // Only FitToLayer (2), already implemented by NVN's full-extent blit.
+     // The optional present pass/FSR preserves aspect ratio instead. Never claim
+     // that it stretches, nor change renderer configuration behind the caller.
++#if defined(NX_ASTRAL_STRICT)
++    // The present pass (NX_UPSCALE=fsr, NX_FSR=1, NX_PRESENT_PASS=1) fits the 16:9 picture into the window keeping its
++    // aspect: on a 16:9 window that is FitToLayer exactly, on any other it adds bars where the blit would stretch.
++    // Astral calls this once at boot and stops on an error, so the pass answers FitToLayer too (astral-upscale.patch).
++    if (mode != 2) {
++        log("vi: scaling mode %u unsupported by active host presentation", mode);
++        c.x[0] = kViOperationFailed;
++        return;
++    }
++    log(nvn::present_pass_wanted() ? "vi: FitToLayer uses the host present pass (aspect kept)"
++                                   : "vi: FitToLayer uses host full-extent blit");
++#else
+     if (mode != 2 || nvn::present_pass_wanted()) {
+         log("vi: scaling mode %u unsupported by active host presentation", mode);
+         c.x[0] = kViOperationFailed;
+         return;
+     }
+     log("vi: FitToLayer uses host full-extent blit");
++#endif
+     c.x[0] = 0;
+ }
+ 
+diff --git a/runtime/src/input_map.cpp b/runtime/src/input_map.cpp
+index c3f531a..55c6487 100644
+--- a/runtime/src/input_map.cpp
++++ b/runtime/src/input_map.cpp
+@@ -390,14 +390,19 @@ bool save_controls(const Controls& c) { return write_file(controls_path(), write
+ 
+ const char* const kResolutions[] = {"1280x720", "1600x900", "1920x1080", "2560x1440", "3840x2160"};
+ const int kResolutionCount = int(sizeof kResolutions / sizeof kResolutions[0]);
++// MetalFX is not offered: it is not built yet (docs/ASTRAL_UPSCALE.md); "metalfx" is read as FSR 1.
++const char* const kUpscales[] = {"bilinear", "fsr"};
++const char* const kUpscaleLabels[] = {"Bilinear", "FSR 1"};
++const int kUpscaleCount = 2;
+ 
+ const char* setting_key(int s) {
+-    static const char* const k[kSettingCount] = {"perf_hud", "fullscreen", "resolution", "mute"};
++    static const char* const k[kSettingCount] = {"perf_hud", "fullscreen", "resolution", "mute", "upscale"};
+     return s >= 0 && s < kSettingCount ? k[s] : "";
+ }
+ 
+ const char* setting_env(int s) {
+-    static const char* const k[kSettingCount] = {"NX_PERF_HUD", "NX_FULLSCREEN", "NX_RESOLUTION", "NX_MUTE"};
++    static const char* const k[kSettingCount] = {"NX_PERF_HUD", "NX_FULLSCREEN", "NX_RESOLUTION", "NX_MUTE",
++                                                    "NX_UPSCALE"};
+     return s >= 0 && s < kSettingCount ? k[s] : "";
+ }
+ 
+@@ -407,18 +412,23 @@ std::string setting_text(const Settings& s, int k) {
+     case kSetFullscreen: return s.fullscreen ? "On" : "Off";
+     case kSetResolution: return s.resolution;
+     case kSetMute: return s.mute ? "On" : "Off";
++    case kSetUpscale:
++        for (int u = 0; u < kUpscaleCount; u++)
++            if (s.upscale == kUpscales[u]) return kUpscaleLabels[u];
++        return kUpscaleLabels[0];
+     default: return "";
+     }
+ }
+ 
+ std::string write_settings(const Settings& s) {
+     std::string out = "# AC-Recomp settings (written by the launcher; docs/ASTRAL_LAUNCHER.md).\n"
+-                      "# The NX_PERF_HUD, NX_FULLSCREEN, NX_RESOLUTION and NX_MUTE environment variables override them.\n"
++                      "# The NX_PERF_HUD, NX_FULLSCREEN, NX_RESOLUTION, NX_MUTE and NX_UPSCALE environment variables override them.\n"
+                       "[settings]\n";
+     out += std::string("perf_hud = ") + (s.perf_hud ? "1" : "0") + "\n";
+     out += std::string("fullscreen = ") + (s.fullscreen ? "1" : "0") + "\n";
+     out += "resolution = " + s.resolution + "\n";
+     out += std::string("mute = ") + (s.mute ? "1" : "0") + "\n";
++    out += "upscale = " + s.upscale + "\n";
+     return out;
+ }
+ 
+@@ -433,6 +443,12 @@ Settings parse_settings(const std::string& text) {
+         if (k == "perf_hud") s.perf_hud = flag(value);
+         else if (k == "fullscreen") s.fullscreen = flag(value);
+         else if (k == "mute") s.mute = flag(value);
++        else if (k == "upscale") {
++            std::string v = lower(value);
++            if (v == "metalfx") v = "fsr";  // an earlier choice: MetalFX is not built, FSR 1 stands in
++            for (int u = 0; u < kUpscaleCount; u++)
++                if (v == kUpscales[u]) s.upscale = v;
++        }
+         else if (k == "resolution") {
+             int w = 0, h = 0;
+             char tail = 0;
+@@ -451,6 +467,11 @@ std::string env_effect(int k, const std::string& v) {
+     case kSetPerfHud: return !v.empty() && v[0] != '0' ? "On" : "Off";
+     case kSetFullscreen: return v == "1" ? "On" : "Off";
+     case kSetMute: return "On";
++    case kSetUpscale: {  // as nvn_upscale.h reads it
++        std::string l = lower(v);
++        if (l == "fsr" || l == "fsr1" || l == "1" || l == "metalfx") return "FSR 1";  // metalfx: alias
++        return "Bilinear";
++    }
+     default: return v;
+     }
+ }
+@@ -468,6 +489,7 @@ void export_env(const Settings& s) {
+     if (s.fullscreen) put(kSetFullscreen, "1");
+     if (s.resolution != Settings().resolution) put(kSetResolution, s.resolution);
+     if (s.mute) put(kSetMute, "1");
++    if (s.upscale != Settings().upscale) put(kSetUpscale, s.upscale);
+ }
+ 
+ std::string settings_path() { return plat::data_root() + "/settings.ini"; }
+diff --git a/runtime/src/input_map.h b/runtime/src/input_map.h
+index 5a5396a..d8c60b4 100644
+--- a/runtime/src/input_map.h
++++ b/runtime/src/input_map.h
+@@ -67,14 +67,20 @@ std::string controls_path();
+ bool save_controls(const Controls& c);
+ 
+ // ---- settings.ini ----
+-enum Setting : int { kSetPerfHud, kSetFullscreen, kSetResolution, kSetMute, kSettingCount };
++enum Setting : int { kSetPerfHud, kSetFullscreen, kSetResolution, kSetMute, kSetUpscale, kSettingCount };
+ const char* setting_key(int s);  // settings.ini key
+ const char* setting_env(int s);  // the environment variable that carries it to the runtime (and overrides it)
+ extern const char* const kResolutions[];
+ extern const int kResolutionCount;
++// Upscaling of the game's picture to the window (NX_UPSCALE, docs/ASTRAL_UPSCALE.md): settings.ini values and labels.
++// Bilinear and FSR 1 everywhere; "metalfx" (not built yet) is read as FSR 1.
++extern const char* const kUpscales[];
++extern const char* const kUpscaleLabels[];
++extern const int kUpscaleCount;
+ struct Settings {
+     bool perf_hud = false, fullscreen = false, mute = false;
+     std::string resolution = "1280x720";
++    std::string upscale = "bilinear";  // bilinear | fsr
+     bool operator==(const Settings&) const = default;
+ };
+ std::string setting_text(const Settings& s, int k);  // "On", "Off", "1280x720"
+@@ -87,7 +93,8 @@ std::string env_effect(int k, const std::string& raw);
+ EnvOverrides env_overrides();
+ std::string write_settings(const Settings& s);
+ Settings parse_settings(const std::string& text);
+-// Exports the settings the environment does not already set (NX_PERF_HUD, NX_FULLSCREEN, NX_RESOLUTION, NX_MUTE);
++// Exports the settings the environment does not already set (NX_PERF_HUD, NX_FULLSCREEN, NX_RESOLUTION, NX_MUTE,
++// NX_UPSCALE);
+ // settings left at their default are not exported, so the runtime behaves as without settings.ini.
+ void export_env(const Settings& s);
+ std::string settings_path();
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index 700766d..ca59e3a 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -52,7 +52,7 @@ namespace {
+ const char* const kMainItems[] = {"PLAY", "CONTROLS", "SETTINGS", "QUIT"};
+ constexpr int kMainCount = 4;
+ const char* const kSettingLabels[input::kSettingCount] = {"Performance HUD (F3)", "Fullscreen (F11)", "Window size",
+-                                                          "Mute audio"};
++                                                          "Mute audio", "Upscaling"};
+ const char* const kFontFile = "Baloo2-Bold.ttf";
+ const char* const kBackgrounds[] = {"title-bg.jpg", "title-bg.png"};
+ 
+@@ -311,6 +311,13 @@ void Menu::change_setting(int k, int delta) {
+     case input::kSetPerfHud: settings.perf_hud = !settings.perf_hud; break;
+     case input::kSetFullscreen: settings.fullscreen = !settings.fullscreen; break;
+     case input::kSetMute: settings.mute = !settings.mute; break;
++    case input::kSetUpscale: {
++        int at = 0, n = input::kUpscaleCount;
++        for (int u = 0; u < n; u++)
++            if (settings.upscale == input::kUpscales[u]) at = u;
++        settings.upscale = input::kUpscales[((at + delta) % n + n) % n];
++        break;
++    }
+     case input::kSetResolution: {
+         int at = -1;
+         for (int r = 0; r < input::kResolutionCount; r++)
+diff --git a/runtime/src/nvn/nvn_present.cpp b/runtime/src/nvn/nvn_present.cpp
+index 8017b2c..f2425de 100644
+--- a/runtime/src/nvn/nvn_present.cpp
++++ b/runtime/src/nvn/nvn_present.cpp
+@@ -15,6 +15,9 @@
+ 
+ #include "nvn_vk.h"
+ #include "platform.h"
++#if defined(NX_ASTRAL_STRICT)
++#include "nvn_upscale.h"
++#endif
+ 
+ namespace nx::nvn {
+ 
+@@ -215,16 +218,30 @@ struct Pass {
+ 
+ bool fsr_on() {
+     static const bool on = [] {
++#if defined(NX_ASTRAL_STRICT)
++        // NX_UPSCALE (the launcher's Upscaling setting) decides when set; else NX_FSR as upstream (nvn_upscale.h).
++        const char* u = std::getenv("NX_UPSCALE");
++        upscale::Mode m = upscale::parse(u);
++        bool v = upscale::fsr_wanted(u, std::getenv("NX_FSR"));
++        if (m == upscale::Mode::MetalFx) log("nvn/vk: NX_UPSCALE=metalfx: MetalFX is not in this build; an alias for fsr: FSR 1");
++        else if (m == upscale::Mode::Unknown) log("nvn/vk: NX_UPSCALE=%s: unknown (bilinear, fsr): bilinear", u);
++        return v;
++#else
+         const char* e = std::getenv("NX_FSR");
+         return e && e[0] == '1';
++#endif
+     }();
+     return on;
+ }
+ 
+ float fsr_sharpness() {  // stops of sharpening: 0 the most, 2 none (FSR's own default is 0.2)
+     static const float v = [] {
++#if defined(NX_ASTRAL_STRICT)
++        return upscale::sharpness(std::getenv("NX_UPSCALE_SHARPNESS"), std::getenv("NX_FSR_SHARP"));
++#else
+         const char* e = std::getenv("NX_FSR_SHARP");
+         return e ? std::max(0.0f, std::min(2.0f, float(std::atof(e)))) : 0.2f;
++#endif
+     }();
+     return v;
+ }
+diff --git a/runtime/src/nvn/nvn_upscale.h b/runtime/src/nvn/nvn_upscale.h
+new file mode 100644
+index 0000000..e7c285a
+--- /dev/null
++++ b/runtime/src/nvn/nvn_upscale.h
+@@ -0,0 +1,51 @@
++// How the game's picture is scaled to the window (docs/ASTRAL_UPSCALE.md): NX_UPSCALE=bilinear|fsr (the
++// launcher's Upscaling setting, settings.ini `upscale`; metalfx is an alias for fsr), NX_UPSCALE_SHARPNESS in stops
++// (FSR 1's RCAS: 0 the most, 2 none, default 0.2). Unset, the upstream NX_FSR / NX_FSR_SHARP switches decide, as
++// before. Astral only.
++#pragma once
++#if defined(NX_ASTRAL_STRICT)
++#include <cctype>
++#include <cstdlib>
++#include <string>
++
++namespace nx::nvn::upscale {
++
++enum class Mode { Unset, Bilinear, Fsr, MetalFx, Unknown };
++
++inline Mode parse(const char* e) {
++    if (!e) return Mode::Unset;
++    std::string v;
++    for (const char* c = e; *c; c++)
++        if (!std::isspace(static_cast<unsigned char>(*c))) v += char(std::tolower(static_cast<unsigned char>(*c)));
++    if (v.empty()) return Mode::Unset;
++    if (v == "bilinear" || v == "linear" || v == "off" || v == "0") return Mode::Bilinear;
++    if (v == "fsr" || v == "fsr1" || v == "1") return Mode::Fsr;
++    if (v == "metalfx") return Mode::MetalFx;
++    return Mode::Unknown;
++}
++
++// Whether the present pass upscales with FSR 1. NX_UPSCALE decides when it names a mode; metalfx (MetalFX is not built
++// in this version) is an alias for fsr; an unknown value keeps the bilinear scaling. Unset: NX_FSR=1 as upstream.
++inline bool fsr_wanted(const char* upscale, const char* fsr) {
++    switch (parse(upscale)) {
++    case Mode::Fsr:
++    case Mode::MetalFx: return true;
++    case Mode::Bilinear:
++    case Mode::Unknown: return false;
++    case Mode::Unset: break;
++    }
++    return fsr && fsr[0] == '1';
++}
++
++// RCAS sharpness in stops, clamped to 0..2: NX_UPSCALE_SHARPNESS, else NX_FSR_SHARP, else 0.2 (FSR 1's default).
++inline float sharpness(const char* upscale_sharpness, const char* fsr_sharp) {
++    const char* e = upscale_sharpness && *upscale_sharpness ? upscale_sharpness : fsr_sharp;
++    if (!e || !*e) return 0.2f;
++    char* end = nullptr;
++    float v = std::strtof(e, &end);
++    if (end == e || !(v == v)) return 0.2f;  // not a number
++    return v < 0.0f ? 0.0f : v > 2.0f ? 2.0f : v;
++}
++
++}  // namespace nx::nvn::upscale
++#endif

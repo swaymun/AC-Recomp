@@ -1,0 +1,199 @@
+diff --git a/runtime/src/hle_fs.cpp b/runtime/src/hle_fs.cpp
+--- a/runtime/src/hle_fs.cpp
++++ b/runtime/src/hle_fs.cpp
+@@ -59,19 +59,35 @@
+ constexpr uint32_t kTargetNotFound = 0x2EE202;  // fs 6001-ish: generic "not mounted"
+
+ std::mutex g_fs;
+-std::map<std::string, fs::path> g_mounts;
++struct Mount {
++    fs::path root;
++    bool save = false;
++    bool failed = false;  // sticky: closing a failed writer must not turn commit into success
++};
++std::map<std::string, std::shared_ptr<Mount>> g_mounts;
+ // Open files: shared so a read in progress survives a close from another thread. Reads run outside g_fs (which
+ // only guards the tables): one global lock made every streaming thread (Bink animations, FMOD banks) wait behind
+ // any big read, felt as hitches.
+ struct File {
+     FILE* f;
+     std::string path;
+-    File(FILE* file, std::string p) : f(file), path(std::move(p)) {}
++    std::shared_ptr<Mount> owner;
++    bool writable = false;
++    File(FILE* file, std::string p, std::shared_ptr<Mount> m = {}, bool write = false)
++        : f(file), path(std::move(p)), owner(std::move(m)), writable(write) {}
+     File(const File&) = delete;  // owns the FILE: one instance only
+     File& operator=(const File&) = delete;
+     ~File() { std::fclose(f); }
+ };
+ std::map<uint64_t, std::shared_ptr<File>> g_files;
++// Includes a closed handle still held by an in-flight operation. g_fs guards this
++// weak registry, mount generations, stream writes, and commits.
++std::vector<std::weak_ptr<File>> g_live_files;
++void track_file(const std::shared_ptr<File>& file) {
++    for (auto it = g_live_files.begin(); it != g_live_files.end();)
++        if (it->expired()) it = g_live_files.erase(it); else ++it;
++    g_live_files.push_back(file);
++}
+
+ // Files the runtime adds or replaces (mods): key = path under the mount point, '/' separated, lower case.
+ std::map<std::string, std::string> g_virtual;
+@@ -109,7 +125,21 @@
+
+ std::string cstr(uint64_t p) { return p ? std::string(reinterpret_cast<const char*>(p)) : std::string(); }
+
+-// "mount:/a/b" -> host path; empty when the mount is unknown.
++bool valid_mount_name(const std::string& name) {
++    if (name.empty() || name.size() > 15) return false;
++    for (unsigned char ch : name)
++        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
++              (ch >= '0' && ch <= '9') || ch == '_' || ch == '-')) return false;
++    return true;
++}
++
++bool beneath(const fs::path& root, const fs::path& path) {
++    auto a = root.begin(), b = path.begin();
++    for (; a != root.end(); ++a, ++b) if (b == path.end() || *a != *b) return false;
++    return true;
++}
++
++// "mount:/a/b" -> host path; empty when unknown or an unsafe save path.
+ fs::path resolve(const std::string& guest) {
+     auto colon = guest.find(':');
+     if (colon == std::string::npos) return {};
+@@ -117,12 +147,20 @@
+     if (it == g_mounts.end()) return {};
+     std::string rest = guest.substr(colon + 1);
+     while (!rest.empty() && (rest[0] == '/' || rest[0] == '\\')) rest.erase(0, 1);
+-    return it->second / fs::u8path(rest);
++    const auto& m = *it->second;
++    if (!m.save) return m.root / fs::u8path(rest);
++    // Save-only confinement; keep ROM/cache/default resolution unchanged.
++    if (rest.find('\\') != std::string::npos || rest.find(':') != std::string::npos) return {};
++    fs::path relative = fs::u8path(rest);
++    for (const auto& part : relative) if (part == "..") return {};
++    std::error_code ec;
++    fs::path p = fs::weakly_canonical(m.root / relative, ec);
++    return !ec && beneath(m.root, p) ? p : fs::path{};
+ }
+
+ void mount(const std::string& name, const fs::path& p) {
+     fs::create_directories(p);
+-    g_mounts[name] = p;
++    g_mounts[name] = std::make_shared<Mount>(Mount{p});
+     log("fs: mounted %s: -> %s", name.c_str(), p.string().c_str());
+ }
+
+@@ -144,7 +182,18 @@
+ void MountSaveData(CPU& c) {
+     std::lock_guard lk(g_fs);
+     std::string name = cstr(c.x[0]);
+-    mount(name, data_root() / "user" / "save");
++    if (!valid_mount_name(name) || g_mounts.count(name)) {
++        c.x[0] = kTargetNotFound;
++        return;
++    }
++    std::error_code ec;
++    fs::path root = fs::weakly_canonical(data_root(), ec);
++    if (ec) { c.x[0] = kPathNotFound; return; }
++    fs::path p = fs::weakly_canonical(root / "user" / "save", ec);
++    if (ec || !beneath(root, p)) { c.x[0] = kPathNotFound; return; }
++    fs::create_directories(p, ec);
++    if (ec) { c.x[0] = kPathNotFound; return; }
++    g_mounts[name] = std::make_shared<Mount>(Mount{p, true});
+     c.x[0] = kOk;
+ }
+
+@@ -154,7 +203,42 @@
+     c.x[0] = kOk;
+ }
+
+-void Commit(CPU& c) { c.x[0] = kOk; }
++// Existing result policy: target-not-found for mounts/handles, path-not-found
++// for host I/O failures. The latter is an approximation, not a verified SDK I/O code.
++bool flush_stream(File& file, bool sync) {
++    bool ok = std::fflush(file.f) == 0;
++    ok = !std::ferror(file.f) && ok;
++    if (ok && sync) {
++#if defined(_WIN32)
++        ok = _commit(_fileno(file.f)) == 0;
++#else
++        int result;
++        do { result = fsync(fileno(file.f)); } while (result != 0 && errno == EINTR);
++        ok = result == 0;
++#endif
++    }
++    if (!ok && file.owner) file.owner->failed = true;
++    return ok;
++}
++
++void Commit(CPU& c) {
++    std::lock_guard lk(g_fs);
++    std::string name = cstr(c.x[0]);
++    auto mount = g_mounts.find(name);
++    if (!valid_mount_name(name) || mount == g_mounts.end()) {
++        c.x[0] = kTargetNotFound;
++        return;
++    }
++    const auto& owner = mount->second;
++    bool ok = !owner->failed;
++    for (auto it = g_live_files.begin(); it != g_live_files.end();) {
++        if (auto file = it->lock()) {
++            if (file->owner == owner && file->writable) ok = flush_stream(*file, true) && ok;
++            ++it;
++        } else it = g_live_files.erase(it);
++    }
++    c.x[0] = ok ? kOk : kPathNotFound;
++}
+ void EnableGlobalFileDataCache(CPU& c) { c.x[0] = kOk; }
+ void DisableGlobalFileDataCache(CPU& c) { c.x[0] = kOk; }
+
+@@ -258,7 +342,9 @@
+         return;
+     }
+     uint64_t h = g_next++;
+-    g_files[h] = std::make_shared<File>(f, guest);
++    auto owner = g_mounts.at(guest.substr(0, guest.find(':')));
++    g_files[h] = std::make_shared<File>(f, guest, owner, (mode & 2) != 0);
++    track_file(g_files[h]);
+     st<uint64_t>(c.x[0], h);
+     note_open("OpenFile", guest, "ok");
+     if (trace_fs()) log("fs: OpenFile(%s, %d) -> %llu", guest.c_str(), mode, (unsigned long long)h);
+@@ -338,18 +424,19 @@
+         return;
+     }
+     std::lock_guard lk(g_fs);
+-    plat::fseek64(file->f, int64_t(c.x[1]), SEEK_SET);
+-    fwrite(reinterpret_cast<const void*>(c.x[2]), 1, c.x[3], file->f);
+-    fflush(file->f);  // positional reads bypass the FILE buffer (saves only: rare and small)
+-    c.x[0] = kOk;
++    bool ok = file->writable && plat::fseek64(file->f, int64_t(c.x[1]), SEEK_SET) == 0;
++    if (ok) ok = fwrite(reinterpret_cast<const void*>(c.x[2]), 1, c.x[3], file->f) == c.x[3];
++    // Positional readers bypass stdio; retain the existing immediate flush.
++    ok = flush_stream(*file, false) && ok;
++    if (!ok && file->owner) file->owner->failed = true;
++    c.x[0] = ok ? kOk : kPathNotFound;
+ }
+
+ void FlushFile(CPU& c) {
+-    if (auto file = open_file(c.x[0])) {
+-        std::lock_guard lk(g_fs);
+-        fflush(file->f);
+-    }
+-    c.x[0] = kOk;
++    auto file = open_file(c.x[0]);
++    if (!file) { c.x[0] = kTargetNotFound; return; }
++    std::lock_guard lk(g_fs);
++    c.x[0] = flush_stream(*file, false) ? kOk : kPathNotFound;
+ }
+
+ // ---- directories ----------------------------------------------------------------------------------------------
+@@ -487,6 +574,7 @@
+ NX_HLE("_ZN2nn2fs25EnableGlobalFileDataCacheEPvm", EnableGlobalFileDataCache);
+ NX_HLE("_ZN2nn2fs26DisableGlobalFileDataCacheEv", DisableGlobalFileDataCache);
+ NX_HLE("_ZN2nn2fs6CommitEPKc", Commit);
++NX_HLE("_ZN2nn2fs14CommitSaveDataEPKc", Commit);
+ NX_HLE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", OpenDirectory);
+ NX_HLE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl", ReadDirectory);
+ NX_HLE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", CloseDirectory);

@@ -1,0 +1,39 @@
+# Native Windows x64 overlay order: runtime/patches/series.linux unchanged, then windows-native.patch (clang-cl
+# policy) and astral-windows.patch (docs/ASTRAL_WINDOWS.md). tests/test_astral_windows.py checks that this list is
+# series.linux plus these two, so keep them in step.
+apple-memory.patch
+astral-bootstrap.patch
+astral-control-import.patch
+astral-sqshl.patch
+astral-notifications.patch
+astral-apm.patch
+astral-audio.patch
+astral-ipc-buffer.patch
+astral-applet.patch
+astral-hid.patch
+astral-controller-support.patch
+astral-vi.patch
+astral-nvn-init.patch
+astral-nvn-texture.patch
+astral-nvn-program.patch
+astral-fiber.patch
+astral-hwopus.patch
+astral-prepo.patch
+astral-fs-commit.patch
+astral-nvn-window-depth.patch
+astral-nvn-bc-zero-fill.patch
+astral-nvn-cube-storage.patch
+astral-shared-font.patch
+astral-swkbd.patch
+astral-perf-hud.patch
+astral-audio-dump.patch
+astral-launcher.patch
+astral-touch.patch
+astral-upscale.patch
+astral-save-profiles.patch
+astral-controls-ui.patch
+astral-fps-variant.patch
+astral-texel-coalesce.patch
+astral-linux.patch
+windows-native.patch
+astral-windows.patch

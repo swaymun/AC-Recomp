@@ -1,0 +1,160 @@
+diff --git a/runtime/src/svc_am.cpp b/runtime/src/svc_am.cpp
+--- a/runtime/src/svc_am.cpp
++++ b/runtime/src/svc_am.cpp
+@@ -261,6 +261,147 @@
+     });
+ }
+
++// Bounded ordinary applet storage. No account, UI, transfer-memory or applet
++// execution is synthesized. Limits apply process-wide across creator sessions.
++constexpr size_t kAppletStorageMax = 64 * 1024;
++constexpr size_t kAppletStorageTotal = 1024 * 1024;
++constexpr size_t kAppletStorageObjects = 32;
++struct AppletStorageBudget {
++    std::mutex mutex;  // never held across a kernel/VM/IPC call
++    size_t bytes = 0, objects = 0;
++};
++std::shared_ptr<AppletStorageBudget> applet_storage_budget() {
++    static auto budget = std::make_shared<AppletStorageBudget>();
++    return budget;
++}
++
++void applet_storage_request(const IpcCtx& c, size_t bytes, bool receive = false) {
++    ReceiveSizeTable table;
++    const auto& frame = c.framing();
++    if ((receive ? c.in_size < bytes : c.in_size != bytes) ||
++        (frame.raw_data && ((c.type != 4 && c.type != 6) ||
++         frame.domain_object_count || !c.receive_size_table(bytes, receive ? 1 : 0, table))) ||
++        (receive && !frame.raw_data) || (bytes && !c.in) || c.has_pid_descriptor() ||
++        !c.in_copy.empty() || !c.in_move.empty() || !c.in_objects.empty() ||
++        !c.w.empty()) fatal("applet: malformed storage request");
++}
++void applet_storage_no_buffers(const IpcCtx& c) {
++    if (!c.a.empty() || !c.b.empty() || !c.x.empty() || !c.c.empty())
++        fatal("applet: unexpected storage buffer");
++}
++struct AppletStorageData {
++    std::vector<uint8_t> bytes;
++    std::shared_ptr<AppletStorageBudget> budget;
++    AppletStorageData(size_t size, std::shared_ptr<AppletStorageBudget> owner)
++        : bytes(size, 0), budget(std::move(owner)) {}
++    ~AppletStorageData() {
++        std::lock_guard lk(budget->mutex);
++        budget->bytes -= bytes.size();
++        --budget->objects;
++    }
++};
++
++Buffer applet_storage_buffer(const IpcCtx& c, bool write) {
++    const auto& first = write ? c.a : c.b;
++    const auto& second = write ? c.x : c.c;
++    if (!(write ? c.b : c.a).empty() || !(write ? c.c : c.x).empty() ||
++        first.size() > 1 || second.size() > 1)
++        fatal("applet: malformed storage buffer");
++    if (!write) {
++        ReceiveSizeTable table;
++        if (first.size() != 1 || second.size() != 1 ||
++            !c.receive_size_table(8, 1, table))
++            fatal("applet: malformed receive size table");
++        const auto selected = c.receive_selection(0);
++        const auto inactive = selected.source == ReceiveDescriptor::B ? second[0] : first[0];
++        const uint64_t expected = selected.source == ReceiveDescriptor::B ? 0 : second[0].size;
++        if (inactive.addr || inactive.size || table.values[0] != expected)
++            fatal("applet: malformed auto-select receive buffer");
++    }
++    Buffer selected; unsigned active = 0;
++    for (const auto* list : {&first, &second}) for (const auto& b : *list) {
++        if (!b.addr && !b.size) continue;  // inactive auto-select placeholder
++        selected = b; ++active;
++    }
++    if (active != 1 || !selected.addr || selected.size > kAppletStorageMax ||
++        selected.addr > ~uint64_t(0) - selected.size)
++        fatal("applet: invalid storage buffer extent");
++    return selected;
++}
++void applet_storage_memory(Buffer b, bool write) {
++    const uint64_t end = b.addr + b.size;
++    for (uint64_t at = b.addr; at < end;) {
++        const auto v = vm_query(at);
++        const uint32_t required = write ? 1u : 2u;
++        if (!(v.perm & required) || v.addr > at || !v.size ||
++            v.addr > ~uint64_t(0) - v.size || v.addr + v.size <= at)
++            fatal("applet: inaccessible storage buffer");
++        at = std::min(end, v.addr + v.size);
++    }
++}
++std::shared_ptr<Service> applet_storage_accessor(std::shared_ptr<AppletStorageData> data) {
++    return svc("IStorageAccessor", [data](Service& s) {
++        s.cmds[0] = [data](IpcCtx& c) {
++            applet_storage_request(c, 0); applet_storage_no_buffers(c);
++            c.push<int64_t>(int64_t(data->bytes.size())); return 0u;
++        };
++        for (uint32_t command : {10u, 11u}) s.cmds[command] = [data, command](IpcCtx& c) {
++            const bool write = command == 10;
++            applet_storage_request(c, 8, !write);
++            const int64_t offset = c.arg<int64_t>(0);
++            const Buffer buffer = applet_storage_buffer(c, write);
++            // Do not clip, wrap, resize or partially modify an invalid request.
++            if (offset < 0 || uint64_t(offset) > data->bytes.size() ||
++                buffer.size > data->bytes.size() - size_t(offset))
++                fatal("applet: storage range exceeds capacity");
++            applet_storage_memory(buffer, write);
++            std::lock_guard lk(data->budget->mutex);
++            if (buffer.size) {
++                auto* guest = reinterpret_cast<void*>(buffer.addr);
++                auto* stored = data->bytes.data() + size_t(offset);
++                if (write) std::memcpy(stored, guest, size_t(buffer.size));
++                else std::memcpy(guest, stored, size_t(buffer.size));
++            }
++            return 0u;
++        };
++    });
++}
++std::shared_ptr<Service> applet_storage(std::shared_ptr<AppletStorageData> data) {
++    return svc("IStorage", [data](Service& s) {
++        s.cmds[0] = [data](IpcCtx& c) {
++            applet_storage_request(c, 0); applet_storage_no_buffers(c);
++            c.push_object(applet_storage_accessor(data)); return 0u;
++        };
++    });
++}
++std::shared_ptr<Service> library_applet_creator() {
++    return svc("ILibraryAppletCreator", [](Service& s) {
++        s.cmds[10] = [](IpcCtx& c) {
++            applet_storage_request(c, 8); applet_storage_no_buffers(c);
++            const int64_t size = c.arg<int64_t>(0);
++            if (size < 0 || uint64_t(size) > kAppletStorageMax)
++                fatal("applet: unsupported storage capacity");
++            const auto budget = applet_storage_budget();
++            std::shared_ptr<AppletStorageData> data;
++            {
++                std::lock_guard lk(budget->mutex);
++                if (budget->objects >= kAppletStorageObjects ||
++                    size_t(size) > kAppletStorageTotal - budget->bytes)
++                    fatal("applet: storage resource limit");
++                data = std::make_shared<AppletStorageData>(size_t(size), budget);
++                ++budget->objects; budget->bytes += size_t(size);
++            }
++            c.push_object(applet_storage(std::move(data))); return 0u;
++        };
++        s.cmds[0] = [](IpcCtx& c) -> uint32_t {
++            applet_storage_request(c, 8); applet_storage_no_buffers(c);
++            if (c.arg<uint32_t>(0) == 0x10 && c.arg<uint32_t>(4) == 0)
++                fatal("applet: user selector unsupported: configured account/UI policy unavailable");
++            fatal("applet: unsupported library applet or mode");
++        };
++    });
++}
++
+ std::shared_ptr<Service> application_proxy() {
+     return svc("IApplicationProxy", [](Service& s) {
+         s.cmds[0] = [](IpcCtx& c) { c.push_object(common_state_getter()); return 0u; };
+@@ -269,7 +410,7 @@
+         s.cmds[3] = [](IpcCtx& c) { c.push_object(std::make_shared<Service>("IAudioController")); return 0u; };
+         s.cmds[4] = [](IpcCtx& c) { c.push_object(std::make_shared<Service>("IDisplayController")); return 0u; };
+         s.cmds[10] = [](IpcCtx& c) { c.push_object(std::make_shared<Service>("IProcessWindingController")); return 0u; };
+-        s.cmds[11] = [](IpcCtx& c) { c.push_object(std::make_shared<Service>("ILibraryAppletCreator")); return 0u; };
++        s.cmds[11] = [](IpcCtx& c) { c.push_object(library_applet_creator()); return 0u; };
+         s.cmds[20] = [](IpcCtx& c) { c.push_object(application_functions()); return 0u; };
+         s.cmds[1000] = [](IpcCtx& c) { c.push_object(std::make_shared<Service>("IDebugFunctions")); return 0u; };
+     });

@@ -1,0 +1,753 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f1b61f8..4a0a7e7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -86,7 +86,15 @@ if(NOT NX_GEN_PROBE)
+     return()
+ endif()
+
++# iOS simulator parity (docs/ASTRAL_IOS_SIM.md): optionally link already built game_main/game_sdk archives from
++# NX_IOS_PREBUILT_GAME_DIR (lib<target>.a, arm64 iOS-simulator objects) instead of recompiling the generated code.
++set(NX_IOS_PREBUILT_GAME_DIR "" CACHE PATH "iOS simulator: directory with prebuilt libgame_main.a/libgame_sdk.a")
+ foreach(mod main sdk)
++    if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NX_IOS_PREBUILT_GAME_DIR)
++        add_library(game_${mod} STATIC IMPORTED)
++        set_target_properties(game_${mod} PROPERTIES IMPORTED_LOCATION "${NX_IOS_PREBUILT_GAME_DIR}/libgame_${mod}.a")
++        continue()
++    endif()
+     file(GLOB src CONFIGURE_DEPENDS "${NX_GEN_DIR}/${mod}/*.cpp")
+     add_library(game_${mod} STATIC ${src})
+     target_include_directories(game_${mod} PRIVATE runtime/include "${NX_GEN_DIR}/${mod}")
+@@ -96,8 +104,9 @@ foreach(mod main sdk)
+         target_compile_options(game_${mod} PRIVATE -O2 -fPIC -fvisibility=hidden -fno-semantic-interposition
+                                -march=armv8.2-a+crypto)
+     elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+-        # Bounded first-boundary build; no optimization/performance acceptance.
+-        target_compile_options(game_${mod} PRIVATE -O0 -fvisibility=hidden -ffp-contract=off)
++        # NX_IOS_GAME_OPT: -O2 matches the macOS build (the simulator runs the host CPU); -O0 was the first-boundary build.
++        set(NX_IOS_GAME_OPT "-O2" CACHE STRING "iOS simulator: optimisation of the generated code")
++        target_compile_options(game_${mod} PRIVATE ${NX_IOS_GAME_OPT} -fvisibility=hidden)
+     elseif(APPLE)
+         target_compile_options(game_${mod} PRIVATE -O2 -fvisibility=hidden)
+     elseif(UNIX)
+@@ -206,7 +215,15 @@ endif()
+ option(NX_HWOPUS "Enable the host single-stream hwopus service" OFF)
+ if(NX_HWOPUS)
+     find_package(PkgConfig REQUIRED)
+-    pkg_check_modules(NX_OPUS REQUIRED IMPORTED_TARGET opus>=1.3)
++    set(NX_OPUS_LIBRARY "" CACHE FILEPATH "Static libopus for this target (iOS simulator); pkg-config elsewhere")
++    if(NX_OPUS_LIBRARY)
++        set(NX_OPUS_INCLUDE_DIRS "${NX_OPUS_INCLUDE}" CACHE PATH "opus headers (the opus/ directory)")
++        add_library(nx_opus_static STATIC IMPORTED)
++        set_target_properties(nx_opus_static PROPERTIES IMPORTED_LOCATION "${NX_OPUS_LIBRARY}")
++        add_library(PkgConfig::NX_OPUS ALIAS nx_opus_static)
++    else()
++        pkg_check_modules(NX_OPUS REQUIRED IMPORTED_TARGET opus>=1.3)
++    endif()
+     list(APPEND NX_RUNTIME_SOURCES runtime/src/svc_hwopus.cpp)
+     set_source_files_properties(runtime/src/svc_hwopus.cpp PROPERTIES
+         INCLUDE_DIRECTORIES "${NX_OPUS_INCLUDE_DIRS}"
+@@ -264,13 +281,17 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+     if(NOT EXISTS "${NX_VULKAN_INCLUDE}/vulkan/vulkan_core.h")
+         message(FATAL_ERROR "missing pinned Vulkan headers")
+     endif()
++    # The runtime's Vulkan headers are the registry version vk_gen.cpp was generated from (the RUNTIME-BOOTSTRAP-001
++    # headers the macOS build uses); MoltenVK 1.3.0 is reached only through vkGetInstanceProcAddr.
+     file(SHA256 "${NX_VULKAN_INCLUDE}/vulkan/vulkan_core.h" mvk_header_hash)
+-    if(NOT mvk_header_hash STREQUAL "7895976b1c44a002b0670865d2dce844185530d5f25728fc575f70f941935483")
+-        message(FATAL_ERROR "unpinned Vulkan headers")
++    if(NOT mvk_header_hash STREQUAL "a7ac0d7e35e77f642c175af5d36729cfdae2d626d2aaa9145c030a42bd44edc6")
++        message(FATAL_ERROR "unpinned Vulkan headers (expected the runtime's vk_gen registry headers)")
+     endif()
+     # END PINNED IOS VULKAN DEPENDENCY
++    enable_language(ASM)
+     add_executable(${NX_GAME} MACOSX_BUNDLE ${NX_RUNTIME_SOURCES}
+         runtime/src/platform_ios.mm runtime/src/memguard_mac.cpp
++        runtime/src/hle_fiber.cpp runtime/src/fiber_context_mac.S runtime/src/nvn/nvn_spirv_subgroup.cpp
+         "${NX_IOS_HOST_DIR}/App.mm" "${NX_IOS_HOST_DIR}/InputBridge.cpp")
+     target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}"
+         "${NX_VULKAN_INCLUDE}" "${NX_IOS_HOST_DIR}")
+@@ -278,7 +299,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+     target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
+     target_link_libraries(${NX_GAME} PRIVATE game_main game_sdk "${NX_IOS_MOLTENVK_LIBRARY}"
+         "-framework IOSurface" "-framework UIKit" "-framework Metal" "-framework MetalKit" "-framework QuartzCore"
+-        "-framework Foundation" "-framework CoreGraphics")
++        "-framework Foundation" "-framework CoreGraphics" "-framework AudioToolbox")
+     set_target_properties(${NX_GAME} PROPERTIES MACOSX_BUNDLE_INFO_PLIST "${NX_IOS_HOST_DIR}/Info.plist")
+ elseif(APPLE)
+     # macOS: SDL3 (window, input, audio) and the Vulkan loader + MoltenVK from Homebrew
+diff --git a/runtime/src/nvn/nvn_debug.cpp b/runtime/src/nvn/nvn_debug.cpp
+index 8f79e3d..6fe15a5 100644
+--- a/runtime/src/nvn/nvn_debug.cpp
++++ b/runtime/src/nvn/nvn_debug.cpp
+@@ -166,7 +166,11 @@ void debug_dump_textures(uint64_t frame) {
+             p_vkResetFences(d, 1, &fence);
+             void* p = nullptr;
+             if (p_vkQueueSubmit(vk_queue(), 1, &si, fence) == VK_SUCCESS &&
++#if defined(NX_ASTRAL_STRICT)
++                gpu_wait_fences(d, 1, &fence, "a debug readback did not finish in the GPU timeout") == VK_SUCCESS &&
++#else
+                 p_vkWaitForFences(d, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS &&
++#endif
+                 p_vkMapMemory(d, s.buffer_memory, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) {
+                 char name[64];
+                 std::snprintf(name, sizeof name, "/frames/%05llu_%llx.raw", (unsigned long long)frame,
+@@ -201,7 +205,11 @@ void debug_dump_textures(uint64_t frame) {
+         si.pCommandBuffers = &cb;
+         p_vkResetFences(d, 1, &fence);
+         if (p_vkQueueSubmit(vk_queue(), 1, &si, fence) == VK_SUCCESS) {
++#if defined(NX_ASTRAL_STRICT)
++            gpu_wait_fences(d, 1, &fence, "a debug readback did not finish in the GPU timeout");
++#else
+             p_vkWaitForFences(d, 1, &fence, VK_TRUE, UINT64_MAX);
++#endif
+             write_ppm(s, w, h, frame, texture);
+         }
+         s.destroy(d);
+diff --git a/runtime/src/nvn/nvn_frames.cpp b/runtime/src/nvn/nvn_frames.cpp
+index 45a9859..4fa7636 100644
+--- a/runtime/src/nvn/nvn_frames.cpp
++++ b/runtime/src/nvn/nvn_frames.cpp
+@@ -137,8 +137,12 @@ uint64_t g_reuse_clock = 0, g_reused = 0;
+ void wait_fences(const VkFence* fences, uint32_t n) {
+     if (!n) return;
+     uint64_t t0 = plat::monotonic_ns();
++#if defined(NX_ASTRAL_STRICT)
++    VkResult r = gpu_wait_fences(vk_device(), n, fences, "a submit did not finish in the GPU timeout");
++#else
+     VkResult r = p_vkWaitForFences(vk_device(), n, fences, VK_TRUE, kFenceTimeout);
+     if (r == VK_TIMEOUT) gpu_hung("a submit did not finish in 2 s");
++#endif
+     if (r == VK_ERROR_DEVICE_LOST) gpu_hung("vkWaitForFences");
+     if (r != VK_SUCCESS) log("nvn/vk: vkWaitForFences failed (%d)", int(r));
+     g_times.fence_ns += plat::monotonic_ns() - t0;
+diff --git a/runtime/src/nvn/nvn_pipeline.h b/runtime/src/nvn/nvn_pipeline.h
+index c92e533..dc1ce8a 100644
+--- a/runtime/src/nvn/nvn_pipeline.h
++++ b/runtime/src/nvn/nvn_pipeline.h
+@@ -96,6 +96,13 @@ uint64_t dynamic_uniform_bindings(const ShaderInfo* s);
+ // Metal's 32 KB). Fragment: the input locations in `locations` (bit mask) that the vertex stage does not write become
+ // private variables holding (0, 0, 0, 1), Maxwell's value for them (nvn_spirv_patch.cpp).
+ bool resize_shared_memory(const std::vector<uint32_t>& in, uint32_t bytes, std::vector<uint32_t>& out);
++#if defined(NX_ASTRAL_STRICT) && defined(NX_IOS_RUNTIME)
++// iOS simulator only: GroupNonUniform operations rewritten to their one-invocation meaning when the device's subgroups
++// are one invocation wide (nvn_spirv_subgroup.cpp, docs/ASTRAL_IOS_SIM.md). False: nothing to do or an unhandled
++// operation.
++bool scalarize_subgroups(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);
++bool gpu_subgroup_size_one();  // nvn_vk.cpp: the device reports a maximum subgroup size of 1
++#endif
+ bool default_unwritten_inputs(const std::vector<uint32_t>& in, uint32_t locations, std::vector<uint32_t>& out);
+ // The fragment input locations `vs` does not write (0 without both stages).
+ uint32_t unwritten_inputs(const ShaderInfo* vs, const ShaderInfo* fs);
+diff --git a/runtime/src/nvn/nvn_spirv_patch.cpp b/runtime/src/nvn/nvn_spirv_patch.cpp
+index 14c0cf4..c806158 100644
+--- a/runtime/src/nvn/nvn_spirv_patch.cpp
++++ b/runtime/src/nvn/nvn_spirv_patch.cpp
+@@ -542,6 +542,12 @@ std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, u
+             ok ? " read (0, 0, 0, 1)" : ", left as they are");
+     }
+     if (clamp_uniform_indices(code, next, nullptr)) code.swap(next);
++#if defined(NX_ASTRAL_STRICT) && defined(NX_IOS_RUNTIME)
++    if (gpu_subgroup_size_one() && scalarize_subgroups(code, next)) {
++        code.swap(next);
++        log("nvn/vk: shader %s: subgroup operations at subgroup size 1", s->hash.c_str());
++    }
++#endif
+     static const bool zero_outputs = [] {  // NX_ZERO_VS_OUTPUTS=0 turns it off (1 turns it on for MoltenVK, not tried)
+         const char* e = std::getenv("NX_ZERO_VS_OUTPUTS");
+ #if defined(__APPLE__)
+diff --git a/runtime/src/nvn/nvn_spirv_subgroup.cpp b/runtime/src/nvn/nvn_spirv_subgroup.cpp
+new file mode 100644
+index 0000000..05503cc
+--- /dev/null
++++ b/runtime/src/nvn/nvn_spirv_subgroup.cpp
+@@ -0,0 +1,240 @@
++// Subgroup operations at subgroup size 1, iOS simulator only (docs/ASTRAL_IOS_SIM.md). The translated shaders use Maxwell warp operations
++// (vote/ballot/shuffle) as GroupNonUniform SPIR-V. The iOS simulator GPU has no SIMD-group functions: MoltenVK reports
++// subgroup sizes 1..1 and its emulation compiles nothing but Elect, so such a compute pipeline fails, its dispatches
++// are skipped, and the passes that read its output later timed out the GPU. On a device whose subgroups are one
++// invocation wide every one of these operations has an exact single-lane meaning, so the module is rewritten to it:
++//   Elect, AllEqual -> true; All, Any -> the predicate; Broadcast(First), Shuffle(Xor/Up/Down) -> the value itself;
++//   Ballot -> (predicate ? 1 : 0, 0, 0, 0); SubgroupLocalInvocationId -> 0; SubgroupSize -> 1;
++//   Subgroup{Eq,Ge,Le}Mask -> (1, 0, 0, 0); Subgroup{Lt,Gt}Mask -> 0 (Private variables with those initialisers).
++// A shuffle from another lane has no single-lane meaning; it reads the caller's own value (what a size-1 device
++// returns for its only lane). Modules with other subgroup operations are left as they are (false).
++#if defined(NX_ASTRAL_STRICT) && defined(NX_IOS_RUNTIME)  // iOS simulator only (CMakeLists.txt)
++#include <algorithm>
++#include <map>
++#include <set>
++#include <vector>
++
++#include <cstdint>
++
++namespace nx::nvn {
++
++namespace {
++enum : uint32_t {
++    OpExtension = 10, OpEntryPoint = 15, OpCapability = 17, OpTypeBool = 20, OpTypeInt = 21, OpTypeVector = 23,
++    OpTypePointer = 32, OpConstantTrue = 41, OpConstant = 43, OpConstantComposite = 44, OpConstantNull = 46,
++    OpFunction = 54, OpVariable = 59, OpLoad = 61, OpAccessChain = 65, OpInBoundsAccessChain = 66,
++    OpDecorate = 71, OpCompositeConstruct = 80, OpCopyObject = 83, OpSelect = 169,
++    OpElect = 333, OpAll = 334, OpAny = 335, OpAllEqual = 336, OpBroadcast = 337, OpBroadcastFirst = 338,
++    OpBallot = 339, OpShuffle = 345, OpShuffleXor = 346, OpShuffleUp = 347, OpShuffleDown = 348,
++    DecorationBuiltIn = 11, StorageInput = 1, StoragePrivate = 6,
++    BuiltInSubgroupSize = 36, BuiltInSubgroupLocalInvocationId = 41,
++    BuiltInEqMask = 4416, BuiltInGeMask = 4417, BuiltInGtMask = 4418, BuiltInLeMask = 4419, BuiltInLtMask = 4420,
++    CapGroupNonUniform = 61, CapGroupNonUniformQuad = 68,
++};
++struct Inst {
++    size_t at;
++    uint32_t op, len;
++};
++bool subgroup_builtin(uint32_t b) {
++    return b == BuiltInSubgroupSize || b == BuiltInSubgroupLocalInvocationId || (b >= BuiltInEqMask && b <= BuiltInLtMask);
++}
++}  // namespace
++
++bool scalarize_subgroups(const std::vector<uint32_t>& in, std::vector<uint32_t>& out) {
++    if (in.size() < 5) return false;
++    std::vector<Inst> insts;
++    for (size_t i = 5; i < in.size();) {
++        uint32_t len = in[i] >> 16;
++        if (!len || i + len > in.size()) return false;
++        insts.push_back({i, in[i] & 0xffff, len});
++        i += len;
++    }
++    uint32_t bound = in[3];
++    std::map<uint32_t, size_t> def;                // id -> instruction index (types, constants, variables)
++    std::map<uint32_t, uint32_t> builtin_of;       // variable -> subgroup builtin
++    std::map<std::pair<uint32_t, uint32_t>, uint32_t> pointer;  // (storage, pointee) -> pointer type
++    uint32_t bool_type = 0;
++    bool uses = false;
++    size_t first_function = insts.size();
++    for (size_t k = 0; k < insts.size(); k++) {
++        const Inst& n = insts[k];
++        const uint32_t* w = &in[n.at];
++        if (n.op == OpFunction && first_function == insts.size()) first_function = k;
++        if (n.op == OpTypeBool && n.len == 2) bool_type = w[1];
++        if (n.op == OpTypePointer && n.len == 4) pointer[{w[2], w[3]}] = w[1];
++        if (k < first_function && n.len >= 2 &&
++            (n.op == OpTypeInt || n.op == OpTypeVector || n.op == OpTypePointer || n.op == OpTypeBool))
++            def[w[1]] = k;
++        if (n.op == OpVariable && n.len >= 4) def[w[2]] = k;
++        if (n.op == OpDecorate && n.len == 4 && w[2] == DecorationBuiltIn && subgroup_builtin(w[3])) builtin_of[w[1]] = w[3];
++        if (n.op >= OpElect && n.op <= 366) {  // the GroupNonUniform instructions
++            uses = true;
++            const bool handled = n.op == OpElect || n.op == OpAll || n.op == OpAny || n.op == OpAllEqual ||
++                                 n.op == OpBroadcast || n.op == OpBroadcastFirst || n.op == OpBallot ||
++                                 (n.op >= OpShuffle && n.op <= OpShuffleDown);
++            if (!handled) return false;
++        }
++        if (n.op >= 4421 && n.op <= 4432) return false;  // the older KHR subgroup instructions
++    }
++    if (!uses && builtin_of.empty()) return false;
++    // Scalar component type of a (vector) type, and its width.
++    auto component = [&](uint32_t type) -> uint32_t {
++        auto it = def.find(type);
++        if (it == def.end()) return 0;
++        const uint32_t* w = &in[insts[it->second].at];
++        return insts[it->second].op == OpTypeVector ? w[2] : type;
++    };
++    auto count = [&](uint32_t type) -> uint32_t {
++        auto it = def.find(type);
++        if (it == def.end()) return 0;
++        return insts[it->second].op == OpTypeVector ? in[insts[it->second].at + 3] : 1;
++    };
++    // New global declarations, inserted before the first function.
++    std::vector<uint32_t> globals;
++    std::map<uint32_t, uint32_t> zero, one, unit;  // type -> OpConstantNull / scalar 1 / (1, 0, ...) constants
++    uint32_t true_id = 0;
++    auto get_zero = [&](uint32_t type) {
++        uint32_t& id = zero[type];
++        if (!id) id = bound++, globals.insert(globals.end(), {(3u << 16) | OpConstantNull, type, id});
++        return id;
++    };
++    auto get_one = [&](uint32_t scalar) {
++        uint32_t& id = one[scalar];
++        if (!id) id = bound++, globals.insert(globals.end(), {(4u << 16) | OpConstant, scalar, id, 1u});
++        return id;
++    };
++    auto get_unit = [&](uint32_t type) {  // (1, 0, 0, 0) of a uint vector, or 1 of a scalar
++        uint32_t n = count(type), c = component(type);
++        if (n <= 1) return get_one(type);
++        uint32_t& id = unit[type];
++        if (!id) {
++            uint32_t a = get_one(c), z = get_zero(c);
++            id = bound++;
++            globals.push_back(((3u + n) << 16) | OpConstantComposite);
++            globals.push_back(type), globals.push_back(id), globals.push_back(a);
++            for (uint32_t k = 1; k < n; k++) globals.push_back(z);
++        }
++        return id;
++    };
++    auto get_pointer = [&](uint32_t pointee) {
++        auto key = std::make_pair(uint32_t(StoragePrivate), pointee);
++        uint32_t& id = pointer[key];
++        if (!id) id = bound++, globals.insert(globals.end(), {(4u << 16) | OpTypePointer, id, StoragePrivate, pointee});
++        return id;
++    };
++    // Rewritten builtin variables: their pointee and initialiser.
++    std::map<uint32_t, uint32_t> private_type;  // variable -> new pointer type
++    std::map<uint32_t, uint32_t> init;
++    size_t insert_at = first_function;
++    for (auto [var, b] : builtin_of) {
++        auto it = def.find(var);
++        if (it == def.end()) return false;
++        const uint32_t* w = &in[insts[it->second].at];
++        if (w[3] != StorageInput) return false;
++        auto pt = def.find(w[1]);
++        if (pt == def.end()) return false;
++        uint32_t pointee = in[insts[pt->second].at + 3];
++        if (!component(pointee)) return false;
++        private_type[var] = get_pointer(pointee);
++        bool set = b == BuiltInSubgroupSize || b == BuiltInEqMask || b == BuiltInGeMask || b == BuiltInLeMask;
++        init[var] = set ? get_unit(pointee) : get_zero(pointee);
++    }
++    // Everything else the rewrite needs is declared up front too.
++    std::set<uint32_t> needs;  // existing types the new declarations refer to
++    for (const Inst& n : insts) {
++        const uint32_t* w = &in[n.at];
++        if (n.op == OpBallot) {
++            uint32_t c = component(w[1]);
++            if (!c) return false;
++            get_one(c), get_zero(c), needs.insert(c);
++        } else if ((n.op == OpElect || n.op == OpAllEqual) && !true_id) {
++            if (!bool_type) return false;
++            true_id = bound++;
++            globals.insert(globals.end(), {(3u << 16) | OpConstantTrue, bool_type, true_id});
++            needs.insert(bool_type);
++        } else if ((n.op == OpAccessChain || n.op == OpInBoundsAccessChain) && n.len >= 4 && private_type.count(w[3])) {
++            auto pt = def.find(w[1]);
++            if (pt == def.end()) return false;
++            uint32_t pointee = in[insts[pt->second].at + 3];
++            get_pointer(pointee), needs.insert(pointee);
++        }
++    }
++    for (auto [var, b] : builtin_of) {
++        uint32_t pointee = in[insts[def[in[insts[def[var]].at + 1]]].at + 3];
++        needs.insert(pointee), needs.insert(component(pointee));
++    }
++    for (uint32_t t : needs) {
++        auto it = def.find(t);
++        if (it == def.end() || it->second >= insert_at) return false;
++    }
++    // Function bodies: instructions are rewritten in place; the Ballot needs one extra id per use.
++    out.assign(in.begin(), in.begin() + 5);
++    const bool interface_all = in[1] >= 0x10400;  // SPIR-V 1.4+: every global is in the entry point interface
++    for (size_t k = 0; k < insts.size(); k++) {
++        const Inst& n = insts[k];
++        const uint32_t* w = &in[n.at];
++        if (k == insert_at) {  // new declarations, then the rewritten variables (only functions use them)
++            out.insert(out.end(), globals.begin(), globals.end());
++            for (auto [var, type] : private_type)
++                out.insert(out.end(), {(5u << 16) | OpVariable, type, var, StoragePrivate, init[var]});
++        }
++        if (n.op == OpCapability && w[1] >= CapGroupNonUniform && w[1] <= CapGroupNonUniformQuad) continue;
++        if (n.op == OpDecorate && n.len == 4 && w[2] == DecorationBuiltIn && builtin_of.count(w[1])) continue;
++        if (n.op == OpEntryPoint && !interface_all) {
++            size_t p = 3;  // the name: a nul-terminated string
++            while (p < n.len && (w[p] >> 24) != 0) p++;
++            p++;
++            std::vector<uint32_t> e(w, w + std::min<size_t>(p, n.len));
++            for (; p < n.len; p++)
++                if (!builtin_of.count(w[p])) e.push_back(w[p]);
++            e[0] = (uint32_t(e.size()) << 16) | OpEntryPoint;
++            out.insert(out.end(), e.begin(), e.end());
++            continue;
++        }
++        if (n.op == OpVariable && n.len >= 4 && private_type.count(w[2])) {
++            continue;  // declared again as Private before the first function
++        }
++        if ((n.op == OpAccessChain || n.op == OpInBoundsAccessChain) && n.len >= 4 && private_type.count(w[3])) {
++            auto pt = def.find(w[1]);
++            if (pt == def.end()) return false;
++            std::vector<uint32_t> a(w, w + n.len);
++            a[1] = pointer[{StoragePrivate, in[insts[pt->second].at + 3]}];
++            out.insert(out.end(), a.begin(), a.end());
++            continue;
++        }
++        switch (n.op) {
++        case OpElect:
++        case OpAllEqual:
++            out.insert(out.end(), {(4u << 16) | OpCopyObject, w[1], w[2], true_id});
++            continue;
++        case OpAll:
++        case OpAny:
++        case OpBroadcastFirst:
++        case OpBroadcast:
++        case OpShuffle:
++        case OpShuffleXor:
++        case OpShuffleUp:
++        case OpShuffleDown:  // rt, id, scope, value[, lane/mask/delta]
++            out.insert(out.end(), {(4u << 16) | OpCopyObject, w[1], w[2], w[4]});
++            continue;
++        case OpBallot: {  // rt (uvec4), id, scope, predicate
++            uint32_t c = component(w[1]), n4 = count(w[1]);
++            uint32_t bit = bound++;
++            out.insert(out.end(), {(6u << 16) | OpSelect, c, bit, w[4], one[c], zero[c]});
++            out.push_back(((3u + n4) << 16) | OpCompositeConstruct);
++            out.push_back(w[1]), out.push_back(w[2]), out.push_back(bit);
++            for (uint32_t j = 1; j < n4; j++) out.push_back(zero[c]);
++            continue;
++        }
++        default:
++            break;
++        }
++        out.insert(out.end(), w, w + n.len);
++    }
++    out[3] = bound;
++    return true;
++}
++
++}  // namespace nx::nvn
++
++#endif
+diff --git a/runtime/src/nvn/nvn_vk.cpp b/runtime/src/nvn/nvn_vk.cpp
+index 474e98c..3556ce2 100644
+--- a/runtime/src/nvn/nvn_vk.cpp
++++ b/runtime/src/nvn/nvn_vk.cpp
+@@ -56,6 +56,9 @@ VkFormat g_sc_format = VK_FORMAT_B8G8R8A8_UNORM;
+ VkSemaphore g_acquired = VK_NULL_HANDLE, g_rendered = VK_NULL_HANDLE;
+ VkBool32 g_depth_clip_control = VK_FALSE;
+ bool g_integrated = false;
++#if defined(NX_ASTRAL_STRICT) && defined(NX_IOS_RUNTIME)
++bool g_subgroup_one = false;  // the device's subgroups are one invocation wide (iOS simulator): scalarize_subgroups
++#endif
+ bool g_require_sg32 = false;  // compute pipelines are made with a required subgroup size of 32 (Maxwell's warp)  // the chosen GPU is an integrated one (unified memory, the GPU is the long side)
+ VkPhysicalDeviceFeatures g_features{};  // the core features enabled (vk_features())
+ VkDescriptorPool g_descriptors = VK_NULL_HANDLE;
+@@ -219,6 +222,9 @@ bool init() {
+         bool can = f13.subgroupSizeControl && sgc.minSubgroupSize <= 32 && sgc.maxSubgroupSize >= 32 &&
+                    (sgc.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
+         g_require_sg32 = can && e && e[0] == '1';  // experimental, off by default: no visible effect on the Intel silhouettes
++#if defined(NX_ASTRAL_STRICT) && defined(NX_IOS_RUNTIME)
++        g_subgroup_one = sgc.maxSubgroupSize == 1;
++#endif
+         log("nvn/vk: subgroup sizes %u..%u, compute subgroup size %s", sgc.minSubgroupSize, sgc.maxSubgroupSize,
+             g_require_sg32 ? "pinned to 32" : "left to the driver");
+     }
+@@ -410,6 +416,47 @@ bool vk_depth_clip_control() { return g_depth_clip_control; }
+ const VkPhysicalDeviceFeatures& vk_features() { return g_features; }
+ bool gpu_is_integrated() { return g_integrated; }
+ bool gpu_require_subgroup32() { return g_require_sg32; }
++#if defined(NX_ASTRAL_STRICT) && defined(NX_IOS_RUNTIME)
++bool gpu_subgroup_size_one() { return g_subgroup_one; }
++#endif
++#if defined(NX_ASTRAL_STRICT)
++// BEGIN GPU TIMEOUT
++// A fence wait longer than this counts as a GPU hang (gpu_hung ends the process). 2 s on every host; NX_GPU_TIMEOUT_S
++// may lower it or raise it to at most 5 s. Never longer: a stuck GPU keeps the host's own GPU busy, and waiting on it
++// froze and restarted the host twice on 2026-10-19 (iOS simulator with a 20 s / 120 s timeout, docs/ASTRAL_IOS_SIM.md).
++constexpr double kGpuTimeoutDefaultS = 2, kGpuTimeoutMaxS = 5;
++double gpu_timeout_seconds(const char* env, bool* clamped) {
++    *clamped = false;
++    if (!env || !*env) return kGpuTimeoutDefaultS;
++    char* end = nullptr;
++    double s = std::strtod(env, &end);
++    if (end == env || !(s > 0)) return kGpuTimeoutDefaultS;  // unparsable, zero, negative or NaN
++    if (s > kGpuTimeoutMaxS) {
++        *clamped = true;
++        return kGpuTimeoutMaxS;
++    }
++    return s;
++}
++// END GPU TIMEOUT
++uint64_t gpu_fence_timeout_ns() {
++    static const uint64_t ns = [] {
++        bool clamped = false;
++        const char* e = std::getenv("NX_GPU_TIMEOUT_S");
++        double s = gpu_timeout_seconds(e, &clamped);
++        if (clamped)
++            log("nvn/vk: NX_GPU_TIMEOUT_S=%s clamped to %.0f s: longer waits on a stuck GPU can freeze or restart the "
++                "host", e, kGpuTimeoutMaxS);
++        return uint64_t(s * 1e9);
++    }();
++    return ns;
++}
++VkResult gpu_wait_fences(VkDevice device, uint32_t count, const VkFence* fences, const char* what) {
++    VkResult r = p_vkWaitForFences(device, count, fences, VK_TRUE, gpu_fence_timeout_ns());
++    if (r == VK_TIMEOUT) gpu_hung(what);
++    if (r == VK_ERROR_DEVICE_LOST) gpu_hung("vkWaitForFences: device lost");
++    return r;
++}
++#endif
+
+ uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
+     for (uint32_t k = 0; k < g_memory.memoryTypeCount; k++)
+@@ -516,8 +563,12 @@ void end_and_wait(VkSemaphore wait, VkSemaphore signal) {
+     uint64_t t1 = plat::monotonic_ns();
+     // 2 s at most: a frame's work takes milliseconds; longer is a shader that does not end.
+     if (queued) {
++#if defined(NX_ASTRAL_STRICT)
++        VkResult w = gpu_wait_fences(g_device, 1, &g_fence, "a submit did not finish in the GPU timeout");
++#else
+         VkResult w = p_vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, 2'000'000'000ull);
+         if (w == VK_TIMEOUT) gpu_hung("a submit did not finish in 2 s");
++#endif
+         check(w, "vkWaitForFences");
+     }
+     frame_times().encode_ns += t1 - t0, frame_times().fence_ns += plat::monotonic_ns() - t1;
+@@ -674,7 +725,14 @@ void gpu_present(uint64_t texture, const int32_t* crop) {
+     if (!g_swapchain && !make_swapchain()) return;
+     uint32_t index = 0;
+     VkSemaphore acquired = async_gpu() ? frame_acquire_semaphore() : g_acquired;
++#if defined(NX_ASTRAL_STRICT)
++    // Bounded: an image that does not come back in the GPU timeout means the presentation engine is stuck behind a hung
++    // GPU; waiting on it for ever can freeze the host.
++    VkResult r = p_vkAcquireNextImageKHR(g_device, g_swapchain, gpu_fence_timeout_ns(), acquired, VK_NULL_HANDLE, &index);
++    if (r == VK_TIMEOUT || r == VK_NOT_READY) gpu_hung("vkAcquireNextImageKHR: no image in the GPU timeout");
++#else
+     VkResult r = p_vkAcquireNextImageKHR(g_device, g_swapchain, UINT64_MAX, acquired, VK_NULL_HANDLE, &index);
++#endif
+     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+         make_swapchain();
+         return;
+diff --git a/runtime/src/nvn/nvn_vk.h b/runtime/src/nvn/nvn_vk.h
+index f4e6529..65423b8 100644
+--- a/runtime/src/nvn/nvn_vk.h
++++ b/runtime/src/nvn/nvn_vk.h
+@@ -39,6 +39,14 @@ VkDevice vk_device();
+ bool vk_depth_clip_control();
+ // The core features the device was created with (all the GPU has): depthClamp, depthBiasClamp, depthBounds, ...
+ const VkPhysicalDeviceFeatures& vk_features();
++#if defined(NX_ASTRAL_STRICT)
++// Astral strict: every GPU wait on the NVN path is bounded (docs/ASTRAL_IOS_SIM.md, host freeze incident). A wait longer
++// than gpu_fence_timeout_ns() counts as a GPU hang: 2 s, or NX_GPU_TIMEOUT_S seconds clamped to at most 5 s, because
++// longer waits on a stuck GPU can freeze or restart the host. gpu_wait_fences waits that long and calls gpu_hung on a
++// timeout or a lost device; other failures are returned.
++uint64_t gpu_fence_timeout_ns();
++VkResult gpu_wait_fences(VkDevice device, uint32_t count, const VkFence* fences, const char* what);
++#endif
+ bool gpu_require_subgroup32();  // compute pipelines pin the subgroup size to 32 (nvn_pipeline.cpp)
+ bool gpu_is_integrated();  // the device in use is an integrated GPU (set when the device is made)
+ VkPhysicalDevice vk_physical();
+diff --git a/runtime/src/perf_hud.cpp b/runtime/src/perf_hud.cpp
+index 5263c9d..ef1e389 100644
+--- a/runtime/src/perf_hud.cpp
++++ b/runtime/src/perf_hud.cpp
+@@ -29,7 +29,10 @@
+ #endif
+ #if defined(__APPLE__)
+ #include <TargetConditionals.h>
++#if __has_include(<libkern/OSThermalNotification.h>)  // not in the iOS simulator SDK
+ #include <libkern/OSThermalNotification.h>
++#define NX_HUD_THERMAL_NOTIFY 1
++#endif
+ #include <mach/mach.h>
+ #include <notify.h>
+ #endif
+@@ -150,7 +153,7 @@ int64_t resident_bytes() {
+ }
+
+ std::string thermal_state() {
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && defined(NX_HUD_THERMAL_NOTIFY)
+     // The system's thermal pressure (what NSProcessInfo.thermalState follows), through notify(3): no Objective-C.
+     static int token = -1;
+     static bool registered = notify_register_check(kOSThermalNotificationPressureLevelName, &token) == NOTIFY_STATUS_OK;
+diff --git a/runtime/src/platform_ios.mm b/runtime/src/platform_ios.mm
+index 3120c0c..913f743 100644
+--- a/runtime/src/platform_ios.mm
++++ b/runtime/src/platform_ios.mm
+@@ -2,6 +2,7 @@
+ // No desktop entry or SDL dependency. Audio remains an explicit unsupported boundary.
+ #import <Foundation/Foundation.h>
+ #import <TargetConditionals.h>
++#import <AudioToolbox/AudioToolbox.h>
+ #if !TARGET_OS_SIMULATOR
+ #error Astral iOS runtime is simulator only
+ #endif
+@@ -12,7 +13,12 @@
+ #include <cmath>
+ #include <cstring>
+ #include <cstdlib>
++#include <deque>
++#include <dlfcn.h>
+ #include <filesystem>
++#include <mutex>
++#include <signal.h>
++#include <vector>
+ #include <pthread.h>
+ #include <sched.h>
+ #include <sys/mman.h>
+@@ -23,6 +29,7 @@
+ #include <nx/runtime.h>
+ #include "platform.h"
+ #include "InputBridge.h"
++#include "kernel.h"
+ namespace nx::plat {
+ bool reserve(uint64_t addr, uint64_t size) {
+     void* p = mmap(reinterpret_cast<void*>(addr), size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+@@ -153,6 +160,8 @@ bool make_dirs(const std::string& path) {
+ void log_line(const char* line) { std::fprintf(stderr, "%s\n", line); }
+
+ std::string data_root() {
++    // NX_DATA_ROOT (simctl launch: SIMCTL_CHILD_NX_DATA_ROOT) as on macOS; the simulator reads host paths.
++    if (const char* r = std::getenv("NX_DATA_ROOT"); r && *r) return r;
+     NSString* root = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"guest"];
+     return root.fileSystemRepresentation;
+ }
+@@ -169,13 +178,18 @@ bool make_dirs(const std::string& path) {
+ // The UIKit host owns main-thread layer attachment and retained surface leases.
+ // Window ownership/state functions live with the main-thread UIKit host in App.mm.
+ float default_render_scale() { return 1.0f; }
+-bool headless() { return false; }
++bool headless() {
++    static const bool on = [] { const char* e = std::getenv("NX_HEADLESS"); return e && *e == '1'; }();
++    return on;
++}
+ void read_pad(PadState& p) {
+     auto s = acs_input_poll();
+-    if (s.abi_version != 1) nx::fatal("iOS input ABI mismatch");
++    if (s.abi_version != ACS_INPUT_ABI_VERSION) nx::fatal("iOS input ABI mismatch");
+     struct Map { ACSInputControl source; uint64_t target; };
+     static const Map map[] = {{ACS_A,kA},{ACS_B,kB},{ACS_X,kX},{ACS_Y,kY},
+-        {ACS_L,kL},{ACS_R,kR},{ACS_ZL,kZL},{ACS_ZR,kZR},{ACS_PLUS,kPlus},{ACS_MINUS,kMinus}};
++        {ACS_L,kL},{ACS_R,kR},{ACS_ZL,kZL},{ACS_ZR,kZR},{ACS_PLUS,kPlus},{ACS_MINUS,kMinus},
++        {ACS_DPAD_UP,kUp},{ACS_DPAD_DOWN,kDown},{ACS_DPAD_LEFT,kLeft},{ACS_DPAD_RIGHT,kRight},
++        {ACS_STICK_L_CLICK,kStickL},{ACS_STICK_R_CLICK,kStickR}};
+     for (auto m : map) if (s.buttons & ACS_BUTTON(m.source)) p.buttons |= m.target;
+     auto axis = [](float v) { return int32_t(std::lround(std::clamp(v, -1.0f, 1.0f) * kStickMax)); };
+     p.lx = axis(s.left_x); p.ly = axis(s.left_y); // both ABIs use up-positive Y
+@@ -190,11 +204,102 @@ void read_pad(PadState& p) {
+     if (p.rx > 16383) p.buttons |= kStickRRight;
+     if (p.ry < -16383) p.buttons |= kStickRDown;
+     if (p.ry > 16383) p.buttons |= kStickRUp;
++    input_script(p);
++}
++
++// Touches that were not on an overlay control (App.mm), as fractions of the game view.
++size_t read_touches(TouchPoint* out, size_t max) {
++    ACSTouchPoint points[ACS_TOUCH_MAX];
++    size_t n = acs_touch_poll(points, std::min<size_t>(max, ACS_TOUCH_MAX));
++    for (size_t k = 0; k < n; ++k) out[k] = TouchPoint{points[k].id, points[k].x, points[k].y};
++    return n;
++}
++
++// ---- audio: one AudioQueue, s16 stereo 48 kHz, fed from the submitted buffers (as platform_mac.cpp's SDL stream)
++namespace {
++struct PendingAudio {
++    const uint8_t* data;
++    size_t size, pos;
++    void* ctx;
++};
++AudioDone g_done = nullptr;
++AudioQueueRef g_queue = nullptr;
++std::mutex g_audio;
++std::deque<PendingAudio> g_pending;
++constexpr UInt32 kAudioBufferBytes = 1024 * 4;  // 1024 frames, 21 ms
++void audio_callback(void*, AudioQueueRef q, AudioQueueBufferRef b) {
++    auto* dst = static_cast<uint8_t*>(b->mAudioData);
++    size_t filled = 0;
++    std::vector<void*> finished;
++    {
++        std::lock_guard lk(g_audio);
++        while (filled < kAudioBufferBytes && !g_pending.empty()) {
++            PendingAudio& p = g_pending.front();
++            size_t take = std::min(size_t(kAudioBufferBytes) - filled, p.size - p.pos);
++            std::memcpy(dst + filled, p.data + p.pos, take);
++            filled += take;
++            p.pos += take;
++            if (p.pos == p.size) {
++                finished.push_back(p.ctx);
++                g_pending.pop_front();
++            }
++        }
++    }
++    if (filled < kAudioBufferBytes) std::memset(dst + filled, 0, kAudioBufferBytes - filled);  // underrun: silence
++    b->mAudioDataByteSize = kAudioBufferBytes;
++    AudioQueueEnqueueBuffer(q, b, 0, nullptr);
++    for (void* ctx : finished) g_done(ctx);
++}
++}  // namespace
++
++bool audio_open(AudioDone done) {
++    g_done = done;
++    // NX_MUTE=1 / headless: no device, the callers pace themselves with a timer (as on macOS).
++    if (headless() || std::getenv("NX_MUTE")) return false;
++    AudioStreamBasicDescription f{};
++    f.mSampleRate = 48000;
++    f.mFormatID = kAudioFormatLinearPCM;
++    f.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked;
++    f.mBytesPerPacket = 4, f.mFramesPerPacket = 1, f.mBytesPerFrame = 4, f.mChannelsPerFrame = 2, f.mBitsPerChannel = 16;
++    if (AudioQueueNewOutput(&f, audio_callback, nullptr, nullptr, nullptr, 0, &g_queue) != noErr) {
++        nx::log("ios audio: AudioQueueNewOutput failed; silent, self-paced");
++        g_queue = nullptr;
++        return false;
++    }
++    for (int k = 0; k < 3; ++k) {
++        AudioQueueBufferRef b = nullptr;
++        if (AudioQueueAllocateBuffer(g_queue, kAudioBufferBytes, &b) != noErr) break;
++        std::memset(b->mAudioData, 0, kAudioBufferBytes);
++        b->mAudioDataByteSize = kAudioBufferBytes;
++        AudioQueueEnqueueBuffer(g_queue, b, 0, nullptr);
++    }
++    if (AudioQueueStart(g_queue, nullptr) != noErr) {
++        nx::log("ios audio: AudioQueueStart failed; silent, self-paced");
++        AudioQueueDispose(g_queue, true);
++        g_queue = nullptr;
++        return false;
++    }
++    nx::log("ios audio: AudioQueue s16 stereo 48 kHz");
++    return true;
++}
++
++bool audio_submit(const void* data, size_t bytes, void* ctx) {
++    if (!g_queue) return false;
++    std::lock_guard lk(g_audio);
++    g_pending.push_back({static_cast<const uint8_t*>(data), bytes, 0, ctx});
++    return true;
++}
++
++uint32_t audio_queued() {
++    std::lock_guard lk(g_audio);
++    return uint32_t(g_pending.size());
++}
++
++void audio_pause(bool paused) {
++    if (!g_queue) return;
++    if (paused) AudioQueuePause(g_queue);
++    else AudioQueueStart(g_queue, nullptr);
+ }
+-bool audio_open(AudioDone) { nx::fatal("unsupported iOS host operation: audio_open"); }
+-bool audio_submit(const void*, size_t, void*) { nx::fatal("unsupported iOS host operation: audio_submit"); }
+-uint32_t audio_queued() { nx::fatal("unsupported iOS host operation: audio_queued"); }
+-void audio_pause(bool) { nx::fatal("unsupported iOS host operation: audio_pause"); }
+ extern "C" void* acs_vulkan_get_instance_proc_addr();
+ extern "C" int acs_vulkan_create_surface(void*, void*, uint64_t*, void*);
+ void* vulkan_get_instance_proc_addr() { return acs_vulkan_get_instance_proc_addr(); }
+@@ -203,3 +308,34 @@ int vulkan_create_surface(void* instance, void* window, uint64_t* surface, void*
+     return acs_vulkan_create_surface(instance, window, surface, gipa);
+ }
+ } // namespace nx::plat
++
++// ---- crash handler (as platform_mac.cpp): guest registers and backtrace into the log -----------------------------
++namespace {
++void ios_crash_handler(int sig, siginfo_t* info, void* uc) {
++    if ((sig == SIGSEGV || sig == SIGBUS) && nx::plat::write_watch_fault(info->si_addr)) return;  // write_watch.cpp
++    const auto* m = static_cast<ucontext_t*>(uc)->uc_mcontext;
++    Dl_info d{};
++    uint64_t pc = m->__ss.__pc;
++    dladdr(reinterpret_cast<void*>(pc), &d);
++    nx::log("CRASH: signal %d at %s+%llx, data address %llx", sig, d.dli_fname ? d.dli_fname : "?",
++            (unsigned long long)(pc - uint64_t(d.dli_fbase)), (unsigned long long)uint64_t(info->si_addr));
++    nx::CPU& c = nx::current_cpu();
++    nx::log("  guest lr %s  sp %llx", nx::describe(c.x[30]).c_str(), (unsigned long long)c.x[31]);
++    for (int k = 0; k < 32; k += 4)
++        nx::log("  x%-2d %016llx %016llx %016llx %016llx", k, (unsigned long long)c.x[k], (unsigned long long)c.x[k + 1],
++                (unsigned long long)c.x[k + 2], (unsigned long long)c.x[k + 3]);
++    nx::backtrace(c);
++    nx::log_recent_files();
++    signal(sig, SIG_DFL);
++    raise(sig);
++}
++__attribute__((constructor)) void ios_install_crash_handler() {
++    struct sigaction sa{};
++    sa.sa_sigaction = ios_crash_handler;
++    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
++    sigaction(SIGSEGV, &sa, nullptr);
++    sigaction(SIGBUS, &sa, nullptr);
++    sigaction(SIGILL, &sa, nullptr);
++    sigaction(SIGFPE, &sa, nullptr);
++}
++}  // namespace

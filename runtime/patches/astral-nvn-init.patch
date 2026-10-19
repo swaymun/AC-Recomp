@@ -1,0 +1,20 @@
+diff --git a/runtime/src/nvn/nvn_device.cpp b/runtime/src/nvn/nvn_device.cpp
+--- a/runtime/src/nvn/nvn_device.cpp
++++ b/runtime/src/nvn/nvn_device.cpp
+@@ -14,8 +14,16 @@ namespace {
+ // minor >= 15 (main+5a7b48). The "provisional" ones are fields the real nvnDeviceInitialize fills in its device
+ // struct; their values are placeholders until that init is read.
+ const std::map<uint32_t, int32_t> kDeviceInfo = {
++#if defined(NX_ASTRAL_STRICT)
++    // Astral's bundled driver reports API 53.310. Its startup requires major
++    // exactly 53 and minor >= 310; a newer major is not ABI-compatible.
++    // These identify the guest API, not the host Vulkan driver's version.
++    {0, 53},
++    {1, 310},
++#else
+     {0, 0x37},
+     {1, 0xf},
++#endif
+     {2, 0xe},
+     {3, 0x10000},
+     {4, 0x100},

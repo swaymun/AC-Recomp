@@ -1,0 +1,19 @@
+# Windows-only policy, applied after astral-bootstrap.patch.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -7,6 +7,14 @@
+ # The game this build is for: games/<NX_GAME>/ holds what only that game needs (game.cpp: nx/game.h), the shared
+ # runtime is the rest. One build directory per game.
+ set(NX_GAME "hades" CACHE STRING "Game to build (a folder under games/)")
++# Keep guest fmul/fadd rounding separate on Windows as on the Linux lane.
++# clang-cl provides the builtins used by the generated code and MSVC ABI.
++if(WIN32 AND NX_GAME STREQUAL "astral")
++    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR NOT MSVC)
++        message(FATAL_ERROR "Astral Windows requires clang-cl and the Windows SDK")
++    endif()
++    add_compile_options(/bigobj /clang:-ffp-contract=off)
++endif()
+ # Astral native memory profile is shared by runtime AND every generated TU.
+ if(NX_GAME STREQUAL "astral")
+     add_compile_definitions(NX_ASTRAL_STRICT=1)

@@ -1,0 +1,243 @@
+#!/bin/bash
+# Bounded real guest runs using IOS026's explicit dedicated-device registry.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+exec python3 - "$@" <<'PY'
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+sys.path.insert(0, 'tools')
+import prepare_runtime as runtime
+p = argparse.ArgumentParser()
+p.add_argument('--prepared', type=Path, required=True)
+p.add_argument('--inputs', type=Path, required=True)
+p.add_argument('--host-registry', type=Path, required=True)
+p.add_argument('--seconds', type=int, default=60)
+a = p.parse_args()
+if not 1 <= a.seconds <= 60:
+    p.error('guest bound must be 1..60 seconds')
+root = Path.cwd()
+private = root / '.local/ios-guest-entry-028'
+private.mkdir(parents=True, exist_ok=True)
+if subprocess.run(['git', 'check-ignore', '-q', str(private)], timeout=10).returncode:
+    raise SystemExit('private evidence must be ignored')
+run = private / ('run-' + uuid.uuid4().hex)
+run.mkdir()
+print('private_evidence=' + str(run), flush=True)
+log = (run / 'commands.log').open('w')
+def command(args, timeout=30, check=True, env=None):
+    args = list(map(str, args))
+    log.write(json.dumps(args) + '\n'); log.flush()
+    child = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, start_new_session=True, env=env)
+    try:
+        output, _ = child.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        output, _ = child.communicate(timeout=5)
+        log.write(output + '\nTIMEOUT\n'); log.flush()
+        raise RuntimeError('bounded command timed out')
+    log.write(output + '\nexit=' + str(child.returncode) + '\n'); log.flush()
+    if check and child.returncode:
+        raise RuntimeError('command failed: ' + ' '.join(args))
+    return output
+report = {'schema': 1, 'dispatch_unit': 'IOS-CUMULATIVE-041',
+          'producer_run': '96df12444ac34a2598b5567cf36fd036',
+          'source_head': command(['git', 'rev-parse', 'HEAD']).strip(),
+          'adapter_sha256': runtime.sha(root / 'scripts/check-ios-runtime'),
+          'prepare_tool_sha256': runtime.sha(root / 'tools/prepare_runtime.py'),
+          'started_at': datetime.now(timezone.utc).isoformat(),
+          'minimum_target': '26.0', 'runtime': '26.5', 'families': {},
+          'gameplay': False, 'guest_frames': 0}
+try:
+    prepared = a.prepared.resolve()
+    runtime.validate_simulator_build(prepared)
+    report['built_identity'] = runtime.simulator_build_identity(prepared)
+    receipt = json.loads((prepared / 'prepared.json').read_text())
+    runtime.validate_ios_identity(receipt['identity'])
+    cumulative = receipt['identity']['profile'] == runtime.IOS_CUMULATIVE
+    if cumulative:
+        import service_batch_startup as service
+        canonical = Path(runtime.git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir')).parent
+        store = canonical / '.local/orchestrate/2026-10-18-afternoon'
+        report['controls'] = service.controls(store)
+        report['dependencies'] = service.reviewed(root, store)
+    report['identity'] = receipt['identity']
+    report['source'] = receipt['source']
+    report['service_overlay_inclusion'] = list(receipt['identity']['patches'])
+    report['handler_execution'] = 'Only explicit per-family log observations establish execution; inclusion does not.'
+    runtime.require(receipt['source'] == runtime.source_fingerprint(prepared / 'source'), 'stale prepared source')
+    manifest, manifest_hash = runtime.validate_inputs(a.inputs.resolve())
+    runtime.require(manifest_hash == receipt['identity']['manifest_sha256'], 'input identity mismatch')
+    commands = json.loads((prepared / 'build/compile_commands.json').read_text())
+    # Identity has hashes for every generated file; source paths are in compile_commands.
+    gen = Path(next(c['file'] for c in commands if c['file'].endswith('/main/table.cpp'))).parent.parent
+    runtime.require(runtime.generated_evidence(gen, manifest) == receipt['identity']['generated'], 'generated input drift')
+    runtime.validate_ios_commands(commands, gen)
+    app = run / 'ACSAstral.app'
+    shutil.copytree(prepared / 'build/astral.app', app, symlinks=False)
+    info = plistlib.loads((root / 'ports/ios/Info.plist').read_bytes())
+    info.update(CFBundleIdentifier=('local.acs.cumulative-041' if cumulative else 'local.acs.guest-entry-028'), CFBundleExecutable='astral', CFBundleName='ACS Guest Entry')
+    (app / 'Info.plist').write_bytes(plistlib.dumps(info))
+    bundle = info['CFBundleIdentifier']
+    command(['codesign', '--force', '--sign', '-', '--timestamp=none', app])
+    command(['codesign', '--verify', '--strict', app])
+    report['binary_platform'] = runtime.validate_simulator_library(app / 'astral')
+    report['executable_sha256'] = runtime.sha(app / 'astral')
+    report['prepared_sha256'] = runtime.sha(prepared / 'prepared.json')
+    report['compile_commands_sha256'] = runtime.sha(prepared / 'build/compile_commands.json')
+    registry = json.loads(a.host_registry.read_text())
+    simruntime = 'com.apple.CoreSimulator.SimRuntime.iOS-26-5'
+    types = {'iPhone':'com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro',
+             'iPad':'com.apple.CoreSimulator.SimDeviceType.iPad-Pro-11-inch-M5-12GB'}
+    def owned(family):
+        entry = registry[family]
+        expected = {'name': 'ACS IOS-LAUNCH-RESCUE-026 ' + family, 'runtime': simruntime, 'type': types[family]}
+        runtime.require(all(entry[k] == v for k,v in expected.items()), 'registry ownership mismatch')
+        inventory = json.loads(command(['xcrun','simctl','list','devices','--json']))
+        matches = [d for d in inventory['devices'].get(simruntime,[]) if d['udid'] == entry['udid']]
+        runtime.require(len(matches) == 1 and matches[0]['name'] == expected['name'] and
+                        matches[0]['deviceTypeIdentifier'] == types[family] and matches[0]['isAvailable'], 'dedicated simulator mismatch')
+        return matches[0]
+    def sim(family, action, *args, **kwargs):
+        return command(['xcrun','simctl',action,owned(family)['udid'],*args],**kwargs)
+    for family in types:
+        result = report['families'][family] = {'build': 'passed', 'installed': False,
+            'guest_run_attempted': False, 'boot_worker_entered': False,
+            'guest_startup': False, 'guest_frames': 0,
+            'started_at': datetime.now(timezone.utc).isoformat(),
+            'native_graphics': 'unsupported; unmeasured', 'native_audio': 'unsupported; unmeasured'}
+        booted = False
+        docs = None
+        installed_app = None
+        try:
+            if cumulative:
+                service.controls(store)
+            runtime.require(owned(family)['state'] == 'Shutdown', 'dedicated simulator is busy')
+            sim(family,'boot')
+            booted = True
+            sim(family,'bootstatus','-b',timeout=120)
+            apps = runtime.simulator_app_inventory(sim(family,'listapps'), run/(family+'-apps.plist'))
+            runtime.require(bundle not in apps, 'existing bundle refused')
+            sim(family,'install',app)
+            installed_app = Path(sim(family,'get_app_container',bundle,'app').strip())
+            runtime.require(installed_app.is_dir() and runtime.sha(installed_app/'astral') == report['executable_sha256'],
+                            'installed executable identity mismatch')
+            result['installed'] = True
+            container = Path(sim(family,'get_app_container',bundle,'data').strip())
+            docs = container / 'Documents'; docs.mkdir(exist_ok=True)
+            # Package only verified flat modules in a fresh owned guest root. No keys/NSP/RomFS copies.
+            guest = docs / 'guest'
+            runtime.require(not guest.exists(), 'existing guest data refused; use a fresh app container')
+            (guest / 'analysis').mkdir(parents=True)
+            for mod in manifest['modules']:
+                flat = runtime.check_file(a.inputs.resolve(),mod['flat'])
+                destination = guest / 'analysis' / (mod['name']+'.bin')
+                shutil.copyfile(flat,destination)
+                runtime.require(runtime.sha(destination) == mod['flat']['sha256'], 'packaged flat identity mismatch')
+            token = run.name + '-' + family
+            for name in ('startup.jsonl','guest.log'):
+                runtime.require(not (docs / name).exists(), 'stale startup evidence refused')
+            started = time.monotonic()
+            result['guest_run_attempted'] = True
+            try:
+                result['launch'] = sim(family,'launch',bundle,'--evidence-run',token,timeout=15,
+                    env=dict(os.environ, SIMCTL_CHILD_NX_TRACE='1')).strip()
+            except RuntimeError as e:
+                # A launch RPC failure is separate from token-correlated app execution.
+                result['launch_rpc_error'] = str(e)
+            while time.monotonic()-started < a.seconds:
+                runtime.require(not (docs/'guest.log').exists() or (docs/'guest.log').stat().st_size <= 16*1024*1024,
+                                'guest trace exceeded 16 MiB bound')
+                text = (docs/'guest.log').read_text(errors='replace') if (docs/'guest.log').exists() else ''
+                if 'FATAL:' in text:
+                    result['boundary'] = next(line for line in text.splitlines() if 'FATAL:' in line)
+                    break
+                time.sleep(.2)
+            result['elapsed_seconds'] = round(time.monotonic()-started,3)
+            stages = [json.loads(line) for line in (docs/'startup.jsonl').read_text().splitlines()]
+            fresh = [s for s in stages if s['evidence_run'] == token]
+            runtime.require(fresh and len({s['pid'] for s in fresh}) == 1, 'missing or mixed process evidence')
+            result['pid'] = fresh[0]['pid']
+            result['evidence_run'] = token
+            # A strict guest fatal may exit before ps; callback records still
+            # bind the single PID/token, while live ownership is checked if present.
+            process = command(['ps','-p',str(result['pid']),'-o','pid=,command='],check=False).strip()
+            if process:
+                runtime.require(str(installed_app/'astral') in process and token in process, 'guest process ownership mismatch')
+            result['live_process_observed'] = bool(process)
+            result['nnMain'] = 'entering nnMain' in text
+            result['observed_service_lines'] = [line for line in text.splitlines()
+                if any(marker in line for marker in ('ipc:', 'FATAL:', 'service dispatch', 'logger: accepted'))]
+            result['unreached_acceptance'] = ['native game frames', 'audible native audio', 'gameplay']
+            result['boot_worker_entered'] = any(s['stage'] == 'nx-boot-enter' for s in fresh)
+            result['ui_active'] = any(s['stage'] == 'scene-active' for s in fresh)
+            result['ui_responsive_during_boot'] = any(s['stage'] == 'ui-responsive-during-boot' for s in fresh)
+            result['guest_entry'] = 'entering nn::init::Start' in text
+            result['guest_startup'] = result['boot_worker_entered'] and result['guest_entry']
+            result.setdefault('boundary','no explicit fatal within bound; guest stopped by supervisor')
+        except Exception as e:
+            result['error'] = str(e)
+        finally:
+            if booted:
+                cleanup_errors = []
+                try:
+                    if result['installed'] and installed_app:
+                        current = Path(sim(family,'get_app_container',bundle,'app').strip())
+                        runtime.require(current == installed_app and runtime.sha(current/'astral') == report['executable_sha256'],
+                                        'cleanup app ownership mismatch')
+                        sim(family,'terminate',bundle,check=False)
+                except Exception as e:
+                    cleanup_errors.append('terminate: ' + str(e))
+                try:
+                    if docs:
+                        for name in ('startup.jsonl','guest.log','input-events.jsonl'):
+                            if (docs/name).exists():
+                                shutil.copyfile(docs/name, run/(family+'-'+name))
+                except Exception as e:
+                    cleanup_errors.append('evidence: ' + str(e))
+                result['app_cleanup'] = 'app not verified installed'
+                try:
+                    if result['installed'] and installed_app:
+                        current = Path(sim(family,'get_app_container',bundle,'app').strip())
+                        runtime.require(current == installed_app and runtime.sha(current/'astral') == report['executable_sha256'],
+                                        'cleanup app ownership mismatch')
+                        sim(family,'uninstall',bundle)
+                        result['app_cleanup'] = 'owned app removed'
+                except Exception as e:
+                    result['app_cleanup'] = 'app removal failed'
+                    cleanup_errors.append('uninstall: ' + str(e))
+                # Device ownership is independent of app ownership. sim() checks
+                # the registry and current inventory again even after app errors.
+                try:
+                    sim(family,'shutdown',timeout=60)
+                    result['device_cleanup'] = 'dedicated device shutdown'
+                except Exception as e:
+                    result['device_cleanup'] = 'device shutdown failed'
+                    cleanup_errors.append('shutdown: ' + str(e))
+                result['cleanup'] = result['app_cleanup'] + '; ' + result['device_cleanup']
+                result['finished_at'] = datetime.now(timezone.utc).isoformat()
+                if cleanup_errors:
+                    result['cleanup_error'] = '; '.join(cleanup_errors)
+    report['status'] = 'measured' if all(r.get('guest_startup') and r.get('ui_responsive_during_boot') and r.get('boundary') and not r.get('error') and not r.get('cleanup_error') for r in report['families'].values()) else 'blocked'
+except Exception as e:
+    report.update(status='blocked', error=str(e))
+finally:
+    report['finished_at'] = datetime.now(timezone.utc).isoformat()
+    log.close()
+    report['evidence_sha256'] = {p.name:runtime.sha(p) for p in run.iterdir() if p.is_file()}
+    (run/'receipt.json').write_text(json.dumps(report,indent=2)+'\n')
+    print(json.dumps(report,indent=2))
+if report['status'] == 'blocked':
+    raise SystemExit(1)
+PY

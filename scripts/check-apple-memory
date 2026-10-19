@@ -1,0 +1,219 @@
+#!/bin/bash
+# Generated apps, source wrapper, device IDs and measurements stay gitignored.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+mode="${1:---native}"
+case "$mode" in --native|--simulators|--all|--native-profile|--all-profile) ;; *) echo 'usage: scripts/check-apple-memory [--native|--simulators|--all|--native-profile|--all-profile]' >&2; exit 2;; esac
+exec python3 - "$mode" <<'PY'
+import datetime
+import json
+import os
+from pathlib import Path
+import plistlib
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+
+root = Path.cwd()
+private = root / '.local/orchestrate/2026-10-18/apple-preflight'
+private.mkdir(parents=True, exist_ok=True)
+run = private / ('run-' + datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:6])
+run.mkdir()
+print('private_evidence=' + str(run), flush=True)
+log = (run / 'commands.log').open('w')
+summary = {'mode': sys.argv[1], 'minimum_mobile_target': '26.0', 'tested_mobile_runtime': '26.5', 'results': {}}
+
+def command(args, timeout=60, check=True):
+    log.write('$ ' + ' '.join(map(str, args)) + '\n'); log.flush()
+    result = subprocess.run(list(map(str, args)), text=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, timeout=timeout)
+    log.write(result.stdout + '\nexit_code=' + str(result.returncode) + '\n'); log.flush()
+    if check and result.returncode:
+        raise RuntimeError('command failed: ' + ' '.join(map(str, args)) + '\n' + result.stdout)
+    return result
+
+mode = sys.argv[1]
+try:
+    command(['xcodebuild', '-version'])
+    command(['sw_vers'])
+    native_failed = False
+    profile_mode = mode in ('--native-profile', '--all-profile')
+    fixed_flags = []
+    # Profile/simulator policy checks compile memory functions from an isolated
+    # copy of the actual pinned source after applying our patch.
+    if profile_mode or mode == '--simulators':
+        source = Path(os.environ.get('APPLE_MEMORY_SOURCE', str(private / 'source'))).resolve()
+        pin = command(['git', '-C', source, 'rev-parse', 'HEAD']).stdout.strip()
+        if pin != '010ed7a596a621c15d3a8dfa5795ca8c3668b066':
+            raise RuntimeError('Refusing wrong upstream source revision')
+        patched = run / 'patched'
+        for name in ('runtime/src/platform_mac.cpp', 'runtime/include/nx/cpu.h', 'runtime/include/nx/runtime.h'):
+            target = patched / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Read committed blobs, never copy another worktree's uncommitted edits.
+            target.write_text(command(['git', '-C', source, 'show', 'HEAD:' + name]).stdout)
+        patch = root / 'runtime/patches/apple-memory.patch'
+        command(['git', '-C', patched, 'apply', '--check', patch])
+        command(['git', '-C', patched, 'apply', patch])
+        text = (patched / 'runtime/src/platform_mac.cpp').read_text()
+        memory = text[text.index('bool reserve('):text.index('// ---- threads and time')]
+        header = run / 'patched_memory.h'
+        header.write_text('namespace nx::plat {\n' + memory + '\n}\n')
+        fixed_flags = ['-DAPPLE_MEMORY_PATCH_HEADER="' + str(header) + '"']
+        summary['runtime_patch'] = {'pin': pin, 'applied': True, 'fixture': 'patched_memory.h'}
+        summary['profile'] = 'apple-high-v1' if profile_mode else 'upstream-layout-with-fixed-decommit'
+        summary['allocator_overrides'] = {}
+    if mode in ('--native', '--all', '--native-profile', '--all-profile'):
+        binary = run / 'apple_memory'
+        command(['xcrun', 'clang++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
+                 root / 'probes/apple_memory.cpp', '-o', binary])
+        result = command([binary], check=False)
+        (run / 'macos.txt').write_text(result.stdout)
+        summary['results']['macOS'] = {'exit_code': result.returncode, 'report': 'macos.txt'}
+        native_failed = result.returncode != 0 or 'RESULT status=PASS exit_code=0' not in result.stdout
+        print(result.stdout, flush=True)
+        if profile_mode:
+            # Keep the original baseline and its nonzero exit visible. Policy
+            # validation is a separate result; it never relabels the baseline.
+            baseline_failed = native_failed
+            summary['baseline_failed'] = baseline_failed
+            binary = run / 'apple_memory_high'
+            command(['xcrun', 'clang++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
+                     '-DAPPLE_MEMORY_HIGH_PROFILE', *fixed_flags,
+                     root / 'probes/apple_memory.cpp', '-o', binary])
+            native_failed = False
+            summary['results']['macOS-profile'] = []
+            for attempt in range(5):
+                result = command([binary], check=False)
+                report = 'macos-high-' + str(attempt) + '.txt'
+                (run / report).write_text(result.stdout)
+                summary['results']['macOS-profile'].append({'exit_code': result.returncode, 'report': report})
+                native_failed |= result.returncode != 0 or 'RESULT status=PASS exit_code=0' not in result.stdout
+                print('apple-high-v1 attempt=' + str(attempt) + '\n' + result.stdout, flush=True)
+    if mode in ('--simulators', '--all', '--all-profile'):
+        # No caller-supplied arbitrary IDs: reuse only privately registered task devices
+        # after validating exact task name and runtime against current inventory.
+        runtime = 'com.apple.CoreSimulator.SimRuntime.iOS-26-5'
+        inventory = json.loads(command(['xcrun', 'simctl', 'list', 'devices', '--json']).stdout)
+        (run / 'devices-before.json').write_text(json.dumps(inventory, indent=2))
+        runtimes = json.loads(command(['xcrun', 'simctl', 'list', 'runtimes', '--json']).stdout)
+        (run / 'runtimes.json').write_text(json.dumps(runtimes, indent=2))
+        if not any(r['identifier'] == runtime and r['isAvailable'] for r in runtimes['runtimes']):
+            raise RuntimeError('Required iOS 26.5 runtime is unavailable')
+        registered = private / 'devices.json'
+        devices = json.loads(registered.read_text()) if registered.exists() else {}
+        families = [('iPhone', 'com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro'),
+                    ('iPad', 'com.apple.CoreSimulator.SimDeviceType.iPad-Pro-11-inch-M5-12GB')]
+        for family, device_type in families:
+            name = 'ACS APPLE-PREFLIGHT-001 ' + family
+            udid = devices.get(family)
+            if udid:
+                matches = [d for d in inventory['devices'].get(runtime, []) if d['udid'] == udid]
+                if len(matches) != 1 or matches[0]['name'] != name or matches[0]['deviceTypeIdentifier'] != device_type:
+                    raise RuntimeError('Refusing unverified/non-task simulator ' + family)
+            else:
+                if profile_mode or fixed_flags:
+                    raise RuntimeError('Policy check requires registered preflight task devices: ' + family)
+                devices[family] = command(['xcrun', 'simctl', 'create', name, device_type, runtime]).stdout.strip()
+                registered.write_text(json.dumps(devices, indent=2))
+        (run / 'devices.json').write_text(json.dumps(devices, indent=2))
+        wrapper = run / 'main.mm'
+        wrapper.write_text(r'''
+#import <UIKit/UIKit.h>
+#include <cstdio>
+int run_apple_memory(FILE*);
+@interface ACSMemoryDelegate : UIResponder <UIApplicationDelegate>
+@end
+@implementation ACSMemoryDelegate
+- (BOOL)application:(UIApplication*)app didFinishLaunchingWithOptions:(NSDictionary*)options {
+    (void)app; (void)options;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+            NSString* docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+            NSString* report = [docs stringByAppendingPathComponent:@"apple-memory.txt"];
+            FILE* out = fopen(report.fileSystemRepresentation, "w");
+            int code = 2;
+            if (out) {
+                fprintf(out, "app_runtime=%s model=%s minimum_target=26.0 signed_for_simulator=1\n",
+                    UIDevice.currentDevice.systemVersion.UTF8String, UIDevice.currentDevice.model.UTF8String);
+                code = run_apple_memory(out);
+                fclose(out);
+            }
+            NSDictionary* result = @{@"exit_code": @(code), @"runtime": UIDevice.currentDevice.systemVersion,
+                                     @"minimum_target": @"26.0", @"kind": @"simulator_app"};
+            NSData* data = [NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingPrettyPrinted error:nil];
+            [data writeToFile:[docs stringByAppendingPathComponent:@"completed.json"] atomically:YES];
+        }
+    });
+    return YES;
+}
+@end
+int main(int argc, char** argv) {
+    @autoreleasepool { return UIApplicationMain(argc, argv, nil, NSStringFromClass(ACSMemoryDelegate.class)); }
+}
+''')
+        app = run / 'ACSMemoryProbe.app'
+        app.mkdir()
+        bundle = 'local.acs.apple-preflight-001.memory'
+        info = dict(CFBundleIdentifier=bundle, CFBundleExecutable='ACSMemoryProbe', CFBundleName='ACS Memory Probe',
+                    CFBundlePackageType='APPL', CFBundleVersion='1', CFBundleShortVersionString='1.0',
+                    MinimumOSVersion='26.0', CFBundleSupportedPlatforms=['iPhoneSimulator'],
+                    UIDeviceFamily=[1, 2], LSRequiresIPhoneOS=True, UILaunchScreen={})
+        (app / 'Info.plist').write_bytes(plistlib.dumps(info))
+        sdk = command(['xcrun', '--sdk', 'iphonesimulator', '--show-sdk-path']).stdout.strip()
+        command(['xcrun', '--sdk', 'iphonesimulator', 'clang++', '-target', 'arm64-apple-ios26.0-simulator',
+                 '-isysroot', sdk, '-std=c++17', '-fobjc-arc', '-DAPPLE_MEMORY_NO_MAIN', *fixed_flags,
+                 root / 'probes/apple_memory.cpp', wrapper, '-framework', 'UIKit', '-framework', 'Foundation',
+                 '-o', app / 'ACSMemoryProbe'])
+        command(['codesign', '--force', '--sign', '-', '--timestamp=none', app])
+        command(['codesign', '--verify', '--strict', '--verbose=2', app])
+        signature = command(['codesign', '-d', '--verbose=4', app]).stdout
+        (run / 'signature.txt').write_text(signature)
+        command(['xcrun', 'vtool', '-show-build', app / 'ACSMemoryProbe'])
+        failures = []
+        for family, _ in families:
+            udid = devices[family]
+            current = json.loads(command(['xcrun', 'simctl', 'list', 'devices', '--json']).stdout)
+            device = next(d for d in current['devices'][runtime] if d['udid'] == udid)
+            was_booted = device['state'] == 'Booted'
+            try:
+                if not was_booted: command(['xcrun', 'simctl', 'boot', udid])
+                command(['xcrun', 'simctl', 'bootstatus', udid, '-b'], timeout=180)
+                command(['xcrun', 'simctl', 'install', udid, app])
+                container = Path(command(['xcrun', 'simctl', 'get_app_container', udid, bundle, 'data']).stdout.strip())
+                docs = container / 'Documents'
+                # Clear only this task app's completion marker, never device data.
+                (docs / 'completed.json').unlink(missing_ok=True)
+                command(['xcrun', 'simctl', 'launch', '--terminate-running-process', udid, bundle])
+                deadline = time.monotonic() + 60
+                while not (docs / 'completed.json').exists() and time.monotonic() < deadline:
+                    time.sleep(0.5)
+                if not (docs / 'completed.json').exists():
+                    raise RuntimeError('Timed out waiting for in-app completion marker: ' + family)
+                result = json.loads((docs / 'completed.json').read_text())
+                summary['results'][family] = dict(result, report=family + '.txt')
+                shutil.copy2(docs / 'completed.json', run / (family + '-completed.json'))
+                report = (docs / 'apple-memory.txt').read_text()
+                (run / (family + '.txt')).write_text(report)
+                print(family + ':\n' + report, flush=True)
+                if result['runtime'] != '26.5' or result['exit_code'] != 0 or 'RESULT status=PASS exit_code=0' not in report:
+                    failures.append(family)
+            finally:
+                command(['xcrun', 'simctl', 'terminate', udid, bundle], check=False)
+                # Only task-owned simulators are shut down. Retain devices/apps/evidence.
+                command(['xcrun', 'simctl', 'shutdown', udid], check=False)
+        after = command(['xcrun', 'simctl', 'list', 'devices', '--json']).stdout
+        (run / 'devices-after.json').write_text(after)
+        if failures: raise RuntimeError('Mapping/process constraints failed in ' + ', '.join(failures))
+    if native_failed: raise RuntimeError('Native mapping/process constraints failed')
+    (run / 'success.txt').write_text('Selected policy checks passed; consult summary.json for the separate baseline outcome. Simulator results are not device proof.\n')
+except Exception as exc:
+    (run / 'failure.txt').write_text(type(exc).__name__ + ': ' + str(exc) + '\n')
+    print('FAIL: ' + str(exc) + '\nEvidence: ' + str(run), file=sys.stderr, flush=True)
+    sys.exit(1)
+finally:
+    (run / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+    log.close()
+PY

@@ -1,0 +1,217 @@
+diff --git a/runtime/src/hle_vi.cpp b/runtime/src/hle_vi.cpp
+--- a/runtime/src/hle_vi.cpp
++++ b/runtime/src/hle_vi.cpp
+@@ -1,97 +1,205 @@
+ // nn::vi (display/layers) and nv:: (graphics driver setup) at the API level. The layer is the platform's window
+ // (Win32 window / Android surface); its handle is the "native window" the game hands to vkCreateViSurfaceNN, which
+ // the Vulkan bridge turns into the platform's surface.
+ #include <cstdlib>
+ #include <memory>
+ #include <mutex>
+ #include <thread>
++#include <algorithm>
++#include <limits>
+
+ #include <nx/runtime.h>
+
+ #include "kernel.h"
+ #include "platform.h"
+
+ namespace nx {
++
++namespace nvn { bool present_pass_wanted(); }
+
+ // NX_DISPLAY_HZ=<hz> (30..360; study fps-unlock-1710): the host vsync event and the present unit run at <hz> instead of
+ // 60. Experimental: Wonder's logic steps one 1/60 s unit per present interval, so above 60 the game runs fast.
+ uint64_t display_period_ns() {
+     static const uint64_t p = [] {
+         const char* e = std::getenv("NX_DISPLAY_HZ");
+         int hz = e ? std::atoi(e) : 0;
+         if (hz < 30 || hz > 360) return uint64_t(16'666'667);
+         log("vi: display at %d Hz (NX_DISPLAY_HZ)", hz);
+         return uint64_t(1'000'000'000ull / uint64_t(hz));
+     }();
+     return p;
+ }
+
+ namespace {
+
+-constexpr uint64_t kFakeDisplay = kKernelBase - 0x1000;  // opaque pointers, never dereferenced by the game
+-constexpr uint64_t kFakeLayer = kKernelBase - 0x2000;
++// Opaque API handles, not SDK objects. Never map or dereference these tokens.
++// One host window/layer is supported. Retired tokens are never reused.
++std::mutex g_vi_mutex;
++uint64_t g_vi_next = kKernelBase - 0x2000;
++uint64_t g_vi_display = 0, g_vi_layer = 0;
++uint64_t g_vi_references = 0;
++constexpr uint32_t kViOperationFailed = 0x272;  // SDK SetLayerScalingMode native-window failure
+
+-void ok(CPU& c) { c.x[0] = 0; }
++uint64_t new_vi_token() {
++    if (g_vi_next < 0x10000) fatal("vi: opaque token space exhausted");
++    uint64_t token = g_vi_next;
++    g_vi_next -= 16;
++    return token;
++}
++
++void vi_output(uint64_t p) {
++    constexpr uint64_t size = sizeof(uint64_t);
++    if (!p || p > std::numeric_limits<uint64_t>::max() - size)
++        fatal("vi: invalid output extent");
++    const uint64_t end = p + size;
++    while (p < end) {
++        auto v = vm_query(p);
++        if (v.addr > p || p - v.addr >= v.size || !(v.perm & 2))
++            fatal("vi: output is not writable");
++        const uint64_t available = v.size - (p - v.addr);
++        p += std::min(available, end - p);
++    }
++}
++
++void vi_ready() {
++    if (!g_vi_references) fatal("vi: not initialized");
++}
++void vi_display(uint64_t p) {
++    vi_ready();
++    if (!p || p != g_vi_display) fatal("vi: invalid, foreign or stale display");
++}
++void vi_layer(uint64_t p) {
++    vi_ready();
++    if (!g_vi_display || !p || p != g_vi_layer) fatal("vi: invalid, foreign or stale layer");
++}
++
++void Initialize(CPU& c) {
++    std::lock_guard lock(g_vi_mutex);
++    if (g_vi_references == std::numeric_limits<uint64_t>::max())
++        fatal("vi: initialize reference overflow");
++    ++g_vi_references;
++    c.x[0] = 0;
++}
+
++void Finalize(CPU&) {
++    std::lock_guard lock(g_vi_mutex);
++    // SDK Finalize is a no-op at zero; only the final release retires objects.
++    if (g_vi_references && !--g_vi_references) {
++        g_vi_layer = 0;
++        g_vi_display = 0;
++    }
++}
++
+ void OpenDefaultDisplay(CPU& c) {
+-    st<uint64_t>(c.x[0], kFakeDisplay);
++    std::lock_guard lock(g_vi_mutex);
++    vi_ready();
++    vi_output(c.x[0]);
++    if (g_vi_display) fatal("vi: multiple display opens unsupported");
++    g_vi_display = new_vi_token();
++    st<uint64_t>(c.x[0], g_vi_display);
+     c.x[0] = 0;
+ }
+
+ void CreateLayer(CPU& c) {
++    std::lock_guard lock(g_vi_mutex);
++    vi_display(c.x[1]);
++    vi_output(c.x[0]);
++    if (g_vi_layer) fatal("vi: multiple host layers unsupported");
+     void* w = plat::create_window();
++    if (!w) { c.x[0] = kViOperationFailed; return; }
+     log("vi: layer created -> native window %p", w);
+     plat::release_window(w);
+-    st<uint64_t>(c.x[0], kFakeLayer);
++    g_vi_layer = new_vi_token();
++    st<uint64_t>(c.x[0], g_vi_layer);
+     c.x[0] = 0;
+ }
+
+-void GetNativeWindow(CPU& c) {  // (void** out, Layer*)
+-    st<uint64_t>(c.x[0], uint64_t(plat::create_window()));
++void GetNativeWindow(CPU& c) {  // Result (void** out, Layer*)
++    std::lock_guard lock(g_vi_mutex);
++    vi_layer(c.x[1]);
++    vi_output(c.x[0]);
++    void* w = plat::create_window();
++    if (!w) { c.x[0] = kViOperationFailed; return; }
++    st<uint64_t>(c.x[0], uint64_t(w));
+     c.x[0] = 0;
++}
++
++void SetLayerScalingMode(CPU& c) {  // Result (Layer*, ScalingMode); no output pointer
++    std::lock_guard lock(g_vi_mutex);
++    vi_layer(c.x[0]);
++    const uint32_t mode = uint32_t(c.x[1]);  // enum passed in w1
++    if (mode > 4) fatal("vi: invalid scaling mode %u", mode);
++    // Only FitToLayer (2), already implemented by NVN's full-extent blit.
++    // The optional present pass/FSR preserves aspect ratio instead. Never claim
++    // that it stretches, nor change renderer configuration behind the caller.
++    if (mode != 2 || nvn::present_pass_wanted()) {
++        log("vi: scaling mode %u unsupported by active host presentation", mode);
++        c.x[0] = kViOperationFailed;
++        return;
++    }
++    log("vi: FitToLayer uses host full-extent blit");
++    c.x[0] = 0;
++}
++
++void DestroyLayer(CPU& c) {  // void (Layer*); host owns the singleton window lifetime
++    std::lock_guard lock(g_vi_mutex);
++    vi_layer(c.x[0]);
++    g_vi_layer = 0;
++}
++
++void CloseDisplay(CPU& c) {  // void (Display*)
++    std::lock_guard lock(g_vi_mutex);
++    vi_display(c.x[0]);
++    // SDK CloseDisplay also invalidates layers belonging to this display.
++    g_vi_layer = 0;
++    g_vi_display = 0;
+ }
+
+ void nv_noop(CPU&) {}
+
+ // The display's vsync: a kernel event a host thread signals every 1/60 s. The game gets it as an nn::os
+ // SystemEvent (AttachSystemEvent with our read/write handles, auto clear: each wait consumes one vsync).
+ std::shared_ptr<EventState> g_vsync = std::make_shared<EventState>();
+
+ void vsync_thread() {
+     plat::set_thread_name("vsync");
+     uint64_t next = plat::monotonic_ns();
+     for (;;) {
+         next += display_period_ns();
+         int64_t wait = int64_t(next - plat::monotonic_ns());
+         if (wait > 0) plat::sleep_ns(wait);
+         event_signal(g_vsync);
+     }
+ }
+
+ void GetDisplayVsyncEvent(CPU& c) {  // (os::SystemEventType*, Display*)
+     auto r = std::make_shared<KEvent>(EventEndpoint::Readable, g_vsync);
+     auto w = std::make_shared<KEvent>(EventEndpoint::Writable, g_vsync);
+     uint32_t hr = handle_add(r), hw = handle_add(w);
+     uint64_t attach = find_symbol("_ZN2nn2os17AttachSystemEventEPNS0_15SystemEventTypeEjbjbNS0_14EventClearModeE");
+     uint64_t saved[8];
+     for (int k = 0; k < 8; k++) saved[k] = c.x[k];
+     c.x[1] = hr, c.x[2] = 1, c.x[3] = hw, c.x[4] = 1, c.x[5] = 1;  // x0: the SystemEventType; 1: AutoClear
+     call(c, attach);
+     for (int k = 0; k < 8; k++) c.x[k] = saved[k];
+     static std::once_flag once;
+     std::call_once(once, [] { std::thread(vsync_thread).detach(); });
+     c.x[0] = 0;
+ }
+
+ }  // namespace
+
+-NX_HLE("_ZN2nn2vi10InitializeEv", ok);
++NX_HLE("_ZN2nn2vi10InitializeEv", Initialize);
++NX_HLE("_ZN2nn2vi8FinalizeEv", Finalize);
+ NX_HLE("_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE", OpenDefaultDisplay);
+ NX_HLE("_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", CreateLayer);
++NX_HLE("_ZN2nn2vi19SetLayerScalingModeEPNS0_5LayerENS0_11ScalingModeE", SetLayerScalingMode);
++NX_HLE("_ZN2nn2vi12DestroyLayerEPNS0_5LayerE", DestroyLayer);
++NX_HLE("_ZN2nn2vi12CloseDisplayEPNS0_7DisplayE", CloseDisplay);
+ NX_HLE("_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE", GetNativeWindow);
+ NX_HLE("_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE", GetDisplayVsyncEvent);
+ NX_HLE("_ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_", nv_noop);
+ NX_HLE("_ZN2nv28SetGraphicsDevtoolsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_", nv_noop);
+ NX_HLE("_ZN2nv18InitializeGraphicsEPvm", nv_noop);
+
+ }  // namespace nx

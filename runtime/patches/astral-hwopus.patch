@@ -1,0 +1,225 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -185,6 +185,17 @@
+ file(GLOB NX_GAME_SOURCES CONFIGURE_DEPENDS "${NX_GAME_DIR}/*.cpp")
+ list(APPEND NX_RUNTIME_SOURCES ${NX_GAME_SOURCES})
+
++# Explicit opt-in: ordinary targets retain their dependencies and services.
++option(NX_HWOPUS "Enable the host single-stream hwopus service" OFF)
++if(NX_HWOPUS)
++    find_package(PkgConfig REQUIRED)
++    pkg_check_modules(NX_OPUS REQUIRED IMPORTED_TARGET opus>=1.3)
++    list(APPEND NX_RUNTIME_SOURCES runtime/src/svc_hwopus.cpp)
++    set_source_files_properties(runtime/src/svc_hwopus.cpp PROPERTIES
++        INCLUDE_DIRECTORIES "${NX_OPUS_INCLUDE_DIRS}"
++        COMPILE_OPTIONS "${NX_OPUS_CFLAGS_OTHER}")
++endif()
++
+ # Vulkan headers (the same registry version tools/gen_vk.py generated from). The loader comes with the GPU driver.
+ if(DEFINED ENV{VULKAN_SDK})
+     set(NX_VULKAN_SDK "$ENV{VULKAN_SDK}" CACHE PATH "Vulkan SDK")
+@@ -241,3 +252,7 @@
+         target_link_options(${NX_GAME} PRIVATE /STACK:67108864 /HIGHENTROPYVA:NO /MAP)
+     endif()
+ endif()
++
++if(NX_HWOPUS)
++    target_link_libraries(${NX_GAME} PRIVATE "$<LINK_ONLY:PkgConfig::NX_OPUS>")
++endif()
+diff --git a/runtime/src/svc_hwopus.cpp b/runtime/src/svc_hwopus.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/svc_hwopus.cpp
+@@ -0,0 +1,191 @@
++/*
++Adapted from letsgo-recomp runtime/services/hwopus.c
++Revision 884f6d78035e537653c36579178cb0bb0c0b4f1d.
++Astral adaptation: nx IPC, checked ranges, real libopus workspace, atomic decode.
++
++MIT License
++
++Copyright (c) 2026 raulzito12345rrs
++Portions copyright (c) 2026 Peiikai (LAS Recomp, see LICENSE-LASRecomp)
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
++
++This license covers the source code in this repository only. It grants nothing
++for Pokémon: Let's Go, Eevee!, which belongs to Nintendo / The Pokémon Company /
++Game Freak and must be supplied by each user from their own copy.
++
++MIT License
++
++Copyright (c) 2026 Peiikai
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
++
++This license covers LAS Recomp's own code. It does not cover The Legend of Zelda: Link's Awakening or any other
++Nintendo property, nor the third-party components in third_party/, which keep their own licenses.
++*/
++#include "ipc.h"
++#include <opus.h>
++#include <algorithm>
++#include <chrono>
++#include <climits>
++#include <mutex>
++#include <new>
++
++namespace nx {
++namespace {
++// Result values retained from the public letsgo implementation, not claimed
++// to reproduce every firmware error. Unsupported signatures are fatal.
++constexpr uint32_t kOpusConfig = 111 | (1 << 9);
++constexpr uint32_t kOpusPacket = 111 | (6 << 9);
++constexpr uint32_t kPacketLimit = 65536; // explicit host resource limit, including padding
++
++uint32_t be32(const uint8_t* p) {
++    return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
++}
++bool opus_memory(uint64_t addr, uint64_t size, uint32_t perm) {
++    if (!addr || !size || size > UINT64_MAX - addr) return false;
++    const auto end = addr + size;
++    while (addr < end) {
++        const auto v = vm_query(addr);
++        if ((v.perm & perm) != perm || v.addr > addr || !v.size ||
++            v.size > UINT64_MAX - v.addr || v.addr + v.size <= addr) return false;
++        addr = std::min(end, v.addr + v.size);
++    }
++    return true;
++}
++bool opus_args(const IpcCtx& c, size_t n) {
++    // CMIF's word count includes padding. Domain requests expose exact bytes.
++    const size_t expected = c.framing().domain ? n : (n + 3) & ~size_t(3);
++    return c.in && c.in_size == expected && (c.type == 4 || c.type == 6) &&
++           !c.has_pid_descriptor() && c.in_objects.empty() && c.in_move.empty();
++}
++bool opus_no_buffers(const IpcCtx& c) {
++    return c.a.empty() && c.b.empty() && c.x.empty() && c.c.empty() && c.w.empty();
++}
++bool opus_params(uint32_t rate, uint32_t channels) {
++    return (channels == 1 || channels == 2) &&
++           (rate == 8000 || rate == 12000 || rate == 16000 || rate == 24000 || rate == 48000);
++}
++// Aligned host-owned shadow of the promised decoder workspace. Guest memory is
++// reserved/validated and its transfer object retained, but never trusted as an
++// opaque codec state. get_size is the actual host requirement, not firmware size.
++using OpusState = std::vector<uint64_t>;
++OpusDecoder* opus_state(OpusState& v) { return reinterpret_cast<OpusDecoder*>(v.data()); }
++struct HardwareOpusDecoder final : Service {
++    uint32_t rate, channels;
++    std::shared_ptr<KTransferMemory> transfer;
++    OpusState state;
++    std::mutex lock;
++    HardwareOpusDecoder(uint32_t r, uint32_t ch, std::shared_ptr<KTransferMemory> tm, uint32_t bytes)
++        : Service("IHardwareOpusDecoder"), rate(r), channels(ch), transfer(std::move(tm)),
++          state((bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t)) {}
++    uint32_t handle(IpcCtx& c) override {
++        if (c.cmd != 6) fatal("hwopus: unsupported decoder command %u", c.cmd);
++        if (!opus_args(c, 1) || !c.in_copy.empty() || c.a.size() != 1 || c.b.size() != 1 ||
++            !c.x.empty() || !c.c.empty() || !c.w.empty() || c.arg<uint8_t>(0) > 1) return kOpusPacket;
++        const auto in = c.a[0], out = c.b[0];
++        if (in.size < 8 || !opus_memory(in.addr, in.size, 1) || !opus_memory(out.addr, out.size, 2))
++            return kOpusPacket;
++        uint8_t header[8];
++        std::memcpy(header, reinterpret_cast<const void*>(in.addr), sizeof header);
++        const uint32_t size = be32(header), final_range = be32(header + 4);
++        if (!size || size > kPacketLimit || size > in.size - 8) return kOpusPacket;
++        // Snapshot input before decoding; output may overlap the input descriptor.
++        std::vector<uint8_t> packet(size);
++        std::memcpy(packet.data(), reinterpret_cast<const void*>(in.addr + 8), size);
++        const unsigned char* frames[48]; opus_int16 sizes[48]; int offset = 0;
++        if (opus_packet_parse(packet.data(), int(size), nullptr, frames, sizes, &offset) < 0)
++            return kOpusPacket;
++        const int samples = opus_packet_get_nb_samples(packet.data(), int(size), int(rate));
++        if (samples <= 0 || samples > int(rate * 120 / 1000)) return kOpusPacket;
++        const size_t pcm_bytes = size_t(samples) * channels * sizeof(opus_int16);
++        if (pcm_bytes > out.size) return kOpusPacket;
++        std::vector<opus_int16> pcm(size_t(samples) * channels);
++        std::lock_guard guard(lock);
++        // libopus explicitly permits shallow copying its contiguous state. Failed
++        // decode/reset/range checks commit neither PCM nor changed decoder state.
++        auto trial = state;
++        auto* decoder = opus_state(trial);
++        const auto start = std::chrono::steady_clock::now();
++        if (c.arg<uint8_t>(0) && opus_decoder_ctl(decoder, OPUS_RESET_STATE) != OPUS_OK)
++            return kOpusPacket;
++        const int n = opus_decode(decoder, packet.data(), int(size), pcm.data(), samples, 0);
++        if (n != samples) { log("hwopus: decode failed result=%d", n); return kOpusPacket; }
++        opus_uint32 actual_range = 0;
++        if (opus_decoder_ctl(decoder, OPUS_GET_FINAL_RANGE(&actual_range)) != OPUS_OK ||
++            (final_range && actual_range != final_range)) return kOpusPacket;
++        const uint64_t micros = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++            std::chrono::steady_clock::now() - start).count());
++        // Allocate reply before committing any externally visible mutation.
++        c.out.reserve(16);
++        c.push<uint32_t>(8 + size); c.push<uint32_t>(uint32_t(n)); c.push<uint64_t>(micros);
++        std::memcpy(reinterpret_cast<void*>(out.addr), pcm.data(), pcm_bytes);
++        state.swap(trial);
++        log("hwopus: decoded rate=%u channels=%u consumed=%u samples=%d reset=%u",
++            rate, channels, 8 + size, n, c.arg<uint8_t>(0));
++        return 0;
++    }
++};
++struct HardwareOpusManager final : Service {
++    HardwareOpusManager() : Service("hwopus") {}
++    uint32_t handle(IpcCtx& c) override {
++        if (c.cmd != 0 && c.cmd != 1) fatal("hwopus: unsupported manager command %u", c.cmd);
++        if (!opus_args(c, c.cmd == 1 ? 8 : 12) || !opus_no_buffers(c) ||
++            c.in_copy.size() != (c.cmd == 1 ? 0u : 1u)) return kOpusConfig;
++        const auto rate = c.arg<uint32_t>(0), channels = c.arg<uint32_t>(4);
++        if (!opus_params(rate, channels)) return kOpusConfig;
++        const int bytes = opus_decoder_get_size(int(channels));
++        if (bytes <= 0) return kOpusConfig;
++        if (c.cmd == 1) {
++            c.push<uint32_t>(uint32_t(bytes));
++            log("hwopus: workspace rate=%u channels=%u bytes=%d backend=%s", rate, channels, bytes, opus_get_version_string());
++            return 0;
++        }
++        const uint32_t supplied = c.arg<uint32_t>(8);
++        auto tm = std::dynamic_pointer_cast<KTransferMemory>(handle_get(c.in_copy[0]));
++        if (!tm || supplied < uint32_t(bytes) || supplied > tm->size || (supplied & 4095) ||
++            (tm->addr & 4095) || (tm->size & 4095) || !opus_memory(tm->addr, tm->size, 3))
++            return kOpusConfig;
++        auto decoder = std::make_shared<HardwareOpusDecoder>(rate, channels, tm, uint32_t(bytes));
++        if (opus_decoder_init(opus_state(decoder->state), int(rate), int(channels)) != OPUS_OK)
++            return kOpusConfig;
++        c.push_object(std::move(decoder));
++        log("hwopus: open rate=%u channels=%u workspace=%u", rate, channels, supplied);
++        return 0;
++    }
++};
++ServiceRegistrar hwopus_registration("hwopus", [] { return std::make_shared<HardwareOpusManager>(); });
++} // namespace
++} // namespace nx

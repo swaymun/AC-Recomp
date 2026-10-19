@@ -1,0 +1,453 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 434d5ed..cbd274a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -270,3 +270,60 @@ endif()
+ if(NX_HWOPUS)
+     target_link_libraries(${NX_GAME} PRIVATE "$<LINK_ONLY:PkgConfig::NX_OPUS>")
+ endif()
++
++# Astral, SDL3 desktop hosts: a second executable, ${NX_GAME}-${NX_MAIN_VARIANT_NAME}, from another lift of main (the
++# 60 fps build, docs/ASTRAL_60FPS.md). tools/acr_build.py writes NX_MAIN_VARIANT_LIST: "dir <variant gen dir>", then
++# "compile <file>" for each generated main file that differs from NX_GEN_DIR/main (or is new) and "exclude <file>" for
++# each base file it replaces or drops. The executable links the base executable's own objects, game_sdk and the base
++# game_main objects except the excluded ones, so only the changed files compile twice.
++set(NX_MAIN_VARIANT_LIST "" CACHE FILEPATH "Variant main file list (tools/acr_build.py)")
++set(NX_MAIN_VARIANT_NAME "60fps" CACHE STRING "Suffix of the variant executable")
++# A one-rate build (acr_build --fps 30|60): the launcher shows that rate on its Frame rate row.
++set(NX_SINGLE_FPS "" CACHE STRING "Frame rate of a one-rate build (30 or 60), empty with both")
++if(NX_GAME STREQUAL "astral" AND NX_SINGLE_FPS MATCHES "^(30|60)$" AND NOT ANDROID AND NOT IOS AND NOT WIN32)
++    set_property(SOURCE runtime/src/launcher.cpp APPEND PROPERTY COMPILE_DEFINITIONS NX_SINGLE_FPS=${NX_SINGLE_FPS})
++endif()
++if(NX_GAME STREQUAL "astral" AND NX_MAIN_VARIANT_LIST AND NOT ANDROID AND NOT IOS AND NOT WIN32)
++    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${NX_MAIN_VARIANT_LIST}")
++    file(STRINGS "${NX_MAIN_VARIANT_LIST}" nx_variant_lines)
++    set(nx_variant_dir "")
++    set(nx_variant_src "")
++    set(nx_variant_drop "")
++    foreach(line IN LISTS nx_variant_lines)
++        if(line MATCHES "^dir (.+)$")
++            set(nx_variant_dir "${CMAKE_MATCH_1}")
++        elseif(line MATCHES "^compile ([A-Za-z0-9_.-]+)$")
++            list(APPEND nx_variant_src "${nx_variant_dir}/${CMAKE_MATCH_1}")
++        elseif(line MATCHES "^exclude ([A-Za-z0-9_.-]+)$")
++            string(REPLACE "." "\\." nx_name "${CMAKE_MATCH_1}")
++            list(APPEND nx_variant_drop "${nx_name}")
++        endif()
++    endforeach()
++    if(NOT IS_DIRECTORY "${nx_variant_dir}")
++        message(FATAL_ERROR "NX_MAIN_VARIANT_LIST: no variant directory (${nx_variant_dir})")
++    endif()
++    set(nx_variant ${NX_GAME}-${NX_MAIN_VARIANT_NAME})
++    set(nx_main_objects "$<TARGET_OBJECTS:game_main>")
++    if(nx_variant_drop)
++        list(JOIN nx_variant_drop "|" nx_drop)
++        set(nx_main_objects "$<FILTER:${nx_main_objects},EXCLUDE,/(${nx_drop})\\.o$>")
++    endif()
++    set(nx_delta "")
++    if(nx_variant_src)
++        add_library(game_main_${NX_MAIN_VARIANT_NAME} OBJECT ${nx_variant_src})
++        target_include_directories(game_main_${NX_MAIN_VARIANT_NAME} PRIVATE runtime/include "${nx_variant_dir}")
++        get_target_property(nx_opts game_main COMPILE_OPTIONS)
++        if(nx_opts)
++            target_compile_options(game_main_${NX_MAIN_VARIANT_NAME} PRIVATE ${nx_opts})
++        endif()
++        set(nx_delta "$<TARGET_OBJECTS:game_main_${NX_MAIN_VARIANT_NAME}>")
++    endif()
++    add_executable(${nx_variant} "$<TARGET_OBJECTS:${NX_GAME}>" "${nx_main_objects}" ${nx_delta})
++    get_target_property(nx_libs ${NX_GAME} LINK_LIBRARIES)
++    list(REMOVE_ITEM nx_libs game_main)
++    target_link_libraries(${nx_variant} PRIVATE ${nx_libs})
++    get_target_property(nx_link_opts ${NX_GAME} LINK_OPTIONS)
++    if(nx_link_opts)
++        target_link_options(${nx_variant} PRIVATE ${nx_link_opts})
++    endif()
++endif()
+diff --git a/runtime/src/input_map.cpp b/runtime/src/input_map.cpp
+index 2da75ab..971cb32 100644
+--- a/runtime/src/input_map.cpp
++++ b/runtime/src/input_map.cpp
+@@ -389,21 +389,44 @@ bool save_controls(const Controls& c) { return write_file(controls_path(), write
+ 
+ // ---- settings ----
+ 
+-const char* const kResolutions[] = {"1280x720", "1600x900", "1920x1080", "2560x1440", "3840x2160"};
++const char* const kResolutions[] = {"1280x720", "1600x900", "1920x1080", "2560x1440", "3200x1800", "3840x2160"};
+ const int kResolutionCount = int(sizeof kResolutions / sizeof kResolutions[0]);
++
++std::string native_resolution() {
++    int w = 0, h = 0;
++    char tail = 0;
++    const char* v = std::getenv("NX_NATIVE_RES");  // the build's --render-res (the .app wrapper exports it)
++    if (v && std::sscanf(v, "%dx%d%c", &w, &h, &tail) == 2 && w > 0 && h > 0)
++        return std::to_string(w) + "x" + std::to_string(h);
++    return "1600x900";  // the game's docked render size
++}
++
++std::string resolution_label(const std::string& res) {
++    int w = 0, h = 0, nw = 0, nh = 0;
++    char tail = 0;
++    if (std::sscanf(res.c_str(), "%dx%d%c", &w, &h, &tail) != 2 || w <= 0 || h <= 0) return res;
++    std::sscanf(native_resolution().c_str(), "%dx%d", &nw, &nh);
++    if (w == nw && h == nh) return res + " (Native)";
++    char f[32];
++    std::snprintf(f, sizeof f, "%.2f", double(w) / nw);
++    std::string x = f;
++    while (x.back() == '0') x.pop_back();
++    if (x.back() == '.') x.pop_back();
++    return res + " (" + x + "x)";
++}
+ // MetalFX is not offered: it is not built yet (docs/ASTRAL_UPSCALE.md); "metalfx" is read as FSR 1.
+ const char* const kUpscales[] = {"bilinear", "fsr"};
+ const char* const kUpscaleLabels[] = {"Bilinear", "FSR 1"};
+ const int kUpscaleCount = 2;
+ 
+ const char* setting_key(int s) {
+-    static const char* const k[kSettingCount] = {"perf_hud", "fullscreen", "resolution", "mute", "upscale"};
++    static const char* const k[kSettingCount] = {"perf_hud", "fullscreen", "resolution", "mute", "upscale", "fps"};
+     return s >= 0 && s < kSettingCount ? k[s] : "";
+ }
+ 
+ const char* setting_env(int s) {
+     static const char* const k[kSettingCount] = {"NX_PERF_HUD", "NX_FULLSCREEN", "NX_RESOLUTION", "NX_MUTE",
+-                                                    "NX_UPSCALE"};
++                                                    "NX_UPSCALE", "NX_FPS"};
+     return s >= 0 && s < kSettingCount ? k[s] : "";
+ }
+ 
+@@ -411,19 +434,20 @@ std::string setting_text(const Settings& s, int k) {
+     switch (k) {
+     case kSetPerfHud: return s.perf_hud ? "On" : "Off";
+     case kSetFullscreen: return s.fullscreen ? "On" : "Off";
+-    case kSetResolution: return s.resolution;
++    case kSetResolution: return resolution_label(s.resolution);
+     case kSetMute: return s.mute ? "On" : "Off";
+     case kSetUpscale:
+         for (int u = 0; u < kUpscaleCount; u++)
+             if (s.upscale == kUpscales[u]) return kUpscaleLabels[u];
+         return kUpscaleLabels[0];
++    case kSetFps: return s.fps == 60 ? "60 (experimental)" : "30";
+     default: return "";
+     }
+ }
+ 
+ std::string write_settings(const Settings& s) {
+     std::string out = "# AC-Recomp settings (written by the launcher; docs/ASTRAL_LAUNCHER.md).\n"
+-                      "# The NX_PERF_HUD, NX_FULLSCREEN, NX_RESOLUTION, NX_MUTE and NX_UPSCALE environment variables override them.\n"
++                      "# The NX_PERF_HUD, NX_FULLSCREEN, NX_RESOLUTION, NX_MUTE, NX_UPSCALE and NX_FPS environment variables override them.\n"
+                       "[settings]\n";
+     out += std::string("perf_hud = ") + (s.perf_hud ? "1" : "0") + "\n";
+     out += std::string("fullscreen = ") + (s.fullscreen ? "1" : "0") + "\n";
+@@ -431,6 +455,7 @@ std::string write_settings(const Settings& s) {
+     out += std::string("mute = ") + (s.mute ? "1" : "0") + "\n";
+     out += "upscale = " + s.upscale + "\n";
+     out += "save_profile = " + s.save_profile + "\n";
++    out += std::string("fps = ") + (s.fps == 60 ? "60" : "30") + "\n";
+     return out;
+ }
+ 
+@@ -445,6 +470,7 @@ Settings parse_settings(const std::string& text) {
+         if (k == "perf_hud") s.perf_hud = flag(value);
+         else if (k == "fullscreen") s.fullscreen = flag(value);
+         else if (k == "mute") s.mute = flag(value);
++        else if (k == "fps") s.fps = value == "60" ? 60 : 30;
+         else if (k == "save_profile") s.save_profile = saves::normalise(value.c_str());
+         else if (k == "upscale") {
+             std::string v = lower(value);
+@@ -475,6 +501,8 @@ std::string env_effect(int k, const std::string& v) {
+         if (l == "fsr" || l == "fsr1" || l == "1" || l == "metalfx") return "FSR 1";  // metalfx: alias
+         return "Bilinear";
+     }
++    case kSetFps: return v == "60" ? "60 (experimental)" : "30";  // as the .app wrapper and the launcher read it
++    case kSetResolution: return resolution_label(v);
+     default: return v;
+     }
+ }
+@@ -493,6 +521,7 @@ void export_env(const Settings& s) {
+     if (s.resolution != Settings().resolution) put(kSetResolution, s.resolution);
+     if (s.mute) put(kSetMute, "1");
+     if (s.upscale != Settings().upscale) put(kSetUpscale, s.upscale);
++    if (s.fps == 60) put(kSetFps, "60");
+     // Always, Default too: a restart (macOS Metal HUD) must boot the profile chosen, even if settings.ini was not
+     // written.
+     setenv("NX_SAVE_PROFILE", s.save_profile.c_str(), 0);
+diff --git a/runtime/src/input_map.h b/runtime/src/input_map.h
+index 6dc6500..913222f 100644
+--- a/runtime/src/input_map.h
++++ b/runtime/src/input_map.h
+@@ -67,11 +67,15 @@ std::string controls_path();
+ bool save_controls(const Controls& c);
+ 
+ // ---- settings.ini ----
+-enum Setting : int { kSetPerfHud, kSetFullscreen, kSetResolution, kSetMute, kSetUpscale, kSettingCount };
++enum Setting : int { kSetPerfHud, kSetFullscreen, kSetResolution, kSetMute, kSetUpscale, kSetFps, kSettingCount };
+ const char* setting_key(int s);  // settings.ini key
+ const char* setting_env(int s);  // the environment variable that carries it to the runtime (and overrides it)
+ extern const char* const kResolutions[];
+ extern const int kResolutionCount;
++// The window size relative to the game's render size (1600x900, or NX_NATIVE_RES for a --render-res build):
++// "1600x900 (Native)", "3200x1800 (2x)", "1920x1080 (1.2x)", "1280x720 (0.8x)".
++std::string native_resolution();
++std::string resolution_label(const std::string& res);
+ // Upscaling of the game's picture to the window (NX_UPSCALE, docs/ASTRAL_UPSCALE.md): settings.ini values and labels.
+ // Bilinear and FSR 1 everywhere; "metalfx" (not built yet) is read as FSR 1.
+ extern const char* const kUpscales[];
+@@ -81,6 +85,7 @@ struct Settings {
+     bool perf_hud = false, fullscreen = false, mute = false;
+     std::string resolution = "1280x720";
+     std::string upscale = "bilinear";  // bilinear | fsr
++    int fps = 30;  // 30 | 60: which binary PLAY runs (astral or astral-60fps; docs/ASTRAL_60FPS.md)
+     std::string save_profile = "Default";  // the PLAY picker's last choice (save_profile.h): NX_SAVE_PROFILE
+     bool operator==(const Settings&) const = default;
+ };
+@@ -95,7 +100,7 @@ EnvOverrides env_overrides();
+ std::string write_settings(const Settings& s);
+ Settings parse_settings(const std::string& text);
+ // Exports the settings the environment does not already set (NX_PERF_HUD, NX_FULLSCREEN, NX_RESOLUTION, NX_MUTE,
+-// NX_UPSCALE);
++// NX_UPSCALE, NX_FPS);
+ // settings left at their default are not exported, so the runtime behaves as without settings.ini.
+ void export_env(const Settings& s);
+ std::string settings_path();
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index bdbb3c6..4bb9cfd 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -11,6 +11,13 @@
+ #include <filesystem>
+ #include <map>
+ 
++#include <cerrno>
++#include <unistd.h>
++#if defined(__APPLE__)
++#include <crt_externs.h>
++#include <mach-o/dyld.h>
++#endif
++
+ #include <nx/runtime.h>
+ 
+ #include "platform.h"
+@@ -52,7 +59,7 @@ namespace {
+ const char* const kMainItems[] = {"PLAY", "CONTROLS", "SETTINGS", "QUIT"};
+ constexpr int kMainCount = 4;
+ const char* const kSettingLabels[input::kSettingCount] = {"Performance HUD (F3)", "Fullscreen (F11)", "Window size",
+-                                                          "Mute audio", "Upscaling"};
++                                                          "Mute audio", "Upscaling", "Frame rate"};
+ const char* const kFontFile = "Baloo2-Bold.ttf";
+ const char* const kBackgrounds[] = {"title-bg.jpg", "title-bg.png"};
+ 
+@@ -249,7 +256,9 @@ std::vector<std::vector<std::string>> Menu::cells() const {
+     case Screen::Settings:
+         for (int k = 0; k < input::kSettingCount; k++)
+             out.push_back({kSettingLabels[k], env.set[k] ? env.value[k] + "  (set by " + input::setting_env(k) + ")"
+-                                                         : input::setting_text(settings, k)});
++                                              : k == input::kSetFps && !fps_variants
++                                                  ? std::string(running_fps == 60 ? "60" : "30") + " (this build)"
++                                                  : input::setting_text(settings, k)});
+         out.push_back({"Back"});
+         break;
+     case Screen::Profiles:
+@@ -330,6 +339,13 @@ void Menu::change_setting(int k, int delta) {
+     case input::kSetPerfHud: settings.perf_hud = !settings.perf_hud; break;
+     case input::kSetFullscreen: settings.fullscreen = !settings.fullscreen; break;
+     case input::kSetMute: settings.mute = !settings.mute; break;
++    case input::kSetFps:
++        if (!fps_variants) {
++            notice = "This build runs at " + std::to_string(running_fps) + " fps only; rebuild without --fps for both";
++            return;
++        }
++        settings.fps = settings.fps == 60 ? 30 : 60;
++        break;
+     case input::kSetUpscale: {
+         int at = 0, n = input::kUpscaleCount;
+         for (int u = 0; u < n; u++)
+@@ -1267,13 +1283,106 @@ bool run(Menu& m) {
+     return m.result == Result::Start;
+ }
+ 
++// ---- running another binary of the same build ----
++
++std::string self_exe() {
++    std::error_code ec;
++#if defined(__APPLE__)
++    uint32_t n = 0;
++    _NSGetExecutablePath(nullptr, &n);
++    std::string p(n + 1, '\0');
++    if (_NSGetExecutablePath(p.data(), &n) != 0) return "";
++    p.resize(std::strlen(p.c_str()));
++    std::filesystem::path c = std::filesystem::canonical(p, ec);
++    return ec ? p : c.string();
++#else
++    std::filesystem::path c = std::filesystem::read_symlink("/proc/self/exe", ec);
++    return ec ? "" : c.string();
++#endif
++}
++
++std::string fps_variant(const std::string& self, bool want60) {
++    static const std::string kTag = "-60fps";
++    if (self.empty()) return "";
++    std::filesystem::path p(self);
++    std::string name = p.filename().string();
++    bool is60 = name.size() > kTag.size() && name.compare(name.size() - kTag.size(), kTag.size(), kTag) == 0;
++    if (want60 == is60) return self;
++    std::string base = is60 ? name.substr(0, name.size() - kTag.size()) : name;
++    std::string other = (p.parent_path() / (want60 ? base + kTag : base)).string();
++    return access(other.c_str(), X_OK) == 0 ? other : "";
++}
++
++int running_fps(const std::string& self) {
++#if defined(NX_SINGLE_FPS)
++    (void)self;
++    return NX_SINGLE_FPS;
++#else
++    static const std::string kTag = "-60fps";
++    std::string name = std::filesystem::path(self).filename().string();
++    return name.size() > kTag.size() && name.compare(name.size() - kTag.size(), kTag.size(), kTag) == 0 ? 60 : 30;
++#endif
++}
++
++static std::vector<std::string> own_args() {
++    std::vector<std::string> out;
++#if defined(__APPLE__)
++    char** argv = *_NSGetArgv();
++    for (int i = 0, n = *_NSGetArgc(); i < n; i++) out.push_back(argv[i] ? argv[i] : "");
++#else
++    std::string text;
++    if (FILE* f = std::fopen("/proc/self/cmdline", "rb")) {
++        char buf[4096];
++        size_t got;
++        while ((got = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, got);
++        std::fclose(f);
++    }
++    for (size_t at = 0; at < text.size();) {
++        size_t end = text.find('\0', at);
++        if (end == std::string::npos) end = text.size();
++        out.push_back(text.substr(at, end - at));
++        at = end + 1;
++    }
++#endif
++    return out;
++}
++
++bool reexec(const std::string& exe, const char* why) {
++    setenv("NX_SKIP_LAUNCHER", "1", 1);  // the player already chose: the new image goes straight to the game
++    setenv("NX_REEXEC", "1", 1);         // the same session: loader.cpp appends to nx.log instead of rotating it
++    std::vector<std::string> args = own_args();
++    if (args.empty()) args.push_back(exe);
++    args[0] = exe;
++    std::vector<char*> argv;
++    for (std::string& a : args) argv.push_back(a.data());
++    argv.push_back(nullptr);
++    nx::log("launcher: running %s (%s)", exe.c_str(), why);
++    std::fflush(nullptr);
++#if defined(__APPLE__)
++    // Apple's Metal HUD (platform_mac.cpp): a HUD this process turned on from the settings is decided afresh by the
++    // new image from the exported settings; one the player set (MTL_HUD_ENABLED) stays.
++    if (const char* a = std::getenv("NX_METAL_HUD_AUTO"); a && *a == '1') unsetenv("MTL_HUD_ENABLED");
++#endif
++    SDL_InitFlags was = SDL_WasInit(0);
++    SDL_Quit();
++    execv(exe.c_str(), argv.data());
++    int err = errno;
++    SDL_Init(was);
++    nx::log("launcher: could not run %s (%s); staying in this binary", exe.c_str(), std::strerror(err));
++    return false;
++}
++
+ bool start() {
+     input::Settings s = input::load_settings();
+-    if (!skipped()) {
++    bool shown = !skipped();
++    if (shown) {
+         Menu m;
+         m.settings = s;
+         m.controls = input::active();
+         m.env = input::env_overrides();
++        std::string self = self_exe();
++        m.fps_variants = !fps_variant(self, true).empty() && !fps_variant(self, false).empty();
++        m.running_fps = running_fps(self);
+         m.profiles = saves::list(plat::data_root());
+         // NX_SAVE_PROFILE decides only when it is a usable name; otherwise the picker shows, with a warning, and
+         // the choice replaces it.
+@@ -1289,6 +1398,14 @@ bool start() {
+         if (!m.profile_env) setenv("NX_SAVE_PROFILE", s.save_profile.c_str(), 1);  // the picker's choice
+     }
+     input::export_env(s);
++    // The frame rate is the binary (docs/ASTRAL_60FPS.md): the .app wrapper starts the one settings.ini names, so
++    // this only acts when the player changed it in the launcher. NX_FPS (exported above) overrides settings.ini.
++    if (shown) {
++        const char* fps = std::getenv("NX_FPS");
++        bool want60 = fps && std::string(fps) == "60";
++        std::string self = self_exe(), want = fps_variant(self, want60);
++        if (!want.empty() && want != self) reexec(want, want60 ? "60 fps" : "30 fps");
++    }
+     return true;
+ }
+ 
+diff --git a/runtime/src/launcher.h b/runtime/src/launcher.h
+index 37c0987..0c0e210 100644
+--- a/runtime/src/launcher.h
++++ b/runtime/src/launcher.h
+@@ -72,6 +72,8 @@ struct Menu {
+     SDL_GamepadType pad_type = SDL_GAMEPAD_TYPE_UNKNOWN;  // for button labels (A/B/X/Y, Cross/Circle, ...)
+     ControlsTab tab = ControlsTab::Gamepad;  // the bindings the Controls screen shows and rebinds
+     bool controls_dirty = false, settings_dirty = false;
++    bool fps_variants = true;  // both binaries (astral, astral-60fps) are installed: the frame rate can change
++    int running_fps = 30;      // this binary's frame rate: the Frame rate row shows it when !fps_variants
+     Result result = Result::None;
+     std::string notice;
+     // PLAY's save picker (Screen::Profiles, save_profile.h): the profiles found, then "New profile", then "Back".
+@@ -130,9 +132,21 @@ bool skipped();
+ // Shows the launcher window until PLAY (true) or QUIT / window closed (false).
+ bool run(Menu& m);
+ // main(), after SDL_Init: settings.ini and controls.ini, then the launcher unless skipped, then exports the settings
+-// to the NX_* environment. False: the player quit.
++// to the NX_* environment. When the player picked another frame rate, it re-executes the matching binary. False: the
++// player quit.
+ bool start();
+ 
++// Running another binary of the same build from the launcher (shared by every re-exec-on-PLAY feature).
++std::string self_exe();  // this process's executable (canonical), "" when unknown
++// The binary for a frame rate: `self` when it already is that one, else its sibling with or without the "-60fps"
++// suffix (astral <-> astral-60fps) when that exists and is executable, else "".
++std::string fps_variant(const std::string& self, bool want60);
++// This binary's frame rate: NX_SINGLE_FPS (a one-rate build, --fps) when compiled in, else 60 for "*-60fps", else 30.
++int running_fps(const std::string& self);
++// Replaces this process with `exe`, same arguments, NX_SKIP_LAUNCHER=1, NX_REEXEC=1 (the same session: nx.log is
++// appended, not rotated) and the environment as it is (export the settings first). Returns false (logged, SDL re-initialised) only when the exec fails.
++bool reexec(const std::string& exe, const char* why);
++
+ // macOS: Apple's Metal Performance HUD is the Performance HUD there (perf_hud.h). Metal loads it only when
+ // MTL_HUD_ENABLED=1 is set before the first Metal device exists, and the launcher's own window makes one, so the
+ // HUD setting the player leaves the launcher with can differ from what platform_mac.cpp's preload() decided at
+diff --git a/runtime/src/loader.cpp b/runtime/src/loader.cpp
+index 5434fb8..696051d 100644
+--- a/runtime/src/loader.cpp
++++ b/runtime/src/loader.cpp
+@@ -60,8 +60,12 @@ void log(const char* fmt, ...) {
+         std::string file = path ? path : def;
+ #if defined(NX_ASTRAL_STRICT)
+         // The macOS Metal HUD restart (launcher.h) continues the same session: its log goes on in the same file.
+-        const char* again = std::getenv("NX_METAL_HUD_RESTARTED");
+-        const bool restarted = again && *again && *again != '0';
++        // So does a launcher re-exec into the other frame rate's binary (NX_REEXEC, launcher.h).
++        auto on = [](const char* name) {
++            const char* v = std::getenv(name);
++            return v && *v && *v != '0';
++        };
++        const bool restarted = on("NX_METAL_HUD_RESTARTED") || on("NX_REEXEC");
+         if (!restarted) {
+ #endif
+         // Keep the previous session's log (a problem report should survive reopening the game).
+diff --git a/runtime/src/platform_mac.cpp b/runtime/src/platform_mac.cpp
+index af4d7e5..1387d6c 100644
+--- a/runtime/src/platform_mac.cpp
++++ b/runtime/src/platform_mac.cpp
+@@ -137,6 +137,7 @@ void preload() {
+     }
+     if (!nx::hud::native_wanted_at_start(std::getenv("NX_PERF_HUD"), text)) return;
+     setenv("MTL_HUD_ENABLED", "1", 1);
++    setenv("NX_METAL_HUD_AUTO", "1", 1);  // set from the settings: a launcher re-exec decides again (launcher.h)
+     g_loaded = true;
+ }
+ // It stays as loaded. Asking for anything else fails, with a hint.

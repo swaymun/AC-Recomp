@@ -1,0 +1,3120 @@
+# Astral bootstrap changes against Wonder 010ed7a596a621c15d3a8dfa5795ca8c3668b066.
+# MIT License
+#
+# Copyright (c) 2026 BelmanteGu
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6518589..7a35db2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -7,6 +7,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ # The game this build is for: games/<NX_GAME>/ holds what only that game needs (game.cpp: nx/game.h), the shared
+ # runtime is the rest. One build directory per game.
+ set(NX_GAME "hades" CACHE STRING "Game to build (a folder under games/)")
++# Astral native memory profile is shared by runtime AND every generated TU.
++if(NX_GAME STREQUAL "astral")
++    add_compile_definitions(NX_ASTRAL_STRICT=1)
++    if(APPLE)
++        if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++            message(FATAL_ERROR "Astral bootstrap is native macOS only; simulator integration pending")
++        endif()
++        add_compile_definitions(NX_APPLE_HIGH_MEMORY=1)
++    endif()
++endif()
+ set(NX_GAME_DIR "${CMAKE_SOURCE_DIR}/games/${NX_GAME}")
+ if(NOT EXISTS "${NX_GAME_DIR}/game.cpp")
+     message(FATAL_ERROR "games/${NX_GAME}/game.cpp not found")
+@@ -62,6 +72,13 @@ endif()
+
+ # Without the generated code (a checkout with no game data) only the tests above are built.
+ file(GLOB NX_GEN_PROBE "${NX_GEN_DIR}/main/*.cpp")
++if(NX_GAME STREQUAL "astral")
++    foreach(mod main sdk)
++        if(NOT EXISTS "${NX_GEN_DIR}/${mod}/table.cpp")
++            message(FATAL_ERROR "Astral requires generated ${mod}/table.cpp in NX_GEN_DIR")
++        endif()
++    endforeach()
++endif()
+ if(NOT NX_GEN_PROBE)
+     message(WARNING "No generated code in ${NX_GEN_DIR}/main: building the unit tests only")
+     return()
+diff --git a/runtime/src/ipc.cpp b/runtime/src/ipc.cpp
+--- a/runtime/src/ipc.cpp
++++ b/runtime/src/ipc.cpp
+@@ -1,305 +1,369 @@
+-﻿// HIPC message parsing / building, sessions, domains and the service manager (sm:).
++// HIPC message parsing / building, sessions, domains and the service manager (sm:).
+ #include "ipc.h"
+
+ #include <mutex>
+ #include <unordered_map>
+
+ namespace nx {
+
+ namespace {
+
+ struct DomainState {
+     std::map<uint32_t, std::shared_ptr<Service>> objects;
+     uint32_t next_object = 1;
+ };
+
+ struct KSession : KObject {
++    // Null after protocol Close: the server is gone, client handles still own this object.
+     std::shared_ptr<Service> svc;
+     bool domain = false;
+     std::shared_ptr<DomainState> dom = std::make_shared<DomainState>();  // shared by clones of a domain session
+ };
+
+ std::unordered_map<std::string, ServiceFactory>& factories() {
+     static std::unordered_map<std::string, ServiceFactory> f;
+     return f;
+ }
+
+ std::recursive_mutex g_ipc;
+
+ constexpr uint32_t kSFCI = 0x49434653;  // 'SFCI'
+ constexpr uint32_t kSFCO = 0x4F434653;  // 'SFCO'
+
+ }  // namespace
+
+ void register_service(const std::string& name, ServiceFactory f) { factories()[name] = std::move(f); }
+
+ std::shared_ptr<Service> make_service(const std::string& name) {
+     auto it = factories().find(name);
+     if (it != factories().end()) return it->second();
++#if defined(NX_ASTRAL_STRICT)
++    fatal("strict IPC missing service: %s", name.c_str());
++#endif
+     log("ipc: no implementation for service '%s', using a stub", name.c_str());
+     return std::make_shared<Service>(name);
+ }
+
+ uint32_t Service::handle(IpcCtx& ctx) {
+     auto it = cmds.find(ctx.cmd);
+     if (it != cmds.end()) return it->second(ctx);
++#if defined(NX_ASTRAL_STRICT)
++    fatal("strict IPC missing command: service=%s command=%u", name.c_str(), ctx.cmd);
++#endif
+     log("ipc: %s cmd %u not implemented (stub ok)", name.c_str(), ctx.cmd);
+     return 0;
+ }
+
+ // ---- sm: ------------------------------------------------------------------------------------------------------
+
+ namespace {
+
+ struct SmService : Service {
+     SmService() : Service("sm:") {
+         cmds[0] = [](IpcCtx&) { return 0u; };  // RegisterClient / Initialize
+         cmds[1] = [](IpcCtx& c) {               // GetService(name)
+             char name[9] = {};
+             std::memcpy(name, c.in, std::min<size_t>(8, c.in_size));
+             log("sm: GetService(%s)", name);
+             c.push_object(make_service(name));
+             return 0u;
+         };
+     }
+ };
+
+ }  // namespace
+
+ uint32_t ipc_connect(const char* port, uint64_t* out_handle) {
+     std::string p = port;
+     log("ConnectToNamedPort(%s)", p.c_str());
+     auto s = std::make_shared<KSession>();
+     s->svc = p == "sm:" ? std::make_shared<SmService>() : make_service(p);
+     *out_handle = handle_add(s);
+     return 0;
+ }
+
+ // ---- messages -------------------------------------------------------------------------------------------------
+
+ static uint32_t new_session_handle(std::shared_ptr<Service> svc) {
+     auto s = std::make_shared<KSession>();
+     s->svc = std::move(svc);
+     return handle_add(s);
+ }
+
+-uint32_t ipc_request(CPU& c, uint32_t handle, uint64_t buf, uint64_t) {
++uint32_t ipc_request(CPU& c, uint32_t handle, uint64_t buf, uint64_t size, const KernelCaller* caller) {
+     std::lock_guard lk(g_ipc);
+     auto sess = std::dynamic_pointer_cast<KSession>(handle_get(handle));
+     if (!sess) {
+         log("ipc: request on invalid handle %x", handle);
+         return 0xE401;
+     }
++    if (!sess->svc) return 0xF601;  // SessionClosed, distinct from a stale client handle.
++    // Validate offsets before pointer arithmetic or any header/descriptor read.
++    // Framing failures are strict adapter errors, not invented Horizon results.
++    auto framing = [] { fatal("ipc: malformed request framing"); };
++    if (!buf || (buf & 3) || size < 8 || size > ~uint64_t(0) - buf) framing();
++    auto words_fit = [&](size_t offset, size_t count) {
++        return offset <= size / 4 && count <= size / 4 - offset;
++    };
++    auto clear_reply = [&] { std::memset(reinterpret_cast<void*>(buf), 0, std::min<uint64_t>(size, 0x100)); };
+     uint32_t* w = reinterpret_cast<uint32_t*>(buf);
+     IpcCtx ctx;
+     ctx.cpu = &c;
+     ctx.type = w[0] & 0xFFFF;
+     uint32_t nx_ = (w[0] >> 16) & 0xF, na = (w[0] >> 20) & 0xF, nb = (w[0] >> 24) & 0xF, nw = (w[0] >> 28) & 0xF;
+     uint32_t ndata = w[1] & 0x3FF;
+     uint32_t cflags = (w[1] >> 10) & 0xF;
+     bool special = w[1] >> 31;
+     size_t p = 2;
+     if (special) {
++        if (!words_fit(p, 1)) framing();
+         uint32_t sh = w[p++];
+         bool pid = sh & 1;
+         uint32_t ncopy = (sh >> 1) & 0xF, nmove = (sh >> 5) & 0xF;
++        if (!words_fit(p, (pid ? 2 : 0) + ncopy + nmove)) framing();
+         if (pid) {
+-            ctx.pid = w[p] | (uint64_t(w[p + 1]) << 32);
++            ctx.pid_descriptor_ = true;  // slot bytes are untrusted and never read
+             p += 2;
+         }
+         for (uint32_t i = 0; i < ncopy; i++) ctx.in_copy.push_back(w[p++]);
+         for (uint32_t i = 0; i < nmove; i++) ctx.in_move.push_back(w[p++]);
+     }
++    if (!words_fit(p, 2 * nx_ + 3 * (na + nb + nw))) framing();
+     for (uint32_t i = 0; i < nx_; i++, p += 2) {
+         uint32_t d0 = w[p], d1 = w[p + 1];
+         uint64_t addr = d1 | (uint64_t((d0 >> 12) & 0xF) << 32) | (uint64_t((d0 >> 6) & 0x7) << 36);
+         ctx.x.push_back({addr, d0 >> 16});
+     }
+     auto abw = [&](std::vector<Buffer>& v, uint32_t n) {
+         for (uint32_t i = 0; i < n; i++, p += 3) {
+             uint32_t size_lo = w[p], addr_lo = w[p + 1], d2 = w[p + 2];
+             uint64_t addr = addr_lo | (uint64_t((d2 >> 28) & 0xF) << 32) | (uint64_t((d2 >> 2) & 0x7) << 36);
+             uint64_t size = size_lo | (uint64_t((d2 >> 24) & 0xF) << 32);
+             v.push_back({addr, size});
+         }
+     };
+     abw(ctx.a, na);
+     abw(ctx.b, nb);
+-    std::vector<Buffer> wbufs;
+-    abw(wbufs, nw);
++    abw(ctx.w, nw);
+     size_t data_start = p;
++    if (!words_fit(data_start, ndata)) framing();
++    const size_t raw_end = (data_start + ndata) * 4;
+     // C descriptors (receive list) after the raw data.
+     if (cflags >= 2) {
+         size_t q = data_start + ndata;
+         uint32_t nc = cflags == 2 ? 1 : cflags - 2;
++        if (!words_fit(q, 2 * nc)) framing();
+         for (uint32_t i = 0; i < nc; i++, q += 2) {
+             uint64_t addr = w[q] | (uint64_t(w[q + 1] & 0xFFFF) << 32);
+             ctx.c.push_back({addr, w[q + 1] >> 16});
+         }
+     }
+
++    ctx.kernel_pid_ = caller ? caller->pid() : 0;
++    auto authenticate = [&] {
++        if (!ctx.pid_descriptor_) return;
++        ctx.caller_pid_ = caller ? caller->pid() : 0;
++        if (!ctx.caller_pid_) fatal("ipc: send-PID requires kernel caller");
++        if (g_trace) log("ipc: kernel caller pid=%llu descriptor=1 service=%s",
++                         (unsigned long long)ctx.caller_pid_, sess->svc->name.c_str());
++    };
++
+     if (ctx.type == 2 || ctx.type == 15) {  // Close (CMIF / TIPC)
+-        handle_close(handle);
+-        return 0;
++        // Protocol Close destroys server-side service ownership, not the client
++        // handle. The SDK separately issues CloseHandle (including for TIPC).
++        // Handle aliases share this closed session; CMIF clones keep their own
++        // session and shared domain references. All session mutation holds g_ipc.
++        authenticate();
++        sess->svc.reset();
++        sess->dom.reset();
++        return 0xF601;  // Server closed without replying: SessionClosed.
+     }
+     if (ctx.type >= 16) {
+         // TIPC (SDK 12+, sm: and a few system services): the command is the message type - 16, the raw data
+         // follows the descriptors with no padding and no SFCI header; the response starts with the result code.
+         ctx.cmd = ctx.type - 16;
+         ctx.in = reinterpret_cast<const uint8_t*>(buf + data_start * 4);
+         ctx.in_size = ndata * 4;
+         if (g_trace) log("ipc: tipc %s cmd %u", sess->svc->name.c_str(), ctx.cmd);
++        authenticate();
+         uint32_t rc = sess->svc->handle(ctx);
++        const size_t handles = ctx.out_copy.size() + ctx.out_move.size() + ctx.out_objects.size();
++        const size_t reply_head = (2 + (handles ? 1 + handles : 0) + 1) * 4;
++        if (reply_head > size || ctx.out.size() > size - reply_head ||
++            ((ctx.out.size() + 3) & ~size_t(3)) > size - reply_head) framing();
+         for (auto& o : ctx.out_objects) ctx.out_move.push_back(new_session_handle(o));
+-        std::memset(w, 0, 0x100);
++        clear_reply();
+         bool has_special = !ctx.out_copy.empty() || !ctx.out_move.empty();
+         size_t q = 2;
+         if (has_special) {
+             w[q++] = (uint32_t(ctx.out_copy.size()) << 1) | (uint32_t(ctx.out_move.size()) << 5);
+             for (uint32_t h : ctx.out_copy) w[q++] = h;
+             for (uint32_t h : ctx.out_move) w[q++] = h;
+         }
+         w[q] = rc;
+         std::memcpy(&w[q + 1], ctx.out.data(), ctx.out.size());
+         w[0] = ctx.type;
+         w[1] = uint32_t(1 + (ctx.out.size() + 3) / 4) | (has_special ? 0x80000000u : 0);
+         return 0;
+     }
+-    // Raw data: aligned to 16 bytes from the message start.
+-    uint64_t raw = (buf + data_start * 4 + 15) & ~15ull;
+-    if (g_trace)
+-        log("ipc: request type %u on %s (handle %x, domain %d, raw word %08x)", ctx.type, sess->svc->name.c_str(),
+-            handle, int(sess->domain), ld<uint32_t>(raw));
++    // libnx cmifGetAlignedDataStart aligns the offset relative to the message.
++    const size_t raw_offset = (data_start * 4 + 15) & ~size_t(15);
++    if (raw_offset > raw_end) framing();
++    uint64_t raw = buf + raw_offset;
++    size_t cmif_size = raw_end - raw_offset;
+     std::shared_ptr<Service> target = sess->svc;
+     uint32_t domain_cmd = 0, domain_obj = 0;
+-    if (sess->domain && (ctx.type == 4 || ctx.type == 6)) {
++    const bool domain_request = sess->domain && (ctx.type == 4 || ctx.type == 6);
++    if (domain_request) {
++        if (cmif_size < 16) framing();
+         domain_cmd = ld<uint8_t>(raw);
+-        uint32_t nobj = ld<uint8_t>(raw + 1);
+-        uint32_t dsize = ld<uint16_t>(raw + 2);
++        const size_t nobj = ld<uint8_t>(raw + 1);
++        const size_t dsize = ld<uint16_t>(raw + 2);
+         domain_obj = ld<uint32_t>(raw + 4);
+-        for (uint32_t i = 0; i < nobj; i++) ctx.in_objects.push_back(ld<uint32_t>(raw + 16 + dsize + 4 * i));
++        // CmifDomainInHeader is 16 bytes; data_size includes CmifInHeader,
++        // excludes the domain header and the immediately following object IDs.
++        // Subtraction after checking avoids underflow; bounded fields avoid sums
++        // overflowing. Neither backing storage nor receive-list bytes are raw data.
++        if (dsize > cmif_size - 16 || nobj > (cmif_size - 16 - dsize) / 4) framing();
++        if (domain_cmd != 1 && domain_cmd != 2) framing();
++        if (domain_cmd == 1 && dsize < 16) framing();
++        for (size_t i = 0; i < nobj; i++) ctx.in_objects.push_back(ld<uint32_t>(raw + 16 + dsize + 4 * i));
+         raw += 16;
+-        if (domain_cmd == 2) {  // close object
++        cmif_size = dsize;
++        if (domain_cmd == 2) {  // close object, including libnx's zero-data form
++            authenticate();
+             sess->dom->objects.erase(domain_obj);
+             goto respond_empty;
+         }
+         auto it = sess->dom->objects.find(domain_obj);
+         if (it == sess->dom->objects.end()) {
+             log("ipc: %s domain object %u not found", sess->svc->name.c_str(), domain_obj);
+             return 0xF601;
+         }
+         target = it->second;
+     }
+     {
+-        uint32_t magic = ld<uint32_t>(raw);
++        if (cmif_size < 16) framing();
++        if (ld<uint32_t>(raw) != kSFCI) framing();
+         ctx.cmd = ld<uint32_t>(raw + 8);
+         ctx.in = reinterpret_cast<const uint8_t*>(raw + 16);
+-        ctx.in_size = ndata * 4 > 32 ? ndata * 4 - 32 : 0;
+-        if (magic != kSFCI) {
+-            log("ipc: %s bad magic %08x (data_start %zu, ndata %u)", target->name.c_str(), magic, data_start, ndata);
+-            for (int k = 0; k < 16; k++) log("   w[%d] = %08x", k, w[k]);
+-        }
+-    }
++        // Non-domain HIPC has only a word count, not a byte payload length.
++        // Retain its 16-byte alignment allowance + 16-byte CMIF header rule;
++        // do not pretend this distinguishes sub-word padding or pointer tables.
++        ctx.in_size = domain_request ? cmif_size - 16 :
++            std::min<size_t>(cmif_size - 16, ndata * 4 > 32 ? ndata * 4 - 32 : 0);
++    }
++    authenticate();
+     uint32_t rc;
+     if (ctx.type == 5 || ctx.type == 7) {  // control
+         switch (ctx.cmd) {
+             case 0:  // ConvertCurrentObjectToDomain -> object id
+                 sess->domain = true;
+                 sess->dom->objects[sess->dom->next_object] = sess->svc;
+                 ctx.push<uint32_t>(sess->dom->next_object++);
+                 rc = 0;
+                 break;
+             case 1:  // CopyFromCurrentDomain
+                 rc = 0;
+                 break;
+             case 2:  // CloneCurrentObject
+             case 4: {  // CloneCurrentObjectEx: the clone is the same session (and domain) under a new handle
+                 auto clone = std::make_shared<KSession>(*sess);
+                 ctx.out_move.push_back(handle_add(clone));
+                 rc = 0;
+                 break;
+             }
+             case 3:  // QueryPointerBufferSize
+                 ctx.push<uint16_t>(0x8000);
+                 rc = 0;
+                 break;
+             default:
+                 log("ipc: control cmd %u", ctx.cmd);
+                 rc = 0;
+         }
+     } else {
+         if (g_trace) log("ipc: %s cmd %u", target->name.c_str(), ctx.cmd);
+         rc = target->handle(ctx);
+     }
+
+     {
++        // Bound the reply before creating output sessions/domain objects or writing.
++        const size_t handles = ctx.out_copy.size() + ctx.out_move.size() +
++            (sess->domain ? 0 : ctx.out_objects.size());
++        const size_t reply_raw = ((2 + (handles ? 1 + handles : 0)) * 4 + 15) & ~size_t(15);
++        // Include the existing serializer's 16-byte trailing raw-word allowance.
++        const size_t reply_head = reply_raw + (domain_request ? 16 : 0) + 16 + 16;
++        const size_t object_bytes = sess->domain ? ctx.out_objects.size() * 4 : 0;
++        if (reply_head > size || object_bytes > size - reply_head ||
++            ctx.out.size() > size - reply_head - object_bytes ||
++            ((ctx.out.size() + 3) & ~size_t(3)) > size - reply_head - object_bytes) framing();
+         // Interfaces returned: domain objects, or new sessions moved to the client.
+         std::vector<uint32_t> out_obj_ids;
+         for (auto& o : ctx.out_objects) {
+             if (sess->domain) {
+                 uint32_t id = sess->dom->next_object++;
+                 sess->dom->objects[id] = o;
+                 out_obj_ids.push_back(id);
+             } else {
+                 ctx.out_move.push_back(new_session_handle(o));
+             }
+         }
+         // Build the response.
+-        std::memset(w, 0, 0x100);
++        clear_reply();
+         bool has_special = !ctx.out_copy.empty() || !ctx.out_move.empty();
+         size_t q = 2;
+         if (has_special) {
+             w[q++] = (uint32_t(ctx.out_copy.size()) << 1) | (uint32_t(ctx.out_move.size()) << 5);
+             for (uint32_t h : ctx.out_copy) w[q++] = h;
+             for (uint32_t h : ctx.out_move) w[q++] = h;
+         }
+         size_t dstart = q;
+-        uint64_t rawo = (buf + q * 4 + 15) & ~15ull;
++        uint64_t rawo = buf + ((q * 4 + 15) & ~size_t(15));
+         uint64_t o = rawo;
+         if (sess->domain && (ctx.type == 4 || ctx.type == 6)) {
+             st<uint32_t>(o, uint32_t(out_obj_ids.size()));
+             o += 16;
+         }
+         st<uint32_t>(o, kSFCO);
+         st<uint32_t>(o + 4, 0);
+         st<uint32_t>(o + 8, rc);
+         st<uint32_t>(o + 12, 0);
+         std::memcpy(reinterpret_cast<void*>(o + 16), ctx.out.data(), ctx.out.size());
+         uint64_t end = o + 16 + ((ctx.out.size() + 3) & ~size_t(3));
+         for (uint32_t id : out_obj_ids) {
+             st<uint32_t>(end, id);
+             end += 4;
+         }
+         uint32_t words = uint32_t((end - (buf + dstart * 4)) / 4) + 4;
+         w[0] = 0;
+         w[1] = words | (has_special ? 0x80000000u : 0);
+         return 0;
+     }
+
+ respond_empty:
+-    std::memset(w, 0, 0x100);
++    clear_reply();
+     w[1] = 8;
+     return 0;
+ }
+
+ // ---- shared memory --------------------------------------------------------------------------------------------
+
+ std::shared_ptr<KSharedMemory> make_shared_memory(const std::string& name, uint64_t size) {
+     auto s = std::make_shared<KSharedMemory>();
+     s->name = name;
+     s->size = size;
+     s->host = kernel_alloc(size);
+     return s;
+ }
+
+ uint32_t map_shared_memory(KSharedMemory& s, uint64_t addr, uint64_t size) {
+     // The guest picks `addr`; we cannot alias pages cheaply, so the service keeps writing to s.host and the
+     // guest reads at addr. Record the mapping: services update both through shm_sync().
+     commit(addr, size);
+     vm_set(addr, size, 0x06 /* shared */, 3);
+     std::memcpy(reinterpret_cast<void*>(addr), reinterpret_cast<void*>(s.host), std::min(size, s.size));
+     s.host = addr;  // from now on the service writes straight to the guest's view
+     return 0;
+ }
+
+ }  // namespace nx
+diff --git a/runtime/src/ipc.h b/runtime/src/ipc.h
+--- a/runtime/src/ipc.h
++++ b/runtime/src/ipc.h
+@@ -1,77 +1,86 @@
+ // HIPC/CMIF service framework.
+ #pragma once
+
+ #include <cstring>
+ #include <functional>
+ #include <map>
+ #include <memory>
+ #include <string>
+ #include <vector>
+
+ #include "kernel.h"
+
+ namespace nx {
+
+ struct Buffer {
+     uint64_t addr = 0, size = 0;
+ };
+
+ struct Service;
+
+ struct IpcCtx {
+     CPU* cpu = nullptr;
+     uint32_t cmd = 0;
+     uint32_t type = 0;
+     const uint8_t* in = nullptr;  // raw arguments (after the SFCI header)
+     size_t in_size = 0;
+     std::vector<uint32_t> in_copy, in_move;
+-    uint64_t pid = 0;
+-    std::vector<Buffer> a, b, x, c;  // send, receive, pointer (X), receive list (C)
++private:
++    uint64_t caller_pid_ = 0;
++    uint64_t kernel_pid_ = 0;
++    bool pid_descriptor_ = false;
++    friend uint32_t ipc_request(CPU&, uint32_t, uint64_t, uint64_t, const KernelCaller*);
++public:
++    // Zero without a descriptor; only the kernel bridge can authenticate it.
++    uint64_t pid() const { return caller_pid_; }
++    uint64_t authenticated_pid() const { return kernel_pid_; }
++    bool has_pid_descriptor() const { return pid_descriptor_; }
++    std::vector<Buffer> a, b, x, c, w;  // send, receive, pointer (X), receive list (C)
+     std::vector<uint32_t> in_objects;  // domain objects passed in
+
+     std::vector<uint8_t> out;
+     std::vector<uint32_t> out_copy, out_move;
+     std::vector<std::shared_ptr<Service>> out_objects;
+
+     template <typename T>
+     T arg(size_t off) const {
+         T v{};
+         if (off + sizeof(T) <= in_size) std::memcpy(&v, in + off, sizeof(T));
+         return v;
+     }
+     template <typename T>
+     void push(const T& v) {
+         size_t o = out.size();
+         out.resize(o + sizeof(T));
+         std::memcpy(out.data() + o, &v, sizeof(T));
+     }
+     void push_object(std::shared_ptr<Service> s) { out_objects.push_back(std::move(s)); }
+     // Buffer of either kind for "the n-th input/output buffer" (A or X / B or C).
+     Buffer in_buf(size_t n) const { return n < a.size() && a[n].addr ? a[n] : (n < x.size() ? x[n] : Buffer{}); }
+     Buffer out_buf(size_t n) const { return n < b.size() && b[n].addr ? b[n] : (n < c.size() ? c[n] : Buffer{}); }
+ };
+
+ struct Service : std::enable_shared_from_this<Service> {
+     std::string name;
+     explicit Service(std::string n) : name(std::move(n)) {}
+     virtual ~Service() = default;
+     // Returns the result code. Unknown commands log and succeed with no output.
+     virtual uint32_t handle(IpcCtx& ctx);
+     std::map<uint32_t, std::function<uint32_t(IpcCtx&)>> cmds;
+ };
+
+ using ServiceFactory = std::function<std::shared_ptr<Service>()>;
+ void register_service(const std::string& name, ServiceFactory f);
+ std::shared_ptr<Service> make_service(const std::string& name);
+
+ struct ServiceRegistrar {
+     ServiceRegistrar(const char* name, ServiceFactory f) { register_service(name, std::move(f)); }
+ };
+
+ std::shared_ptr<Service> make_storage(std::vector<uint8_t> data);
+ std::shared_ptr<Service> preselected_user_storage();
+
+ // Kernel shared memory owned by a service (hid, etc.)
+ std::shared_ptr<KSharedMemory> make_shared_memory(const std::string& name, uint64_t size);
+
+ }  // namespace nx
+diff --git a/runtime/src/kernel.cpp b/runtime/src/kernel.cpp
+--- a/runtime/src/kernel.cpp
++++ b/runtime/src/kernel.cpp
+@@ -1,734 +1,845 @@
+ // A small Horizon kernel: handles, threads, synchronization (mutex/condvar/address arbitration), events,
+ // memory and GetInfo. Services (IPC) live in ipc.cpp.
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <condition_variable>
+ #include <cstdlib>
+ #include <cstring>
+ #include <deque>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+ #include <tuple>
+ #include <unordered_map>
+ #include <vector>
+
+ #include <nx/game.h>
+
+ #include "kernel_state.h"
+ #include "platform.h"
+
++#if __has_include("astral_control_context.h")
++#include "astral_control_context.h"
++#endif
++
+ namespace nx {
+
+ namespace kstate {  // kernel_state.h
+
+ std::recursive_mutex g_k;
+ std::vector<KThread*> g_sync_waiters;
+ std::unordered_map<uint32_t, std::shared_ptr<KObject>> g_handles;
+ uint32_t g_next_handle = 0x10000;
+ std::atomic<uint64_t> g_next_thread_id{0x50};
+ uint64_t g_heap_size = 0;
+
+ std::vector<KThread*> g_mutex_waiters;
+ std::vector<KThread*> g_cv_waiters;
+ std::vector<KThread*> g_addr_waiters;
+
+ thread_local KThread* t_self = nullptr;
+
+ std::mutex g_all_lock;
+ std::vector<std::weak_ptr<KThread>> g_all;
+
+ }  // namespace kstate
+
+ using namespace kstate;
+
++// One loaded guest address space. IDs are kernel-local lifetime identities,
++// unrelated to title IDs, host PIDs or policy. Only actual thread creation enrolls
++// an execution context; setting t_self or populating a handle is insufficient.
++namespace {
++struct GuestProcess final : KObject {
++    const uint64_t id;
++    std::atomic<bool> live{true};
++    std::unordered_map<KThread*, std::shared_ptr<KThread>> threads;
++    const std::shared_ptr<const ControlMetadata> control;
++    explicit GuestProcess(uint64_t value) : id(value), control(
++#if defined(NX_CONTROL_CONTEXT)
++        std::make_shared<const ControlMetadata>(ControlMetadata NX_CONTROL_CONTEXT)
++#else
++        nullptr
++#endif
++    ) {}
++};
++std::shared_ptr<GuestProcess> guest_process;
++uint64_t next_process_id = 1;
++std::shared_ptr<GuestProcess> owner_process(KThread* t, bool executing) {
++    if (!t || !guest_process || !guest_process->live.load()) return {};
++    auto it = guest_process->threads.find(t);
++    if (it == guest_process->threads.end()) return {};
++    auto owned = it->second;
++    if (!owned || owned.get() != t || (executing && (!t->started || t->exited))) return {};
++    return guest_process;
++}
++void retire_thread(KThread* t) {  // g_k held
++    t->exited = true;
++    if (!guest_process) return;
++    for (auto& item : guest_process->threads)
++        if (!item.second->exited) return;
++    guest_process->live.store(false);
++}
++}
++
++std::shared_ptr<const ControlMetadata> process_control_metadata(uint64_t pid) {
++    std::lock_guard lk(g_k);
++    if (!pid || !guest_process || guest_process->id != pid || !guest_process->live.load()) return {};
++    return guest_process->control;
++}
++
++class KernelIpc {
++public:
++    static uint32_t send(CPU& c, uint32_t handle, uint64_t buf, uint64_t size) {
++        std::shared_ptr<GuestProcess> process;
++        {
++            std::lock_guard lk(g_k);
++            process = owner_process(t_self, true);
++        }
++        if (!process) return 0xE401;
++        KernelCaller caller(process->id, &process->live);
++        return ipc_request(c, handle, buf, size, &caller);
++    }
++};
++
+ uint32_t handle_add(std::shared_ptr<KObject> o) {
+     std::lock_guard lk(g_k);
+     uint32_t h = g_next_handle++;
+     g_handles[h] = std::move(o);
+     return h;
+ }
+
+ std::shared_ptr<KObject> handle_get(uint32_t h) {
+     std::lock_guard lk(g_k);
++    if (h == 0xFFFF8001u) return owner_process(t_self, true);
+     if (h == kPseudoCurrentThread && t_self) return t_self->self.lock();
+     auto it = g_handles.find(h);
+     return it == g_handles.end() ? nullptr : it->second;
+ }
+
+ void handle_close(uint32_t h) {
+     std::lock_guard lk(g_k);
+     g_handles.erase(h);
+ }
+
+ // A waitable object changed (event signalled, thread exited...): wake the threads waiting on objects, only them.
+ // Mutex, condition variable and address waiters are woken one by one (wake()): one global condition variable woke
+ // every waiting thread of the process on each signal (the engine's job system broadcasts all the time).
+ void notify_all() {
+     std::lock_guard lk(g_k);
+     for (KThread* t : g_sync_waiters) t->cv.notify_one();
++}
++
++void event_signal(const std::shared_ptr<EventState>& state) {
++    std::lock_guard lk(g_k);
++    if (!state->signaled) {
++        state->signaled = true;
++        notify_all();
++    }
++}
++
++void event_clear(const std::shared_ptr<EventState>& state) {
++    std::lock_guard lk(g_k);
++    state->signaled = false;
++}
++
++uint32_t event_reset(const std::shared_ptr<EventState>& state) {
++    std::lock_guard lk(g_k);
++    if (!state->signaled) return 0xFA01;
++    state->signaled = false;
++    return 0;
+ }
+
+ KThread* self_thread() { return t_self; }
+
+ uint64_t heap_size() { return g_heap_size; }
+
+ CPU& current_cpu() { return t_self->ctx; }
+
+ uint64_t system_tick() { return plat::monotonic_ns() * 192 / 10000; }  // 19.2 MHz
+
+ // The spin throttles below (a 0.5 ms nap for threads spinning on the tick or on yields) were made for Hades on phones.
+ // Wonder's job system joins its workers by yielding in a loop: every join became >= 1 ms and the main thread spent
+ // ~18% of its time in forced naps, holding the game near 26 fps (docs/nvn/DEBUG.md #37). NX_SPIN_NAPS=0/1 overrides.
+ static bool spin_naps() {
+     static const bool on = [] {
+         if (const char* e = std::getenv("NX_SPIN_NAPS")) return e[0] == '1';
+         return std::strcmp(nx::game::kInfo.id, "hades") == 0;
+     }();
+     return on;
+ }
+
+ // nn::os::GetSystemTick. Hades' main loop (nnMain, main+2496fc) polls it without pause until its fixed step is
+ // due: on the Switch that thread owns a core, on a phone it pins a big core at 100% (80% of that thread's time was
+ // clock reads) and the heat lowers everyone's clocks. A thread asking again within 20 us, 50 times in a row, is
+ // spinning: let it sleep 0.5 ms (the loop keeps sub-millisecond precision against a 16.6 ms step).
+ // Hades only (spin_naps()): Wonder's job loops read the tick legitimately.
+ std::atomic<uint64_t> g_tick_calls{0}, g_yield_calls{0}, g_sleep_calls{0};
+ static void hle_get_system_tick(CPU& c) {
+     g_tick_calls.fetch_add(1, std::memory_order_relaxed);
+     if (KThread* t = spin_naps() ? t_self : nullptr) {
+         uint64_t now = plat::monotonic_ns();
+         if (now - t->last_tick_call < 20'000) {
+             if (++t->tick_spins >= 50) {
+                 t->tick_spins = 0;
+                 plat::sleep_ns(500'000);
+             }
+         } else {
+             t->tick_spins = 0;
+         }
+         t->last_tick_call = plat::monotonic_ns();
+     }
+     c.x[0] = system_tick();
+ }
+ NX_HLE("_ZN2nn2os13GetSystemTickEv", hle_get_system_tick);
+
+ // ---- waiting --------------------------------------------------------------------------------------------------
+
+ // Wait (with g_k held) until `self->wake` or timeout (ns, <0 = forever). Returns false on timeout.
+ static bool block(std::unique_lock<std::recursive_mutex>& lk, KThread* self, int64_t timeout_ns) {
+     if (timeout_ns < 0) {
+         self->cv.wait(lk, [&] { return self->wake; });
+         return true;
+     }
+     auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
+     return self->cv.wait_until(lk, until, [&] { return self->wake; });
+ }
+
+ // Wake a blocked thread (with g_k held).
+ static void wake(KThread* t) {
+     t->wake = true;
+     t->wait_result = 0;
+     t->cv.notify_one();
+ }
+
+ static void remove(std::vector<KThread*>& v, KThread* t) { v.erase(std::remove(v.begin(), v.end(), t), v.end()); }
+
+ static uint32_t load32(uint64_t a) { return __atomic_load_n(reinterpret_cast<uint32_t*>(a), __ATOMIC_SEQ_CST); }
+ static void store32(uint64_t a, uint32_t v) { __atomic_store_n(reinterpret_cast<uint32_t*>(a), v, __ATOMIC_SEQ_CST); }
+ static bool cas32(uint64_t a, uint32_t expected, uint32_t v) {
+     return __atomic_compare_exchange_n(reinterpret_cast<uint32_t*>(a), &expected, v, false, __ATOMIC_SEQ_CST,
+                                        __ATOMIC_SEQ_CST);
+ }
+
+ // Hand the mutex at `addr` to its next waiter (or clear it).
+ static void unlock_mutex(uint64_t addr) {
+     KThread* next = nullptr;
+     int more = 0;
+     for (KThread* t : g_mutex_waiters)
+         if (t->wait_mutex == addr) {
+             if (!next)
+                 next = t;
+             else
+                 more++;
+         }
+     if (!next) {
+         store32(addr, 0);
+         return;
+     }
+     remove(g_mutex_waiters, next);
+     store32(addr, next->wait_tag | (more ? kHandleWaitMask : 0));
+     wake(next);
+ }
+
+ // ---- svc implementations --------------------------------------------------------------------------------------
+
+ static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) {
+     std::unique_lock lk(g_k);
+     KThread* self = t_self;
+     if (load32(addr) != (owner | kHandleWaitMask)) return 0;
+     self->wake = false;
+     self->wait_mutex = addr;
+     self->wait_tag = tag;
+     g_mutex_waiters.push_back(self);
+     block(lk, self, -1);
+     return self->wait_result;
+ }
+
+ static uint32_t svc_arbitrate_unlock(uint64_t addr) {
+     std::unique_lock lk(g_k);
+     unlock_mutex(addr);
+     return 0;
+ }
+
+ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
+     std::unique_lock lk(g_k);
+     KThread* self = t_self;
+     // Like Horizon: the condvar's "has waiters" word is written BEFORE the mutex is released. The SDK's Signal/
+     // Broadcast read that word in guest code and skip the svc when it is 0; the other order lost wake-ups (a thread
+     // took the freed mutex, posted, saw 0, and the waiter then slept forever).
+     self->wake = false;
+     self->wait_mutex = mutex;
+     self->wait_key = key;
+     self->wait_tag = tag;
+     self->wait_result = 0;
+     g_cv_waiters.push_back(self);
+     store32(key, 1);
+     unlock_mutex(mutex);
+     if (block(lk, self, timeout)) return self->wait_result;
+     // Timed out (not handed the mutex): leave the condvar, or the mutex queue a signal moved us to, and return
+     // without the mutex. Like Horizon: the SDK re-locks it itself (TimedWait -> InternalCriticalSection::Enter);
+     // returning with it held made that Enter wait on ourselves forever.
+     remove(g_cv_waiters, self);
+     remove(g_mutex_waiters, self);
+     bool others = std::any_of(g_cv_waiters.begin(), g_cv_waiters.end(), [&](KThread* t) { return t->wait_key == key; });
+     if (!others) store32(key, 0);
+     return 0xEA01;
+ }
+
+ static uint32_t svc_signal_process_wide_key(uint64_t key, int32_t count) {
+     std::unique_lock lk(g_k);
+     int n = 0;
+     for (size_t i = 0; i < g_cv_waiters.size() && (count <= 0 || n < count);) {
+         KThread* t = g_cv_waiters[i];
+         if (t->wait_key != key) {
+             i++;
+             continue;
+         }
+         g_cv_waiters.erase(g_cv_waiters.begin() + i);
+         n++;
+         // Try to give it the mutex right away.
+         for (;;) {
+             uint32_t v = load32(t->wait_mutex);
+             if (v == 0) {
+                 if (!cas32(t->wait_mutex, 0, t->wait_tag)) continue;
+                 wake(t);
+                 break;
+             }
+             if (!(v & kHandleWaitMask) && !cas32(t->wait_mutex, v, v | kHandleWaitMask)) continue;
+             g_mutex_waiters.push_back(t);
+             break;
+         }
+     }
+     bool others = std::any_of(g_cv_waiters.begin(), g_cv_waiters.end(), [&](KThread* t) { return t->wait_key == key; });
+     if (!others) store32(key, 0);
+     return 0;
+ }
+
+ // NX_TRACE_ADDR=<hex>: log every wait on and signal to that address (lost wakeups in the guest's sync objects).
+ static uint64_t trace_addr() {
+     static uint64_t a = [] {
+         const char* e = std::getenv("NX_TRACE_ADDR");
+         return e ? std::strtoull(e, nullptr, 16) : 0ull;
+     }();
+     return a;
+ }
+
+ static uint32_t svc_wait_for_address(uint64_t addr, uint32_t type, int32_t value, int64_t timeout) {
+     if (addr == trace_addr())
+         log("arb: thread %x waits on %llx type %u value %d (memory %d) timeout %lld", t_self ? t_self->handle : 0,
+             (unsigned long long)addr, type, value, int32_t(load32(addr)), (long long)timeout);
+     std::unique_lock lk(g_k);
+     KThread* self = t_self;
+     int32_t cur = int32_t(load32(addr));
+     switch (type) {
+         case 0:  // WaitIfLessThan
+             if (!(cur < value)) return 0xFA01;
+             break;
+         case 1:  // DecrementAndWaitIfLessThan
+             if (!(cur < value)) return 0xFA01;
+             store32(addr, uint32_t(cur - 1));
+             break;
+         case 2:  // WaitIfEqual
+             if (cur != value) return 0xFA01;
+             break;
+         default:
+             return 0xF001;
+     }
+     if (timeout == 0) return 0xEA01;
+     self->wake = false;
+     self->wait_addr = addr;
+     self->wait_result = 0;
+     g_addr_waiters.push_back(self);
+     if (!block(lk, self, timeout)) {
+         remove(g_addr_waiters, self);
+         return 0xEA01;
+     }
+     return self->wait_result;
+ }
+
+ static int wake_addr(uint64_t addr, int32_t count) {
+     int n = 0;
+     for (size_t i = 0; i < g_addr_waiters.size() && (count <= 0 || n < count);) {
+         KThread* t = g_addr_waiters[i];
+         if (t->wait_addr != addr) {
+             i++;
+             continue;
+         }
+         g_addr_waiters.erase(g_addr_waiters.begin() + i);
+         wake(t);
+         n++;
+     }
+     return n;
+ }
+
+ static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t value, int32_t count) {
+     if (addr == trace_addr())
+         log("arb: thread %x signals %llx type %u value %d count %d (memory %d)", t_self ? t_self->handle : 0,
+             (unsigned long long)addr, type, value, count, int32_t(load32(addr)));
+     std::unique_lock lk(g_k);
+     int waiters = int(std::count_if(g_addr_waiters.begin(), g_addr_waiters.end(), [&](KThread* t) { return t->wait_addr == addr; }));
+     switch (type) {
+         case 0:  // Signal
+             break;
+         case 1:  // SignalAndIncrementIfEqual
+             if (!cas32(addr, uint32_t(value), uint32_t(value + 1))) return 0xFA01;
+             break;
+         case 2: {  // SignalAndModifyByWaitingCountIfEqual
+             int32_t updated = value;
+             if (count <= 0)
+                 updated = waiters ? value - 2 : value + 1;
+             else if (waiters)
+                 updated = waiters <= count ? value - 1 : value;
+             else
+                 updated = value + 1;
+             if (!cas32(addr, uint32_t(value), uint32_t(updated))) return 0xFA01;
+             break;
+         }
+         default:
+             return 0xF001;
+     }
+     wake_addr(addr, count);
+     return 0;
+ }
+
+ static uint32_t svc_wait_synchronization(CPU& c, uint64_t handles, int32_t count, int64_t timeout) {
+     std::unique_lock lk(g_k);
+     std::vector<std::shared_ptr<KObject>> objs;
+     for (int i = 0; i < count; i++) {
+         auto o = handle_get(ld<uint32_t>(handles + 4 * i));
+-        if (!o) return 0xE401;  // invalid handle
++        if (!o || !o->waitable()) return 0xE401;  // invalid or nonwaitable handle
+         objs.push_back(o);
+     }
+     auto ready = [&]() -> int {
+         for (int i = 0; i < count; i++)
+             if (objs[i]->signaled()) return i;
+         return -1;
+     };
+     auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout < 0 ? 0 : timeout);
+     KThread* self = t_self;
+     self->cancel = false;
+     g_sync_waiters.push_back(self);
+     struct Leave {
+         KThread* t;
+         ~Leave() { remove(g_sync_waiters, t); }
+     } leave{self};
+     for (;;) {
+         int i = ready();
+         if (i >= 0) {
+             c.x[1] = uint32_t(i);
+             objs[i]->consume();
+             return 0;
+         }
+         if (self->cancel) {
+             self->cancel = false;
+             return 0xEC01;
+         }
+         if (timeout == 0) return 0xEA01;
+         if (timeout < 0)
+             self->cv.wait(lk);
+         else if (self->cv.wait_until(lk, until) == std::cv_status::timeout && ready() < 0)
+             return 0xEA01;
+     }
+ }
+
+ // ---- threads --------------------------------------------------------------------------------------------------
+
+ static void thread_main(void* p) {
+     KThread* t = static_cast<KThread*>(p);
+     t_self = t;
+     t->host_tid = plat::current_thread_id();
+     char name[16];
+     std::snprintf(name, sizeof name, "g%llx", (unsigned long long)t->id);
+     plat::set_thread_name(name);
+     call(t->ctx, t->entry);
+     // Returning from the entry point is like svcExitThread.
+     std::lock_guard lk(g_k);
+-    t->exited = true;
++    retire_thread(t);
+     notify_all();
+ }
+
+ static std::shared_ptr<KThread> new_thread(uint64_t entry, uint64_t arg, uint64_t sp, int prio, int core) {
++    std::lock_guard lk(g_k);
++    if (!guest_process || !guest_process->live.load()) fatal("kernel: no live guest process");
+     auto t = std::make_shared<KThread>();
+     t->self = t;
+     t->id = g_next_thread_id++;
+     t->entry = entry;
+     t->prio = prio;
+     t->core = core;
+     t->tls = kernel_alloc(0x1000);  // one TLS page per thread (0x200 used)
+     // Static TLS block for the thread (what rtld and the libc provide on Horizon): the thread pointer, stored at
+     // TLS region +0x1F0 where nn::os loads TPIDR_EL0 from. main's TLS is 0x440 bytes of .tbss at tp+0x10.
+     uint64_t block = kernel_alloc(0x4000);
+     init_tls_block(block);  // main's .tdata initial values (Wonder: 16 bytes, {-1, 0}); the rest is .tbss, zero
+     st<uint64_t>(t->tls + 0x1F0, block);
+     t->ctx.tpidr = block;
+     t->ctx.x[0] = arg;
+     t->ctx.x[31] = sp;
+     t->ctx.tpidrro = t->tls;
+     t->handle = handle_add(t);
++    guest_process->threads.emplace(t.get(), t);
+     std::lock_guard al(g_all_lock);
+     g_all.push_back(t);
+     return t;
+ }
+
+ uint32_t create_main_thread(uint64_t stack_size) {
++    std::lock_guard lk(g_k);
++    if (guest_process) {
++        if (guest_process->live.load()) fatal("kernel: guest process already active");
++        // Handle/address-space/service teardown is loader-owned. Reusing global
++        // handles as a second process would accidentally authenticate stale state.
++        fatal("kernel: guest relaunch requires loader teardown");
++    }
++    if (!next_process_id) fatal("kernel: process identity exhausted");
++    guest_process = std::make_shared<GuestProcess>(next_process_id++);
+     uint64_t stack = kernel_alloc(stack_size);
+     vm_set(stack, stack_size, kMemStack, 3);
+     auto t = new_thread(0, 0, stack + stack_size, 44, 0);
+     t->started = true;
+     t_self = t.get();
+     t->host_tid = plat::current_thread_id();
+     return t->handle;
+ }
+
+
+ // ---- dispatch -------------------------------------------------------------------------------------------------
+
+ static void write_meminfo(uint64_t p, const VmInfo& v) {
+     st<uint64_t>(p + 0, v.addr);
+     st<uint64_t>(p + 8, v.size);
+     st<uint32_t>(p + 16, v.state);
+     st<uint32_t>(p + 20, 0);  // attribute
+     st<uint32_t>(p + 24, v.perm);
+     st<uint32_t>(p + 28, 0);
+     st<uint32_t>(p + 32, 0);
+     st<uint32_t>(p + 36, 0);
+ }
+
+ static void svc_impl(CPU& c, uint32_t imm, uint64_t pc) {
+     if (g_trace) log("svc %#x from %s", imm, describe(pc).c_str());
+     uint32_t rc = 0;
+     switch (imm) {
+         case 0x01: {  // SetHeapSize(size) -> addr
+             uint64_t size = c.x[1];
+             if (size > kHeapMax) {
+                 rc = 0xD001;
+                 break;
+             }
+             if (size > g_heap_size) commit(kHeapBase + g_heap_size, size - g_heap_size);
+             vm_set(kHeapBase, kHeapMax, kMemInaccessible, 0);
+             if (size) vm_set(kHeapBase, size, kMemHeap, 3);
+             g_heap_size = size;
+             c.x[1] = kHeapBase;
+             break;
+         }
+         case 0x02:  // SetMemoryPermission
+         case 0x03:  // SetMemoryAttribute
+             break;
+         case 0x04: {  // MapMemory(dst, src, size): src becomes inaccessible, so a copy behaves the same
+             uint64_t dst = c.x[0], src = c.x[1], size = c.x[2];
+             commit(dst, size);
+             std::memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<void*>(src), size);
+             vm_set(dst, size, dst - kStackBase < kStackSize ? kMemStack : kMemAlias, 3);
+             break;
+         }
+         case 0x05: {  // UnmapMemory(dst, src, size)
+             uint64_t dst = c.x[0], src = c.x[1], size = c.x[2];
+             std::memcpy(reinterpret_cast<void*>(src), reinterpret_cast<void*>(dst), size);
+             decommit(dst, size);
+             vm_set(dst, size, kMemFree, 0);
+             break;
+         }
+         case 0x06: {  // QueryMemory(meminfo*, pageinfo*, addr)
+             write_meminfo(c.x[0], vm_query(c.x[2]));
+             c.x[1] = 0;
+             break;
+         }
+         case 0x07:
+             log("svcExitProcess");
++            {
++                std::lock_guard lk(g_k);
++                if (!owner_process(t_self, true)) { rc = 0xE401; break; }
++                guest_process->live.store(false);
++            }
+             plat::exit_process(0);
+         case 0x08: {  // CreateThread(entry x1, arg x2, stack_top x3, prio w4, core w5) -> handle
++            std::lock_guard lk(g_k);
++            if (!owner_process(t_self, true)) { rc = 0xE401; break; }
+             auto t = new_thread(c.x[1], c.x[2], c.x[3], int(c.x[4]), int32_t(c.x[5]));
+             c.x[1] = t->handle;
+             if (g_trace) log("CreateThread %s handle %x", describe(t->entry).c_str(), t->handle);
+             break;
+         }
+         case 0x09: {  // StartThread(handle)
++            std::lock_guard lk(g_k);
+             auto t = std::dynamic_pointer_cast<KThread>(handle_get(uint32_t(c.x[0])));
+-            if (!t) {
++            if (!owner_process(t_self, true) || !t || !owner_process(t.get(), false) || t->exited) {
+                 rc = 0xE401;
+                 break;
+             }
+             t->started = true;
+             plat::start_thread(thread_main, t.get(), 64ull << 20);  // host stack: recompiled calls nest deeply
+             break;
+         }
+         case 0x0A: {  // ExitThread
+             {
+                 // The lock must be released before the host thread ends: pthread_exit runs no C++ destructors on
+                 // macOS, so a lock_guard alive across it kept the kernel locked for good (Wonder, ~frame 50).
+                 std::lock_guard lk(g_k);
+-                t_self->exited = true;
++                retire_thread(t_self);
+                 notify_all();
+             }
+             plat::exit_thread();
+         }
+         case 0x0B: {  // SleepThread(ns)
+             int64_t ns = int64_t(c.x[0]);
+             if (ns > 0) {
+                 g_sleep_calls.fetch_add(1, std::memory_order_relaxed);
+                 plat::sleep_ns(ns);
+                 return;
+             }
+             // Yield (0, -1, -2). On the Switch a thread yielding in a loop only takes time nobody else wants; here
+             // each yield is a syscall on a real core (the network thread polls a flag this way and burned a whole
+             // core, heating the phone). Past 32 yields in a row (each within 2 ms of the last), every yield sleeps
+             // 0.5 ms until the thread does something else for a while.
+             g_yield_calls.fetch_add(1, std::memory_order_relaxed);
+             KThread* t = t_self;
+             uint64_t now = plat::monotonic_ns();
+             if (now - t->last_yield > 2'000'000) t->yields = 0;
+             if (!spin_naps() || ++t->yields <= 32)
+                 plat::yield();
+             else
+                 plat::sleep_ns(500'000);
+             t->last_yield = plat::monotonic_ns();
+             return;
+         }
+         case 0x0C: {  // GetThreadPriority(handle) -> prio
+             auto t = std::dynamic_pointer_cast<KThread>(handle_get(uint32_t(c.x[1])));
+             c.x[1] = t ? t->prio : 44;
+             break;
+         }
+         case 0x0D: {  // SetThreadPriority(handle, prio)
+             auto t = std::dynamic_pointer_cast<KThread>(handle_get(uint32_t(c.x[0])));
+             if (t) t->prio = int(c.x[1]);
+             break;
+         }
+         case 0x0E: {  // GetThreadCoreMask(handle) -> core, mask
+             auto t = std::dynamic_pointer_cast<KThread>(handle_get(uint32_t(c.x[2])));
+             c.x[1] = t ? uint32_t(t->core) : 0;
+             c.x[2] = 0xF;
+             break;
+         }
+         case 0x0F:  // SetThreadCoreMask(handle, ideal core, mask)
+             rc = set_thread_core_mask(uint32_t(c.x[0]), int32_t(c.x[1]), c.x[2]);
+             break;
+         case 0x10:  // GetCurrentProcessorNumber
+             c.x[0] = t_self ? uint32_t(std::max(t_self->core, 0)) : 0;
+             return;
+-        case 0x11: {  // SignalEvent(handle)
++        case 0x11: {  // SignalEvent: writable endpoint only
++            std::lock_guard lk(g_k);
+             auto e = std::dynamic_pointer_cast<KEvent>(handle_get(uint32_t(c.x[0])));
+-            if (!e) {
+-                rc = 0xE401;
+-                break;
+-            }
++            if (!e || e->endpoint != EventEndpoint::Writable) rc = 0xE401;
++            else event_signal(e->state);
++            break;
++        }
++        case 0x12: {  // ClearEvent: either endpoint, idempotent
+             std::lock_guard lk(g_k);
+-            e->state->signaled = true;
+-            notify_all();
+-            break;
+-        }
+-        case 0x12:    // ClearEvent(handle)
+-        case 0x17: {  // ResetSignal(handle)
+             auto e = std::dynamic_pointer_cast<KEvent>(handle_get(uint32_t(c.x[0])));
+-            if (!e) {
+-                rc = 0xE401;
+-                break;
+-            }
++            if (!e) rc = 0xE401;
++            else event_clear(e->state);
++            break;
++        }
++        case 0x17: {  // ResetSignal: readable endpoint, conditional clear
+             std::lock_guard lk(g_k);
+-            if (imm == 0x17 && !e->state->signaled) rc = 0xFA01;
+-            e->state->signaled = false;
++            auto e = std::dynamic_pointer_cast<KEvent>(handle_get(uint32_t(c.x[0])));
++            if (!e || e->endpoint != EventEndpoint::Readable) rc = 0xE401;
++            else rc = event_reset(e->state);
+             break;
+         }
+         case 0x13: {  // MapSharedMemory(handle, addr, size, perm)
+             auto s = std::dynamic_pointer_cast<KSharedMemory>(handle_get(uint32_t(c.x[0])));
+             if (!s) {
+                 rc = 0xE401;
+                 break;
+             }
+             rc = map_shared_memory(*s, c.x[1], c.x[2]);
+             break;
+         }
+         case 0x14:  // UnmapSharedMemory
+             break;
+         case 0x15: {  // CreateTransferMemory(addr x1, size x2, perm w3) -> handle
+             auto tm = std::make_shared<KTransferMemory>();
+             tm->addr = c.x[1];
+             tm->size = c.x[2];
+             c.x[1] = handle_add(tm);
+             break;
+         }
+-        case 0x16:  // CloseHandle
+-            handle_close(uint32_t(c.x[0]));
+-            break;
++        case 0x16: {  // CloseHandle: validate/remove atomically, reject stale handles
++            std::lock_guard lk(g_k);
++            if (!g_handles.erase(uint32_t(c.x[0]))) rc = 0xE401;
++            break;
++        }
+         case 0x18:  // WaitSynchronization(out idx, handles x1, count w2, timeout x3)
+             rc = svc_wait_synchronization(c, c.x[1], int32_t(c.x[2]), int64_t(c.x[3]));
+             break;
+         case 0x19: {  // CancelSynchronization(thread handle)
+             auto t = std::dynamic_pointer_cast<KThread>(handle_get(uint32_t(c.x[0])));
+             std::lock_guard lk(g_k);
+             if (t) t->cancel = true;
+             notify_all();
+             break;
+         }
+         case 0x1A:
+             rc = svc_arbitrate_lock(uint32_t(c.x[0]), c.x[1], uint32_t(c.x[2]));
+             break;
+         case 0x1B:
+             rc = svc_arbitrate_unlock(c.x[0]);
+             break;
+         case 0x1C:
+             rc = svc_wait_process_wide_key(c.x[0], c.x[1], uint32_t(c.x[2]), int64_t(c.x[3]));
+             break;
+         case 0x1D:
+             rc = svc_signal_process_wide_key(c.x[0], int32_t(c.x[1]));
+             break;
+         case 0x1E:  // GetSystemTick
+             c.x[0] = system_tick();
+             return;
+         case 0x1F: {  // ConnectToNamedPort(name x1) -> handle
+             rc = ipc_connect(reinterpret_cast<const char*>(c.x[1]), c.x[1] ? &c.x[1] : nullptr);
+             break;
+         }
+         case 0x21:  // SendSyncRequest(handle)
+-            rc = ipc_request(c, uint32_t(c.x[0]), t_self->tls, 0x100);
++            rc = KernelIpc::send(c, uint32_t(c.x[0]), t_self ? t_self->tls : 0, 0x100);
+             break;
+         case 0x22:  // SendSyncRequestWithUserBuffer(buf, size, handle)
+-            rc = ipc_request(c, uint32_t(c.x[2]), c.x[0], c.x[1]);
+-            break;
+-        case 0x24:  // GetProcessId
+-            c.x[1] = 0x51;
+-            break;
++            rc = KernelIpc::send(c, uint32_t(c.x[2]), c.x[0], c.x[1]);
++            break;
++        case 0x24: {  // GetProcessId(process/thread handle in w1)
++            std::lock_guard lk(g_k);
++            auto current = owner_process(t_self, true);
++            auto object = current ? handle_get(uint32_t(c.x[1])) : nullptr;
++            auto process = std::dynamic_pointer_cast<GuestProcess>(object);
++            if (auto thread = std::dynamic_pointer_cast<KThread>(object))
++                process = owner_process(thread.get(), false);
++            if (!process || process != current || !process->live.load()) rc = 0xE401;
++            else c.x[1] = process->id;
++            break;
++        }
+         case 0x25: {  // GetThreadId(handle) -> id
+             auto t = std::dynamic_pointer_cast<KThread>(handle_get(uint32_t(c.x[1])));
+             c.x[1] = t ? t->id : 0;
+             break;
+         }
+         case 0x26:  // Break(reason, arg, size)
+             if (c.x[2] == 4 && c.x[1]) {
+                 uint32_t r = ld<uint32_t>(c.x[1]);
+                 log("abort with Result %#x (module %u, description %u)", r, r & 0x1FF, (r >> 9) & 0x1FFF);
+             }
+             backtrace(c);
+             fatal("svcBreak(%llx, %llx, %llx) from %s", (unsigned long long)c.x[0], (unsigned long long)c.x[1],
+                   (unsigned long long)c.x[2], describe(c.x[30]).c_str());
+         case 0x27: {  // OutputDebugString(str, len)
+             std::string s(reinterpret_cast<const char*>(c.x[0]), c.x[1]);
+             while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+             log("[guest] %s", s.c_str());
+             break;
+         }
+         case 0x28:
+             fatal("svcReturnFromException(%llx)", (unsigned long long)c.x[0]);
+         case 0x29: {  // GetInfo(type w1, handle w2, sub x3) -> x1
+             c.x[1] = get_info(uint32_t(c.x[1]), uint32_t(c.x[2]), c.x[3], rc);
+             break;
+         }
+         case 0x2A:  // FlushEntireDataCache
+             break;
+         case 0x2C:  // MapPhysicalMemory(addr, size)
+             commit(c.x[0], c.x[1]);
+             vm_set(c.x[0], c.x[1], kMemHeap, 3);
+             break;
+         case 0x2D:  // UnmapPhysicalMemory
+             decommit(c.x[0], c.x[1]);
+             vm_set(c.x[0], c.x[1], c.x[0] - kAliasBase < kAliasSize ? kMemFree : kMemInaccessible, 0);
+             break;
+         case 0x34:
+             rc = svc_wait_for_address(c.x[0], uint32_t(c.x[1]), int32_t(c.x[2]), int64_t(c.x[3]));
+             break;
+         case 0x35:
+             rc = svc_signal_to_address(c.x[0], uint32_t(c.x[1]), int32_t(c.x[2]), int32_t(c.x[3]));
+             break;
+         case 0x36:  // SynchronizePreemptionState
+             break;
+         case 0x45: {  // CreateEvent -> write handle x1, read handle x2
+             auto st = std::make_shared<EventState>();
+-            auto w = std::make_shared<KEvent>();
+-            auto r = std::make_shared<KEvent>();
+-            w->state = r->state = st;
++            auto w = std::make_shared<KEvent>(EventEndpoint::Writable, st);
++            auto r = std::make_shared<KEvent>(EventEndpoint::Readable, st);
+             c.x[1] = handle_add(w);
+             c.x[2] = handle_add(r);
+             break;
+         }
+         case 0x51:  // MapTransferMemory(handle, addr, size, perm)
+             rc = map_transfer_memory(uint32_t(c.x[0]), c.x[1], c.x[2]);
+             break;
+         case 0x52:  // UnmapTransferMemory(handle, addr, size)
+             rc = unmap_transfer_memory(uint32_t(c.x[0]), c.x[1], c.x[2]);
+             break;
+         default:
++#if defined(NX_ASTRAL_STRICT)
++            fatal("strict unhandled SVC: %#x caller=%s", imm, describe(pc).c_str());
++#endif
+             log("unhandled svc %#x from %s (x0 %llx x1 %llx x2 %llx)", imm, describe(pc).c_str(),
+                 (unsigned long long)c.x[0], (unsigned long long)c.x[1], (unsigned long long)c.x[2]);
+             rc = 0;
+     }
+     c.x[0] = rc;
+ }
+
+
+ // NX_SVC_PROFILE=1: wall time of the game main thread's kernel calls that took 30 us or more, by call and caller,
+ // logged every 600 frames (where the main thread sleeps: job barriers, mutexes, waits on the replay).
+ namespace {
+ thread_local int t_svc_role = 0;  // 1 game main, 2 the thread that presents
+ std::mutex g_svc_lock;
+ std::map<std::tuple<int, uint32_t, uint64_t>, std::pair<uint64_t, uint64_t>> g_svc_prof;  // (role, svc, pc) -> (ns, calls)
+ bool svc_profile_on() {
+     static const bool on = std::getenv("NX_SVC_PROFILE") != nullptr;
+     return on;
+ }
+ }  // namespace
+
+ void svc_profile_mark(int role) { t_svc_role = role; }
+
+ void svc_profile_report(uint64_t frames, int role) {
+     if (!svc_profile_on()) return;
+     std::lock_guard lk(g_svc_lock);
+     std::vector<std::pair<uint64_t, std::tuple<int, uint32_t, uint64_t>>> v;
+     uint64_t total = 0;
+     for (auto& [k, val] : g_svc_prof)
+         if (std::get<0>(k) == role) v.push_back({val.first, k}), total += val.first;
+     std::sort(v.rbegin(), v.rend());
+     log("svc profile: role %d thread blocked %.2f ms per frame in calls over 30 us (over %llu frames)", role,
+         double(total) / 1e6 / double(frames), (unsigned long long)frames);
+     for (size_t i = 0; i < v.size() && i < 8; i++) {
+         auto& val = g_svc_prof[v[i].second];
+         log("svc profile: role %d: %.2f ms/frame, %.1f calls/frame: svc %#x from %s", role, double(val.first) / 1e6 / double(frames),
+             double(val.second) / double(frames), std::get<1>(v[i].second), describe(std::get<2>(v[i].second)).c_str());
+     }
+     for (auto it = g_svc_prof.begin(); it != g_svc_prof.end();)
+         it = std::get<0>(it->first) == role ? g_svc_prof.erase(it) : std::next(it);
+ }
+
+ void svc(CPU& c, uint32_t imm, uint64_t pc) {
+     if (!t_svc_role || !svc_profile_on()) return svc_impl(c, imm, pc);
+     uint64_t t0 = plat::monotonic_ns();
+     svc_impl(c, imm, pc);
+     uint64_t dt = plat::monotonic_ns() - t0;
+     if (dt >= 30000) {
+         std::lock_guard lk(g_svc_lock);
+         auto& e = g_svc_prof[{t_svc_role, imm, pc}];
+         e.first += dt, e.second++;
+     }
+ }
+
+ }  // namespace nx
+diff --git a/runtime/src/kernel.h b/runtime/src/kernel.h
+--- a/runtime/src/kernel.h
++++ b/runtime/src/kernel.h
+@@ -1,83 +1,128 @@
+ // Kernel objects shared by kernel.cpp and ipc.cpp.
+ #pragma once
+
++#include <atomic>
+ #include <condition_variable>
+ #include <memory>
+ #include <vector>
+ #include <string>
+
+ #include <nx/runtime.h>
+
+ namespace nx {
+
+ struct KObject {
+     virtual ~KObject() = default;
++    virtual bool waitable() const { return false; }
+     virtual bool signaled() const { return false; }
+     virtual void consume() {}
+ };
+
+ struct KThread : KObject {
+     std::weak_ptr<KThread> self;
+     uint32_t handle = 0;
+     uint64_t id = 0;
+     CPU ctx{};
+     uint64_t tls = 0;
+     uint64_t entry = 0;
+     int64_t host_tid = 0;
+     uint64_t last_yield = 0;  // svcSleepThread(0) back-off
+     uint32_t yields = 0;
+     uint64_t last_tick_call = 0;  // nn::os::GetSystemTick back-off
+     uint32_t tick_spins = 0;
+     int prio = 44, core = 0;
+     bool started = false, exited = false, cancel = false;
+     // wait state (under the kernel lock)
+     bool wake = false;
+     uint32_t wait_result = 0;
+     uint64_t wait_mutex = 0, wait_key = 0, wait_addr = 0;
+     uint32_t wait_tag = 0;
+     std::condition_variable_any cv;  // this thread's own wake-up (with the kernel lock)
++    bool waitable() const override { return true; }
+     bool signaled() const override { return exited; }
+ };
+
+-struct EventState {
++// State is accessed only under g_k. Host producers use the helpers below;
++// waiting and conditional reset hold the same lock, avoiding lost wakeups.
++class EventState {
+     bool signaled = false;
++    friend struct KEvent;
++    friend void event_signal(const std::shared_ptr<EventState>&);
++    friend void event_clear(const std::shared_ptr<EventState>&);
++    friend uint32_t event_reset(const std::shared_ptr<EventState>&);
+ };
+
++enum class EventEndpoint { Readable, Writable };
+ struct KEvent : KObject {
+-    std::shared_ptr<EventState> state;
++    const EventEndpoint endpoint;
++    const std::shared_ptr<EventState> state;
++    KEvent(EventEndpoint role, std::shared_ptr<EventState> shared)
++        : endpoint(role), state(std::move(shared)) {
++        if (!state) fatal("event requires shared state");
++    }
++    bool waitable() const override { return endpoint == EventEndpoint::Readable; }
++    // Kernel wait holds g_k; callers outside the kernel must not inspect state.
+     bool signaled() const override { return state->signaled; }
+ };
++
++// Lock order: producer locks (audio Out / render / applet) precede g_k.
++// Helpers never call guest/host callbacks or acquire producer locks.
++void event_signal(const std::shared_ptr<EventState>& state);
++void event_clear(const std::shared_ptr<EventState>& state);
++uint32_t event_reset(const std::shared_ptr<EventState>& state);
+
+ struct KSharedMemory : KObject {
+     uint64_t size = 0;
+     uint64_t host = 0;  // backing memory the service writes to (kernel region)
+     std::string name;
+ };
+
+ struct KTransferMemory : KObject {
+     uint64_t addr = 0, size = 0;
+ };
+
+ uint32_t handle_add(std::shared_ptr<KObject> o);
+ std::shared_ptr<KObject> handle_get(uint32_t h);
+ void handle_close(uint32_t h);
+ void notify_all();
+ KThread* self_thread();
+ void backtrace(CPU& c);
+ uint64_t heap_size();  // svcSetHeapSize's current size
+
+ // svc_process.cpp
+ uint64_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint32_t& rc);
+ uint32_t set_thread_core_mask(uint32_t handle, int32_t ideal, uint64_t mask);
+ uint32_t map_transfer_memory(uint32_t handle, uint64_t addr, uint64_t size);
+ uint32_t unmap_transfer_memory(uint32_t handle, uint64_t addr, uint64_t size);
+ // Initial static TLS of main (its .tdata), copied to tp+0x10 of every thread created afterwards.
+ void set_tls_template(uint64_t start, uint64_t end);
+ void init_tls_block(uint64_t block);
+
++// Validated at preparation, copied into the loaded process once, never guest writable.
++struct ControlMetadata {
++    uint64_t application_id, program_id;
++    uint32_t parental_flags;
++    int8_t ratings[32];
++    const char* receipt_sha256;
++};
++std::shared_ptr<const ControlMetadata> process_control_metadata(uint64_t authenticated_pid);
++
++// Only kernel.cpp's dispatch bridge can construct this noncopyable provenance.
++// A numeric PID or a parsed guest descriptor cannot construct one.
++class KernelIpc;
++class KernelCaller {
++    uint64_t id_;
++    const std::atomic<bool>* live_;
++    KernelCaller(uint64_t id, const std::atomic<bool>* live) : id_(id), live_(live) {}
++    friend class KernelIpc;
++public:
++    KernelCaller(const KernelCaller&) = delete;
++    uint64_t pid() const { return live_->load() ? id_ : 0; }
++};
++
+ // ipc.cpp
+ uint32_t ipc_connect(const char* port, uint64_t* out_handle);
+-uint32_t ipc_request(CPU& c, uint32_t handle, uint64_t buf, uint64_t size);
++uint32_t ipc_request(CPU& c, uint32_t handle, uint64_t buf, uint64_t size, const KernelCaller* caller = nullptr);
+ uint32_t map_shared_memory(KSharedMemory& s, uint64_t addr, uint64_t size);
+
+ }  // namespace nx
+diff --git a/runtime/src/loader.cpp b/runtime/src/loader.cpp
+--- a/runtime/src/loader.cpp
++++ b/runtime/src/loader.cpp
+@@ -1,283 +1,315 @@
+ // Module loader and dynamic linker (what rtld does on Horizon), indirect-call dispatch and HLE thunks.
+ #include <algorithm>
+ #include <cstdarg>
+ #include <cstdio>
+ #include <fstream>
+ #include <mutex>
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
+
+ #include <nx/runtime.h>
+
+ #include "platform.h"
+
+ namespace nx {
+
+ bool g_trace = false;
+ std::atomic<uint64_t> g_frame{0};
+
+ namespace {
+
+ std::mutex g_log_lock;
+ FILE* g_log_file = nullptr;
+
+ std::vector<LoadedModule> g_modules;
+ std::unordered_map<std::string, uint64_t> g_exports;
+
+ struct Thunk {
+     std::string name;
+     HleFn fn;
+ };
+ std::vector<Thunk> g_thunks;
+ std::unordered_map<std::string, uint64_t> g_thunk_by_name;
+
+ std::unordered_map<std::string, HleFn>& registry() {
+     static std::unordered_map<std::string, HleFn> r;
+     return r;
+ }
+
+ thread_local const char* t_missing_name = nullptr;
+
+ }  // namespace
+
+ // ---- logging --------------------------------------------------------------------------------------------------
+
+ void log(const char* fmt, ...) {
+     char buf[2048];
+     va_list ap;
+     va_start(ap, fmt);
+     vsnprintf(buf, sizeof buf, fmt, ap);
+     va_end(ap);
+     std::lock_guard lk(g_log_lock);
+     if (!g_log_file) {
+         const char* path = std::getenv("NX_LOG");
+ #if defined(__ANDROID__)
+         std::string def = plat::data_root() + "/nx.log";  // next to the data, readable from the phone
+ #else
+         std::string def = plat::data_root() + "/../nx.log";
+ #endif
+         std::string file = path ? path : def;
+         // Keep the previous session's log (a problem report should survive reopening the game).
+         std::remove((file + ".prev").c_str());
+         std::rename(file.c_str(), (file + ".prev").c_str());
+         g_log_file = std::fopen(file.c_str(), "w");
+     }
+     plat::log_line(buf);
+     if (g_log_file) {
+         std::fprintf(g_log_file, "%s\n", buf);
+         std::fflush(g_log_file);
+     }
+ }
+
+ void fatal(const char* fmt, ...) {
+     char buf[2048];
+     va_list ap;
+     va_start(ap, fmt);
+     vsnprintf(buf, sizeof buf, fmt, ap);
+     va_end(ap);
+     log("FATAL: %s", buf);
+     plat::exit_process(1);
+ }
+
+ // ---- HLE registry ---------------------------------------------------------------------------------------------
+
+ HleRegistrar::HleRegistrar(const char* name, HleFn fn) { registry()[name] = fn; }
+
+ HleFn hle_lookup(const char* name) {
+     auto it = registry().find(name);
+     return it == registry().end() ? nullptr : it->second;
+ }
+
+ static void missing_stub(CPU& c) {
++#if defined(NX_ASTRAL_STRICT)
++    fatal("strict missing function: %s (lr %s)", t_missing_name, describe(c.x[30]).c_str());
++#endif
+     // Name comes from the thunk that dispatched here.
+     log("missing import called: %s (lr %s) -> 0", t_missing_name, describe(c.x[30]).c_str());
+     c.x[0] = 0;
+ }
+
+ uint64_t hle_address_or(const char* name, HleFn fallback) {
+     static std::mutex lock;  // NVN hands out procs by name at run time, from any thread
+     std::lock_guard lk(lock);
+     // Other threads index g_thunks while we add to it: never reallocate (one entry per 16 bytes of the region).
+     if (g_thunks.capacity() < kThunkSize / 16) g_thunks.reserve(kThunkSize / 16);
+     auto it = g_thunk_by_name.find(name);
+     if (it != g_thunk_by_name.end()) return it->second;
+     if (g_thunks.size() == kThunkSize / 16) fatal("out of HLE thunks");
+     HleFn fn = hle_lookup(name);
+     uint64_t addr = kThunkBase + g_thunks.size() * 16;
+     g_thunks.push_back({name, fn ? fn : fallback});
+     g_thunk_by_name[name] = addr;
+     return addr;
+ }
+
+ uint64_t hle_address(const char* name) { return hle_address_or(name, missing_stub); }
+
+ const char* hle_current_name() { return t_missing_name; }
+
+ // ---- dispatch -------------------------------------------------------------------------------------------------
+
+ const LoadedModule* module_at(uint64_t addr) {
+     for (auto& m : g_modules)
+         if (addr - m.base < m.size) return &m;
+     return nullptr;
+ }
+
+ std::string describe(uint64_t addr) {
+     char buf[512];
+     if (addr - kThunkBase < kThunkSize) {
+         size_t i = (addr - kThunkBase) / 16;
+         snprintf(buf, sizeof buf, "hle:%s", i < g_thunks.size() ? g_thunks[i].name.c_str() : "?");
+         return buf;
+     }
+     const LoadedModule* m = module_at(addr);
+     if (!m) {
+         snprintf(buf, sizeof buf, "%llx", (unsigned long long)addr);
+         return buf;
+     }
+     uint64_t off = addr - m->base;
+     // Nearest preceding function symbol.
+     const Symbol* best = nullptr;
+     for (size_t k = 0; k < m->info->symbol_count; k++) {
+         const Symbol& s = m->info->symbols[k];
+         if (s.imported || s.type != 2 || s.value > off) continue;
+         if (!best || s.value > best->value) best = &s;
+     }
+     if (best && off - best->value < 0x10000)
+         snprintf(buf, sizeof buf, "%s+%llx (%s+%llx)", m->info->name, (unsigned long long)off, best->name,
+                  (unsigned long long)(off - best->value));
+     else
+         snprintf(buf, sizeof buf, "%s+%llx", m->info->name, (unsigned long long)off);
+     return buf;
+ }
+
+ void backtrace(CPU& c);
+
+ // Indirect calls (every blr of the game) look the target up here: the modules' text ranges in a small flat array.
+ struct FastModule {
+     uint64_t base, text_size;
+     const Fn* table;
+ };
+ FastModule g_fast[4];
+ size_t g_fast_count = 0;
+
+ void call(CPU& c, uint64_t t) {
+     for (size_t k = 0; k < g_fast_count; k++) {
+         const FastModule& m = g_fast[k];
+         uint64_t off = t - m.base;
+         if (off < m.text_size) [[likely]] {
+             Fn fn = m.table[off >> 2];
+             if (!fn) [[unlikely]] {
+                 for (int k = 0; k < 31; k += 4)
+                     log("  x%-2d %016llx %016llx %016llx %016llx", k, (unsigned long long)c.x[k],
+                         (unsigned long long)c.x[k + 1], (unsigned long long)c.x[k + 2],
+                         (unsigned long long)(k + 3 < 31 ? c.x[k + 3] : c.x[31]));
+                 backtrace(c);
+                 fatal("call into the middle of a function: %s (lr %s)", describe(t).c_str(), describe(c.x[30]).c_str());
+             }
+             fn(c);
+             return;
+         }
+     }
+     uint64_t off = t - kThunkBase;
+     if (off < kThunkSize && off / 16 < g_thunks.size()) {
+         const Thunk& th = g_thunks[off / 16];
+         if (g_trace) log("hle %s", th.name.c_str());
+         const char* prev = t_missing_name;
+         t_missing_name = th.name.c_str();
+         th.fn(c);
+         t_missing_name = prev;
+         return;
+     }
+     fatal("call to %llx (%s), lr %s", (unsigned long long)t, describe(t).c_str(), describe(c.x[30]).c_str());
+ }
+
+ void trace_sp(CPU& c, uint64_t pc) {
+     log("sp %llx x19 %llx at %s", (unsigned long long)c.x[31], (unsigned long long)c.x[19], describe(pc).c_str());
+ }
+
+ [[noreturn]] void unimpl(CPU& c, uint64_t pc, const char* what) {
+     for (int k = 0; k < 31; k += 4)
+         log("  x%-2d %016llx %016llx %016llx %016llx", k, (unsigned long long)c.x[k], (unsigned long long)c.x[k + 1],
+             (unsigned long long)c.x[k + 2], (unsigned long long)(k + 3 < 32 ? c.x[k + 3] : 0));
+     backtrace(c);
+     fatal("unimplemented instruction at %s: %s (lr %s)", describe(pc).c_str(), what, describe(c.x[30]).c_str());
+ }
+
+ // ---- loading and linking --------------------------------------------------------------------------------------
+
+ uint64_t find_symbol(const char* name) {
+     auto it = g_exports.find(name);
+     return it == g_exports.end() ? 0 : it->second;
+ }
+
+ void load_modules(const ModuleInfo* const* mods, size_t count, const std::string& data_dir) {
++    if (count > 4) fatal("module dispatch capacity exceeded: %zu > 4", count);
+     // Map every module first so symbols of all of them are known before relocating.
+     for (size_t i = 0; i < count; i++) {
+         const ModuleInfo* mi = mods[i];
+         uint64_t image = mi->data + mi->data_size;
+         uint64_t size = ((mi->bss + mi->bss_size) + 0xFFF) & ~0xFFFull;
+         if (!commit(mi->base, size)) fatal("cannot commit module %s", mi->name);
+         std::string path = data_dir + "/" + mi->name + ".bin";
+         std::ifstream f(path, std::ios::binary);
+         if (!f) fatal("missing %s (run tools/nso2bin.py)", path.c_str());
+         f.read(reinterpret_cast<char*>(mi->base), std::streamsize(image));
+         if (uint64_t(f.gcount()) != image) fatal("%s: expected %llx bytes", path.c_str(), (unsigned long long)image);
+         vm_set(mi->base + mi->text, mi->text_size, kMemCode, 5);
+         vm_set(mi->base + mi->ro, mi->ro_size, kMemCode, 1);
+         vm_set(mi->base + mi->data, size - mi->data, kMemCodeData, 3);
+
+         LoadedModule lm{mi, mi->base, size, new Fn[mi->text_size / 4]()};
+         for (size_t k = 0; k < mi->func_count; k++) lm.table[mi->funcs[k].offset / 4] = mi->funcs[k].fn;
+         g_modules.push_back(lm);
+         if (g_fast_count < 4) g_fast[g_fast_count++] = {lm.base, mi->text_size, lm.table};
+
+         for (size_t k = 0; k < mi->symbol_count; k++) {
+             const Symbol& s = mi->symbols[k];
+             if (s.imported || !s.name[0] || s.bind == 0) continue;  // skip locals
+             auto it = g_exports.find(s.name);
+             if (it == g_exports.end() || s.bind == 1)  // global beats weak; first global wins
+                 if (it == g_exports.end()) g_exports[s.name] = mi->base + s.value;
+         }
+         log("loaded %s at %llx (%llu functions, %llu relocs)", mi->name, (unsigned long long)mi->base,
+             (unsigned long long)mi->func_count, (unsigned long long)mi->reloc_count);
+     }
+
+-    size_t hle = 0, missing = 0, linked = 0;
++    size_t hle = 0, missing = 0, linked = 0, missing_functions = 0, missing_data = 0, missing_notype = 0, unknown_relocs = 0, weak_undefined = 0;
+     for (auto& lm : g_modules) {
+         const ModuleInfo* mi = lm.info;
+         for (size_t k = 0; k < mi->reloc_count; k++) {
+             const Reloc& r = mi->relocs[k];
+             uint64_t* slot = reinterpret_cast<uint64_t*>(lm.base + r.offset);
+             if (r.type == R_AARCH64_RELATIVE) {
+                 *slot = lm.base + uint64_t(r.addend);
+                 continue;
+             }
+             if (r.type != R_AARCH64_GLOB_DAT && r.type != R_AARCH64_JUMP_SLOT && r.type != R_AARCH64_ABS64) {
++                unknown_relocs++;
+                 log("%s: relocation type %u at %llx not handled", mi->name, r.type, (unsigned long long)r.offset);
+                 continue;
+             }
++            if (r.sym >= mi->symbol_count) fatal("%s: relocation symbol index %u out of bounds", mi->name, r.sym);
+             const Symbol& s = mi->symbols[r.sym];
+             uint64_t target = 0;
+             if (s.type == 2 || s.imported) {
+                 if (hle_lookup(s.name)) {
+                     target = hle_address(s.name);
+                     hle++;
+                 }
+             }
+             if (!target) {
+                 target = find_symbol(s.name);
+                 if (target) linked++;
+             }
+             if (!target && !s.imported) target = lm.base + s.value;
++            // ELF STB_WEAK + SHN_UNDEF: absent definitions have S = 0.
++            // Only supported S+A relocations reach here; retain their addend.
++            // A null function pointer is not a callable success thunk.
++            if (!target && s.imported && s.bind == 2) {
++                *slot = uint64_t(r.addend);
++                weak_undefined++;
++                log("undefined weak: module=%s symbol=%s type=%u reloc=%u offset=%llx addend=%lld",
++                    mi->name, s.name, s.type, r.type, (unsigned long long)r.offset, (long long)r.addend);
++                continue;
++            }
+             if (!target) {
++#if defined(NX_ASTRAL_STRICT)
++                if (s.type == 2) missing_functions++;
++                else if (s.type == 0) missing_notype++;
++                else missing_data++;
++                log("strict unresolved %s: module=%s symbol=%s bind=%u type=%u reloc=%u offset=%llx",
++                    s.type == 2 ? "function" : (s.type == 0 ? "notype" : "data"), mi->name, s.name,
++                    s.bind, s.type, r.type, (unsigned long long)r.offset);
++                missing++;
++                continue;
++#endif
+                 // Unresolved: functions get a logging stub; data stays null.
+                 if (s.type == 2 || s.type == 0) target = hle_address(s.name);
+                 missing++;
+             }
+             *slot = target + uint64_t(r.addend);
+         }
+     }
++#if defined(NX_ASTRAL_STRICT)
++    if (missing || unknown_relocs)
++        fatal("strict link blocked: functions=%zu data=%zu notype=%zu relocations=%zu",
++              missing_functions, missing_data, missing_notype, unknown_relocs);
++#endif
++    log("undefined weak relocations: %zu", weak_undefined);
+     log("linked: %zu to HLE, %zu across modules, %zu unresolved", hle, linked, missing);
+ }
+
+ }  // namespace nx
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index ee2a825..03ae7f6 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -116,6 +116,7 @@ static void nn_main(CPU& c) {
+     for (size_t k = 0; k < nx_module_main.symbol_count; k++)
+         if (!nx_module_main.symbols[k].imported && std::string(nx_module_main.symbols[k].name) == "nnMain")
+             real = nx_module_main.base + nx_module_main.symbols[k].value;
++    if (!real) fatal("boot: real nnMain export not found in main");
+     call(c, real);
+ }
+
+@@ -140,6 +141,9 @@ NX_HLE("__process_return", process_return);
+ void boot() {
+     if (const char* t = std::getenv("NX_TRACE")) g_trace = *t == '1';
+     if (plat::setting("trace") == "1") g_trace = true;
++#if defined(NX_ASTRAL_STRICT)
++    log("astral strict boot: host rtld replacement; main+sdk; unsupported guest instructions remain fatal");
++#endif
+     memory_init();
+     kernel_init();
+     const ModuleInfo* mods[] = {&nx_module_main, &nx_module_sdk};
+@@ -150,7 +154,12 @@ void boot() {
+         set_tls_template(tdata, tdata_end);
+         log("main .tdata: %llu bytes", (unsigned long long)(tdata_end - tdata));
+     }
++    #if defined(NX_ASTRAL_STRICT)
++    // Actual NPDM main-thread stack size, checked before preparation.
++    uint32_t main_thread = create_main_thread(1ull << 20);
++#else
+     uint32_t main_thread = create_main_thread(16ull << 20);
++#endif
+     CPU& c = current_cpu();
+     c.x[0] = main_thread;
+     c.x[1] = nx_module_main.base;
+diff --git a/games/astral/game.cpp b/games/astral/game.cpp
+new file mode 100644
+index 0000000..112f503
+--- /dev/null
++++ b/games/astral/game.cpp
+@@ -0,0 +1,9 @@
++// Original Astral bootstrap adapter; metadata must be verified by prepare_runtime.py.
++#include <nx/game.h>
++namespace nx::game {
++const Info kInfo = {"astral", "ASTRAL CHAIN", 0x01007300020FA000ull,
++                   "", "private/astral", 0};
++void after_init() {}
++void renderer_start() {}
++void first_frame() {}
++} // namespace nx::game
+diff --git a/runtime/src/svc_am.cpp b/runtime/src/svc_am.cpp
+--- a/runtime/src/svc_am.cpp
++++ b/runtime/src/svc_am.cpp
+@@ -1,158 +1,244 @@
+ // am services (appletOE): application proxy, focus/operation-mode state, launch parameters.
+ #include <cstdlib>
+ #include <deque>
++#include <mutex>
+
+ #include "ipc.h"
+ #include "language.h"
+
+ namespace nx {
+
+ namespace {
+
+ constexpr uint32_t kAmNoMessage = 0x680;  // am error 3
+ constexpr uint32_t kMsgFocusStateChanged = 15;
+ constexpr uint32_t kMsgOperationModeChanged = 30;
+ constexpr uint32_t kMsgPerformanceModeChanged = 31;
+
++enum class FocusHandlingMode { AlwaysSuspend, SuspendHomeSleep, NoSuspend };
++
+ struct AppletState {
+     std::deque<uint32_t> messages{kMsgFocusStateChanged, kMsgOperationModeChanged, kMsgPerformanceModeChanged};
+     std::shared_ptr<EventState> message_event = std::make_shared<EventState>();
++    // Applet-owned policy, shared by all controller sessions and common getters.
++    bool focus_notify = true;
++    FocusHandlingMode focus_mode = FocusHandlingMode::SuspendHomeSleep;
+ };
+
+ AppletState& applet() {
+     static AppletState s;
+     return s;
+ }
+
++std::mutex g_applet_events;  // precedes g_k; never acquired by kernel callbacks
++
++// Keep disabled focus notifications pending, matching observed system behaviour.
++// Other message kinds remain available; enabling notify reveals pending focus.
++auto available_message(AppletState& a) {
++    auto it = a.messages.begin();
++    while (it != a.messages.end() && !a.focus_notify && *it == kMsgFocusStateChanged) ++it;
++    return it;
++}
++
++void update_message_event(AppletState& a) {
++    if (available_message(a) != a.messages.end()) event_signal(a.message_event);
++    else event_clear(a.message_event);
++}
++
+ uint32_t event_handle(std::shared_ptr<EventState> st) {
+-    auto e = std::make_shared<KEvent>();
+-    e->state = std::move(st);
++    auto e = std::make_shared<KEvent>(EventEndpoint::Readable, std::move(st));
+     return handle_add(e);
+ }
+
+ std::shared_ptr<Service> svc(const char* name, std::function<void(Service&)> setup) {
+     auto s = std::make_shared<Service>(name);
+     setup(*s);
+     return s;
+ }
+
+ std::shared_ptr<Service> common_state_getter() {
+     return svc("ICommonStateGetter", [](Service& s) {
+         s.cmds[0] = [](IpcCtx& c) {  // GetEventHandle
+-            applet().message_event->signaled = !applet().messages.empty();
++            std::lock_guard lk(g_applet_events);
++            update_message_event(applet());
+             c.out_copy.push_back(event_handle(applet().message_event));
+             return 0u;
+         };
+         s.cmds[1] = [](IpcCtx& c) {  // ReceiveMessage
++            std::lock_guard lk(g_applet_events);
+             auto& a = applet();
+-            if (a.messages.empty()) {
+-                a.message_event->signaled = false;
++            auto it = available_message(a);
++            if (it == a.messages.end()) {
++                event_clear(a.message_event);
+                 return kAmNoMessage;
+             }
+-            c.push<uint32_t>(a.messages.front());
+-            a.messages.pop_front();
+-            if (a.messages.empty()) a.message_event->signaled = false;
++            c.push<uint32_t>(*it);
++            a.messages.erase(it);
++            update_message_event(a);
+             return 0u;
+         };
+         // NX_HANDHELD=1: handheld mode, so the game renders for 1280x720 (a lighter GPU load) instead of docked 1080p.
+         static const bool handheld = std::getenv("NX_HANDHELD") != nullptr;
+         s.cmds[5] = [](IpcCtx& c) { c.push<uint8_t>(handheld ? 0 : 1); return 0u; };   // GetOperationMode
+         s.cmds[6] = [](IpcCtx& c) { c.push<uint32_t>(handheld ? 0 : 1); return 0u; };  // GetPerformanceMode
+         s.cmds[9] = [](IpcCtx& c) { c.push<uint8_t>(1); return 0u; };   // GetCurrentFocusState: in focus
+         // SetCpuBoostMode(CpuBoostMode): Wonder asks for the boost around every load. A PC has no clock to raise, so
+         // the request is taken and dropped (no output). Same answer as the generic stub, without its log line.
+         s.cmds[66] = [](IpcCtx&) { return 0u; };
+         // NX_RENDER_RES=<w>x<h>: the size the game renders at, while it stays docked (a resolution scale: the game sizes
+         // its window textures and targets from this answer; the present step stretches the picture to the window).
+         static const std::pair<uint32_t, uint32_t> res = [] {
+             uint32_t w = handheld ? 1280 : 1920, h = handheld ? 720 : 1080, rw = 0, rh = 0;
+             if (const char* e = std::getenv("NX_RENDER_RES"); e && std::sscanf(e, "%ux%u", &rw, &rh) == 2 && rw >= 320 && rh >= 180)
+                 w = rw, h = rh;
+             return std::pair<uint32_t, uint32_t>{w, h};
+         }();
+         s.cmds[60] = [](IpcCtx& c) {  // GetDefaultDisplayResolution
+             c.push<uint32_t>(res.first);
+             c.push<uint32_t>(res.second);
+             return 0u;
+         };
+         s.cmds[61] = [](IpcCtx& c) {  // GetDefaultDisplayResolutionChangeEvent
+             c.out_copy.push_back(event_handle(std::make_shared<EventState>()));
+             return 0u;
+         };
+     });
+ }
+
++// Command 91 follows libnx 20cbcfd9 and observed behaviour: service-owned,
++// lazy, initially signaled state; each acquisition copies a readable endpoint.
++// The only producer here is initial creation. No suspend/resume producer exists
++// in this runtime; command 90 stays fatal rather than inventing tick accounting.
+ std::shared_ptr<Service> self_controller() {
+     return svc("ISelfController", [](Service& s) {
++        // libnx 20cbcfd9: three u8 booleans, no output. Observed behaviour
++        // applies notify/suspend to applet state; background is read but unused.
++        // Validate before mutation: malformed input must never look successful.
++        s.cmds[13] = [](IpcCtx& c) {
++            if (!c.in || c.in_size < 3 || c.arg<uint8_t>(0) > 1 ||
++                c.arg<uint8_t>(1) > 1 || c.arg<uint8_t>(2) > 1)
++                fatal("ISelfController SetFocusHandlingMode: malformed boolean payload");
++            const bool notify = c.arg<uint8_t>(0) != 0;
++            const bool background = c.arg<uint8_t>(1) != 0;
++            const bool suspend = c.arg<uint8_t>(2) != 0;
++            std::lock_guard lk(g_applet_events);  // IPC -> applet -> kernel
++            auto& a = applet();
++            a.focus_notify = notify;
++            // Command 13 preserves AlwaysSuspend when suspension stays allowed.
++            if (!suspend) a.focus_mode = FocusHandlingMode::NoSuspend;
++            else if (a.focus_mode == FocusHandlingMode::NoSuspend)
++                a.focus_mode = FocusHandlingMode::SuspendHomeSleep;
++            update_message_event(a);
++            // ForegroundVisible stays runnable/InFocus for either suspend mode.
++            // No focus transition or suspended-tick/event producer is invented.
++            log("am: SetFocusHandlingMode notify=%u background=%u suspend=%u (foreground)",
++                unsigned(notify), unsigned(background), unsigned(suspend));
++            return 0u;
++        };
++        // libnx 20cbcfd9: one u8 bool, result only. Observed behaviour:
++        // applet-owned three-mode transition; false preserves NoSuspend.
++        s.cmds[16] = [](IpcCtx& c) {
++            if (!c.in || c.in_size < 1 || c.arg<uint8_t>(0) > 1)
++                fatal("ISelfController SetOutOfFocusSuspendingEnabled: malformed boolean payload");
++            const bool enabled = c.arg<uint8_t>(0) != 0;
++            std::lock_guard lk(g_applet_events);  // IPC -> applet -> kernel
++            auto& a = applet();
++            if (enabled) a.focus_mode = FocusHandlingMode::AlwaysSuspend;
++            else if (a.focus_mode == FocusHandlingMode::AlwaysSuspend)
++                a.focus_mode = FocusHandlingMode::SuspendHomeSleep;
++            // The existing single applet is ForegroundVisible: every mode is
++            // runnable/InFocus. No transition, notification or tick is produced.
++            log("am: SetOutOfFocusSuspendingEnabled enabled=%u mode=%u (foreground runnable)",
++                unsigned(enabled), unsigned(a.focus_mode));
++            return 0u;
++        };
++        s.cmds[91] = [event = std::shared_ptr<EventState>{}](IpcCtx& c) mutable {
++            std::lock_guard lk(g_applet_events);  // IPC -> applet -> kernel
++            if (!event) {
++                event = std::make_shared<EventState>();
++                event_signal(event);
++            }
++            c.out_copy.push_back(event_handle(event));
++            return 0u;
++        };
+         s.cmds[40] = [](IpcCtx& c) { c.push<uint64_t>(1); return 0u; };  // CreateManagedDisplayLayer
+         s.cmds[0] = [](IpcCtx&) { return 0u; };                             // Exit
+         s.cmds[62] = [](IpcCtx&) { return 0u; };                            // SetIdleTimeDetectionExtension
+         for (uint32_t cmd : {19u, 50u, 71u, 110u})                           // AccumulatedSuspendedTickChangedEvent etc.
+             s.cmds[cmd] = [](IpcCtx& c) {
+                 c.out_copy.push_back(event_handle(std::make_shared<EventState>()));
+                 return 0u;
+             };
+     });
+ }
+
+ std::shared_ptr<Service> window_controller() {
+     return svc("IWindowController", [](Service& s) {
+         s.cmds[1] = [](IpcCtx& c) { c.push<uint64_t>(0x51); return 0u; };  // GetAppletResourceUserId
++        // libnx 20cbcfd9: command 10 is AcquireForegroundRights, no input/output.
++        // Observed behaviour completes it without a state transition. This
++        // runtime has one application, already InFocus (CommonStateGetter 9).
++        // Acknowledge that existing foreground state; do not invent an ARUID,
++        // host window, focus notification or process lifetime for this command.
++        s.cmds[10] = [](IpcCtx&) {
++            log("am: AcquireForegroundRights: single application already in foreground");
++            return 0u;
++        };
+     });
+ }
+
+ std::shared_ptr<Service> application_functions() {
+     return svc("IApplicationFunctions", [](Service& s) {
+         s.cmds[1] = [](IpcCtx& c) {  // PopLaunchParameter(kind): the preselected user, once
+             static bool popped = false;
+             if (c.arg<uint32_t>(0) != 2 || popped) return 0x2A80u;
+             popped = true;
+             c.push_object(preselected_user_storage());
+             return 0u;
+         };
+         s.cmds[20] = [](IpcCtx& c) { c.push<uint64_t>(0); return 0u; };  // EnsureSaveData
+         s.cmds[21] = [](IpcCtx& c) {                                      // GetDesiredLanguage
+             uint64_t code = desired_language();
+             char tag[9] = {0};
+             std::memcpy(tag, &code, 8);
+             log("am: desired language = %s", tag);
+             c.push<uint64_t>(code);
+             return 0u;
+         };
+         s.cmds[40] = [](IpcCtx& c) { c.push<uint8_t>(0); return 0u; };  // NotifyRunning
+         s.cmds[50] = [](IpcCtx& c) {                                     // GetPseudoDeviceId
+             c.push<uint64_t>(0x1234);
+             c.push<uint64_t>(0x5678);
+             return 0u;
+         };
+         s.cmds[130] = [](IpcCtx& c) {  // GetGpuErrorDetectedSystemEvent
+             c.out_copy.push_back(event_handle(std::make_shared<EventState>()));
+             return 0u;
+         };
+         s.cmds[210] = [](IpcCtx&) { return 0u; };  // UnsetGameCardEject... (stub)
+     });
+ }
+
+ std::shared_ptr<Service> application_proxy() {
+     return svc("IApplicationProxy", [](Service& s) {
+         s.cmds[0] = [](IpcCtx& c) { c.push_object(common_state_getter()); return 0u; };
+         s.cmds[1] = [](IpcCtx& c) { c.push_object(self_controller()); return 0u; };
+         s.cmds[2] = [](IpcCtx& c) { c.push_object(window_controller()); return 0u; };
+         s.cmds[3] = [](IpcCtx& c) { c.push_object(std::make_shared<Service>("IAudioController")); return 0u; };
+         s.cmds[4] = [](IpcCtx& c) { c.push_object(std::make_shared<Service>("IDisplayController")); return 0u; };
+         s.cmds[10] = [](IpcCtx& c) { c.push_object(std::make_shared<Service>("IProcessWindingController")); return 0u; };
+         s.cmds[11] = [](IpcCtx& c) { c.push_object(std::make_shared<Service>("ILibraryAppletCreator")); return 0u; };
+         s.cmds[20] = [](IpcCtx& c) { c.push_object(application_functions()); return 0u; };
+         s.cmds[1000] = [](IpcCtx& c) { c.push_object(std::make_shared<Service>("IDebugFunctions")); return 0u; };
+     });
+ }
+
+ ServiceRegistrar reg_applet_oe("appletOE", [] {
+     return svc("appletOE", [](Service& s) {
+         s.cmds[0] = [](IpcCtx& c) { c.push_object(application_proxy()); return 0u; };  // OpenApplicationProxy
+     });
+ });
+
+ }  // namespace
+
+ }  // namespace nx
+diff --git a/runtime/src/hle_vi.cpp b/runtime/src/hle_vi.cpp
+--- a/runtime/src/hle_vi.cpp
++++ b/runtime/src/hle_vi.cpp
+@@ -1,98 +1,97 @@
+ // nn::vi (display/layers) and nv:: (graphics driver setup) at the API level. The layer is the platform's window
+ // (Win32 window / Android surface); its handle is the "native window" the game hands to vkCreateViSurfaceNN, which
+ // the Vulkan bridge turns into the platform's surface.
+ #include <cstdlib>
+ #include <memory>
+ #include <mutex>
+ #include <thread>
+
+ #include <nx/runtime.h>
+
+ #include "kernel.h"
+ #include "platform.h"
+
+ namespace nx {
+
+ // NX_DISPLAY_HZ=<hz> (30..360; study fps-unlock-1710): the host vsync event and the present unit run at <hz> instead of
+ // 60. Experimental: Wonder's logic steps one 1/60 s unit per present interval, so above 60 the game runs fast.
+ uint64_t display_period_ns() {
+     static const uint64_t p = [] {
+         const char* e = std::getenv("NX_DISPLAY_HZ");
+         int hz = e ? std::atoi(e) : 0;
+         if (hz < 30 || hz > 360) return uint64_t(16'666'667);
+         log("vi: display at %d Hz (NX_DISPLAY_HZ)", hz);
+         return uint64_t(1'000'000'000ull / uint64_t(hz));
+     }();
+     return p;
+ }
+
+ namespace {
+
+ constexpr uint64_t kFakeDisplay = kKernelBase - 0x1000;  // opaque pointers, never dereferenced by the game
+ constexpr uint64_t kFakeLayer = kKernelBase - 0x2000;
+
+ void ok(CPU& c) { c.x[0] = 0; }
+
+ void OpenDefaultDisplay(CPU& c) {
+     st<uint64_t>(c.x[0], kFakeDisplay);
+     c.x[0] = 0;
+ }
+
+ void CreateLayer(CPU& c) {
+     void* w = plat::create_window();
+     log("vi: layer created -> native window %p", w);
+     plat::release_window(w);
+     st<uint64_t>(c.x[0], kFakeLayer);
+     c.x[0] = 0;
+ }
+
+ void GetNativeWindow(CPU& c) {  // (void** out, Layer*)
+     st<uint64_t>(c.x[0], uint64_t(plat::create_window()));
+     c.x[0] = 0;
+ }
+
+ void nv_noop(CPU&) {}
+
+ // The display's vsync: a kernel event a host thread signals every 1/60 s. The game gets it as an nn::os
+ // SystemEvent (AttachSystemEvent with our read/write handles, auto clear: each wait consumes one vsync).
+ std::shared_ptr<EventState> g_vsync = std::make_shared<EventState>();
+
+ void vsync_thread() {
+     plat::set_thread_name("vsync");
+     uint64_t next = plat::monotonic_ns();
+     for (;;) {
+         next += display_period_ns();
+         int64_t wait = int64_t(next - plat::monotonic_ns());
+         if (wait > 0) plat::sleep_ns(wait);
+-        g_vsync->signaled = true;
+-        notify_all();
++        event_signal(g_vsync);
+     }
+ }
+
+ void GetDisplayVsyncEvent(CPU& c) {  // (os::SystemEventType*, Display*)
+-    auto r = std::make_shared<KEvent>(), w = std::make_shared<KEvent>();
+-    r->state = w->state = g_vsync;
++    auto r = std::make_shared<KEvent>(EventEndpoint::Readable, g_vsync);
++    auto w = std::make_shared<KEvent>(EventEndpoint::Writable, g_vsync);
+     uint32_t hr = handle_add(r), hw = handle_add(w);
+     uint64_t attach = find_symbol("_ZN2nn2os17AttachSystemEventEPNS0_15SystemEventTypeEjbjbNS0_14EventClearModeE");
+     uint64_t saved[8];
+     for (int k = 0; k < 8; k++) saved[k] = c.x[k];
+     c.x[1] = hr, c.x[2] = 1, c.x[3] = hw, c.x[4] = 1, c.x[5] = 1;  // x0: the SystemEventType; 1: AutoClear
+     call(c, attach);
+     for (int k = 0; k < 8; k++) c.x[k] = saved[k];
+     static std::once_flag once;
+     std::call_once(once, [] { std::thread(vsync_thread).detach(); });
+     c.x[0] = 0;
+ }
+
+ }  // namespace
+
+ NX_HLE("_ZN2nn2vi10InitializeEv", ok);
+ NX_HLE("_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE", OpenDefaultDisplay);
+ NX_HLE("_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", CreateLayer);
+ NX_HLE("_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE", GetNativeWindow);
+ NX_HLE("_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE", GetDisplayVsyncEvent);
+ NX_HLE("_ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_", nv_noop);
+ NX_HLE("_ZN2nv28SetGraphicsDevtoolsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_", nv_noop);
+ NX_HLE("_ZN2nv18InitializeGraphicsEPvm", nv_noop);
+
+ }  // namespace nx
+diff --git a/runtime/src/hle_audio.cpp b/runtime/src/hle_audio.cpp
+--- a/runtime/src/hle_audio.cpp
++++ b/runtime/src/hle_audio.cpp
+@@ -1,554 +1,554 @@
+ // nn::audio AudioOut at the API level. FMOD (inside main) mixes s16 stereo 48 kHz into AudioOutBuffers and appends
+ // them; a player thread hands each one to the platform's audio device (XAudio2 / AAudio / SDL3) and gives it back to
+ // the game (released + system event signalled) when it has been played, so the device clock paces FMOD's mixer.
+ // Without a device the same pacing runs on a timer. Audio input reports no devices. SDK 16 games (Wonder) use the
+ // AudioRenderer instead, rendered in process; its final mix goes to the same device (see below).
+ #include <algorithm>
+ #include <chrono>
+ #include <cmath>
+ #include <condition_variable>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <deque>
+ #include <mutex>
+ #include <thread>
+ #include <vector>
+
+ #include "kernel.h"
+ #include "platform.h"
+
+ namespace nx {
+
+ namespace {
+
+ constexpr uint64_t kBytesPerSecond = 48000 * 2 * 2;
+ constexpr uint32_t kMaxInFlight = 4;  // buffers queued in the device (4 x ~21 ms)
+
+ // Our AudioOutBuffer layout (only our HLE reads it): {void* data; u64 capacity; u64 size}.
+ struct Out {
+     std::mutex lock;
+     std::condition_variable cv;
+     std::deque<uint64_t> queued, released;
+     std::shared_ptr<EventState> event = std::make_shared<EventState>();
+     bool started = false;
+ };
+ Out g_out;
+
++// Keep queue mutation and event update atomic to other audio operations.
++// Lock order is Out::lock -> kernel g_k; the kernel never takes Out::lock.
+ void release(void* ctx) {
+     std::lock_guard lk(g_out.lock);
+     g_out.released.push_back(reinterpret_cast<uint64_t>(ctx));
+-    g_out.event->signaled = true;
+-    notify_all();
++    event_signal(g_out.event);
+     g_out.cv.notify_all();
+ }
+
+ // The platform device has one completion callback: AudioOut buffers are guest addresses, the renderer's blocks
+ // live in g_render (below) and go back to its free list.
+ void render_block_done(void* ctx);
+ bool render_owns(void* ctx);
+
+ void device_done(void* ctx) {
+     if (render_owns(ctx))
+         render_block_done(ctx);
+     else
+         release(ctx);
+ }
+
+ bool device_open() {
+     static const bool ok = plat::audio_open(device_done);
+     return ok;
+ }
+
+ void player() {
+     bool device = device_open();
+     log("audio: %s", device ? "device output (48 kHz stereo s16)" : "no audio device, timer pacing");
+     using clock = std::chrono::steady_clock;
+     auto next = clock::now();
+     for (;;) {
+         uint64_t buf = 0, size = 0;
+         {
+             std::unique_lock lk(g_out.lock);
+             auto ready = [&] {
+                 return g_out.started && !g_out.queued.empty() && (!device || plat::audio_queued() < kMaxInFlight);
+             };
+             g_out.cv.wait_for(lk, std::chrono::milliseconds(5), ready);
+             if (!ready()) continue;
+             buf = g_out.queued.front();
+             g_out.queued.pop_front();
+             size = ld<uint64_t>(buf + 16);
+         }
+         if (device && plat::audio_submit(reinterpret_cast<const void*>(ld<uint64_t>(buf)), size,
+                                          reinterpret_cast<void*>(buf)))
+             continue;
+         next = std::max(next, clock::now() - std::chrono::milliseconds(50));
+         next += std::chrono::microseconds(size * 1000000 / kBytesPerSecond);
+         std::this_thread::sleep_until(next);
+         release(reinterpret_cast<void*>(buf));
+     }
+ }
+
+ void InitializeAudioOutParameter(CPU& c) {  // {u32 sample_rate; u16 channels; u16 reserved}
+     st<uint32_t>(c.x[0], 0);
+     st<uint16_t>(c.x[0] + 4, 0);
+     st<uint16_t>(c.x[0] + 6, 0);
+ }
+
+ void OpenDefaultAudioOut(CPU& c) {  // (AudioOut*, os::SystemEvent*, const AudioOutParameter&)
+     uint64_t out = c.x[0], sysev = c.x[1];
+     // Give the guest a system event backed by our kernel event: nn::os::AttachSystemEvent(type, read, managed,
+     // write, managed, clear mode = manual).
+-    auto w = std::make_shared<KEvent>();
+-    auto r = std::make_shared<KEvent>();
+-    w->state = r->state = g_out.event;
++    auto w = std::make_shared<KEvent>(EventEndpoint::Writable, g_out.event);
++    auto r = std::make_shared<KEvent>(EventEndpoint::Readable, g_out.event);
+     uint32_t hr = handle_add(r), hw = handle_add(w);
+     uint64_t attach = find_symbol("_ZN2nn2os17AttachSystemEventEPNS0_15SystemEventTypeEjbjbNS0_14EventClearModeE");
+     uint64_t saved[8];
+     for (int k = 0; k < 8; k++) saved[k] = c.x[k];
+     c.x[0] = sysev;
+     c.x[1] = hr;
+     c.x[2] = 1;
+     c.x[3] = hw;
+     c.x[4] = 1;
+     c.x[5] = 1;  // manual clear
+     call(c, attach);
+     for (int k = 0; k < 8; k++) c.x[k] = saved[k];
+     st<uint64_t>(out, 0xA0D10);  // opaque
+     static std::once_flag once;
+     std::call_once(once, [] { std::thread(player).detach(); });
+     c.x[0] = 0;
+ }
+
+ void StartAudioOut(CPU& c) {
+     std::lock_guard lk(g_out.lock);
+     g_out.started = true;
+     g_out.cv.notify_all();
+     c.x[0] = 0;
+ }
+
+ void StopAudioOut(CPU&) {
+     std::lock_guard lk(g_out.lock);
+     g_out.started = false;
+ }
+
+ void CloseAudioOut(CPU&) {}
+
+ void SetAudioOutBufferInfo(CPU& c) {  // (AudioOutBuffer*, void* data, size_t capacity, size_t size)
+     st<uint64_t>(c.x[0], c.x[1]);
+     st<uint64_t>(c.x[0] + 8, c.x[2]);
+     st<uint64_t>(c.x[0] + 16, c.x[3]);
+ }
+
+ void GetAudioOutBufferDataPointer(CPU& c) { c.x[0] = ld<uint64_t>(c.x[0]); }
+
+ void AppendAudioOutBuffer(CPU& c) {  // (AudioOut*, AudioOutBuffer*)
+     std::lock_guard lk(g_out.lock);
+     g_out.queued.push_back(c.x[1]);
+     g_out.cv.notify_all();
+     c.x[0] = 1;  // bool: appended
+ }
+
+ void GetReleasedAudioOutBuffer(CPU& c) {
+     std::lock_guard lk(g_out.lock);
+     if (g_out.released.empty()) {
+         c.x[0] = 0;
+         return;
+     }
+     c.x[0] = g_out.released.front();
+     g_out.released.pop_front();
+-    if (g_out.released.empty()) g_out.event->signaled = false;
++    if (g_out.released.empty()) event_clear(g_out.event);
+ }
+
+ void ListAudioIns(CPU& c) { c.x[0] = 0; }
+ void audio_in_fail(CPU& c) { c.x[0] = (1u << 9) | 153u; }  // audio: not found
+ void zero(CPU& c) { c.x[0] = 0; }
+
+ // SDK 16 (Super Mario Bros. Wonder): the AudioRenderer. The sdk carries the renderer's server side too and can
+ // reach it in process ("direct function call") instead of over IPC to audren:u: hand out that one.
+ // Both return nn::sf::SharedPointer<IAudioRendererManager> through x8.
+ void CreateAudioRendererManagerByHipc(CPU& c) {
+     static uint64_t dfc = find_symbol("_ZN2nn5audio31CreateAudioRendererManagerByDfcEv");
+     if (!dfc) fatal("CreateAudioRendererManagerByDfc not found");
+     log("audio: AudioRenderer manager in process (DFC) instead of audren:u");
+     call(c, dfc);
+ }
+
+ // The AudioRenderer, in process (DFC). On the console the ADSP renders one audio frame every 5 ms and signals the
+ // renderer's system event, which paces the game's sound thread. In process nothing does that on its own: the
+ // renderer object (AudioRendererManagerImpl::AudioRendererImpl) has ExecuteAudioRendererRendering, which generates
+ // the frame's commands and runs the sdk's own DSP command processor on the calling thread, and its render system
+ // (impl + 0x60) signals its own event, which has no kernel object in process. A guest thread of ours renders every
+ // 5 ms and signals the game's event itself, then sends the frame's final mix to the host device.
+ constexpr uint64_t kRendererVtable = 0xd04910;     // sdk: vtable of the sf object wrapping AudioRendererImpl
+ constexpr uint64_t kExecuteRendering = 0x20cac8;   // sdk: AudioRendererImpl::ExecuteAudioRendererRendering
+
+ // The in-process render system hands the client a readable handle of 0 for the renderer's event (there is no
+ // kernel event behind it), so the SystemEvent the game waits on is ours: an InterProcessEventType keeps its
+ // readable handle at +0x14 and its writable one at +0x18 (nn::os::detail::WaitInterProcessEvent, sdk+1305a0).
+ std::shared_ptr<EventState> g_audio_frame = std::make_shared<EventState>();
+
+ std::mutex g_renderers_lock;
+ std::vector<uint64_t> g_renderers;  // AudioRendererImpl*
+
+ uint64_t sdk_base() {
+     static uint64_t base = [] {
+         const LoadedModule* m = module_at(find_symbol("nvnBootstrapLoader"));
+         return m ? m->base : 0;
+     }();
+     return base;
+ }
+
+ // The AudioRendererImpl behind an AudioRendererHandle: an sf object whose vtable pointer is that one, within two
+ // pointer hops of the handle.
+ uint64_t find_renderer(uint64_t handle) {
+     uint64_t vptr = sdk_base() + kRendererVtable + 0x10;
+     auto valid = [](uint64_t p) { return p >= kModuleBase && p < kKernelBase + kKernelSize && (p & 7) == 0; };
+     for (uint64_t a = 0; a < 0x40; a += 8) {
+         uint64_t p = ld<uint64_t>(handle + a);
+         if (!valid(p)) continue;
+         if (ld<uint64_t>(p) == vptr) return p + 0x10;
+         for (uint64_t b = 0; b < 0x40; b += 8) {
+             uint64_t q = ld<uint64_t>(p + b);
+             if (valid(q) && ld<uint64_t>(q) == vptr) return q + 0x10;
+         }
+     }
+     return 0;
+ }
+
+ // ---- the renderer's final mix to the host device ----
+ // The command list ends with a DeviceSink command (id 19) naming the final mix's buffers, but the sdk's DSP command
+ // processor skips it: on the console the ADSP's sink stage hands those buffers to the output device. So
+ // CommandListProcessor::Process is wrapped: after the real one has run the list, the sink's input mix buffers (s32
+ // samples in the PCM16 range, one buffer per channel) are summed into g_render.mix; the render thread converts each
+ // 5 ms frame to s16 stereo and queues it on the device. Command header: {u32 magic 0xcafebabe; u8 enabled; s8 id;
+ // s16 size; u32 estimated time}. DeviceSink (CommandBuffer::Generate<DeviceSink>, sdk+211e10): +0x128 the mix
+ // buffers (or the upsampler's), +0x130 input count, +0x134 s16 buffer index per input.
+ constexpr uint8_t kCmdDownMix6chTo2ch = 17, kCmdDeviceSink = 19;
+ constexpr int kFrame = 240;          // samples per 5 ms at 48 kHz
+ constexpr int kBlocks = 64;          // 320 ms of output blocks
+ constexpr uint32_t kMaxQueued = 12;  // 60 ms in the device queue: past that, frames are dropped
+ constexpr size_t kPrime = 4;         // after an underrun, 20 ms are gathered before playing again
+
+ struct RenderOut {
+     std::mutex lock;
+     int32_t mix[kFrame * 2] = {};
+     bool mixed = false;
+     int16_t blocks[kBlocks][kFrame * 2];
+     std::vector<int> free, held;
+     bool priming = true;
+     // statistics since the last log, and the optional dump (NX_AUDIO_DUMP=file.wav: 10 s from the first sound)
+     uint64_t frames = 0, dropped = 0, underruns = 0, silent = 0;
+     double sum_sq = 0;
+     int peak = 0;
+     std::vector<int16_t> dump;
+     RenderOut() {
+         for (int k = kBlocks - 1; k >= 0; k--) free.push_back(k);
+     }
+ };
+ RenderOut g_render;
+
+ bool render_owns(void* ctx) {
+     auto p = static_cast<const uint8_t*>(ctx), b = reinterpret_cast<const uint8_t*>(g_render.blocks);
+     return p >= b && p < b + sizeof g_render.blocks;
+ }
+
+ void render_block_done(void* ctx) {
+     std::lock_guard lk(g_render.lock);
+     g_render.free.push_back(int((static_cast<int16_t*>(ctx) - g_render.blocks[0]) / (kFrame * 2)));
+ }
+
+ void capture_device_sink(uint64_t proc) {  // proc: nn::audio::dsp::CommandListProcessor after Process
+     uint64_t cmd = ld<uint64_t>(proc) + 0x20;  // the list header, then the commands (+8 is the cursor: at the end)
+     uint32_t count = ld<uint32_t>(proc + 0x1c), samples = ld<uint32_t>(proc + 0x20), rate = ld<uint32_t>(proc + 0x28);
+     uint32_t frames = rate == 48000 ? samples : kFrame;  // other rates: the upsampler's 48 kHz buffers
+     bool downmixed = false;
+     for (uint32_t i = 0; i < count && ld<uint32_t>(cmd) == 0xcafebabe; i++, cmd += ld<int16_t>(cmd + 6)) {
+         if (!ld<uint8_t>(cmd + 4)) continue;
+         uint8_t id = ld<uint8_t>(cmd + 5);
+         if (id == kCmdDownMix6chTo2ch) downmixed = true;
+         if (id != kCmdDeviceSink) continue;
+         uint64_t buffers = ld<uint64_t>(cmd + 0x128);
+         uint32_t inputs = ld<uint32_t>(cmd + 0x130);
+         static bool once = false;
+         if (!once) {
+             once = true;
+             log("audio: device sink '%s', %u inputs%s, %u samples at %u Hz", reinterpret_cast<const char*>(cmd + 0x20),
+                 inputs, downmixed ? " (downmixed to stereo)" : "", samples, rate);
+         }
+         if (!buffers || !inputs || frames != kFrame) continue;
+         auto ch = [&](uint32_t k) {
+             return reinterpret_cast<const int32_t*>(buffers + uint64_t(ld<int16_t>(cmd + 0x134 + 2 * k)) * frames * 4);
+         };
+         const int32_t* l = ch(0);
+         const int32_t* r = inputs > 1 ? ch(1) : l;
+         // Six channels without the sdk's own downmix (FL FR FC LFE RL RR): fold them to stereo here.
+         const int32_t *c = nullptr, *rl = nullptr, *rr = nullptr;
+         if (inputs >= 6 && !downmixed) c = ch(2), rl = ch(4), rr = ch(5);
+         std::lock_guard lk(g_render.lock);
+         for (int s = 0; s < kFrame; s++) {
+             int64_t a = l[s], b = r[s];
+             if (c) {
+                 a += (int64_t(c[s]) + rl[s]) * 707 / 1000;
+                 b += (int64_t(c[s]) + rr[s]) * 707 / 1000;
+             }
+             g_render.mix[2 * s] += int32_t(std::clamp<int64_t>(a, INT32_MIN, INT32_MAX));
+             g_render.mix[2 * s + 1] += int32_t(std::clamp<int64_t>(b, INT32_MIN, INT32_MAX));
+         }
+         g_render.mixed = true;
+     }
+ }
+
+ // AudioRenderSystem::Update (the game's RequestUpdate) takes the render system's mutex, but GenerateCommand runs
+ // without it: on the console both run on the audio system's side, one after the other. Here the game's sound thread
+ // updates while our render thread generates, and an effect being updated mid-generation crashed
+ // (EffectContext::UpdateStateByDspShared on a null effect). Both are serialized by this lock.
+ std::mutex g_render_system;
+
+ // One update per rendered frame, as on the console: an update copies the game's parameters and a new effect's
+ // "initialize" status rides on exactly one of them. Our render thread signals the game's audio event every 5 ms
+ // whether or not it rendered since the last update, so a sound thread that fell behind updated twice in a row, the
+ // second update overwrote the status, and the next render applied a LightLimiter whose state was never initialized
+ // (null pointers in ApplyLightLimiterEffect, an intermittent crash at startup; docs/nvn/DEBUG.md #28). An update
+ // now waits (at most 1 s, outside the lock) until a render ran since the previous one.
+ std::mutex g_pace_lock;
+ std::condition_variable g_pace_cv;
+ uint64_t g_renders = 0, g_renders_at_update = ~0ull;
+
+ void AudioRenderSystemUpdate(CPU& c) {
+     static uint64_t real = find_symbol("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm");
+     {
+         std::unique_lock pk(g_pace_lock);
+         static uint64_t waited = 0;
+         if (g_renders == g_renders_at_update && waited++ < 5) log("audio: update waits for a render");
+         // 1 s, not 50 ms: at boot, with every thread loading, a render took longer and the second update went through
+         // (the limiter crash again, once in ~25 Windows runs). The render thread runs every 5 ms: 1 s only bounds a stall.
+         if (!g_pace_cv.wait_for(pk, std::chrono::seconds(1), [] { return g_renders != g_renders_at_update; }))
+             log("audio: no render for 1 s since the last update: updating anyway");
+     }
+     std::lock_guard lk(g_render_system);
+     call(c, real);
+     // Counted after the update, under the render lock (renders count themselves under it too): a render that began
+     // before this update and ended after it no longer passes for one that used it (the limiter crash, DEBUG-2 #74).
+     std::lock_guard pk(g_pace_lock);
+     g_renders_at_update = g_renders;
+ }
+
+ void CommandListProcessorProcess(CPU& c) {
+     static uint64_t real = find_symbol("_ZN2nn5audio3dsp20CommandListProcessor7ProcessEv");
+     uint64_t proc = c.x[0];
+     call(c, real);
+     capture_device_sink(proc);
+ }
+
+ void write_wav(const char* path, const std::vector<int16_t>& pcm) {
+     FILE* f = std::fopen(path, "wb");
+     if (!f) return;
+     auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+     auto u16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, f); };
+     uint32_t bytes = uint32_t(pcm.size() * 2);
+     std::fwrite("RIFF", 1, 4, f), u32(36 + bytes), std::fwrite("WAVEfmt ", 1, 8, f);
+     u32(16), u16(1), u16(2), u32(48000), u32(48000 * 4), u16(4), u16(16);
+     std::fwrite("data", 1, 4, f), u32(bytes), std::fwrite(pcm.data(), 2, pcm.size(), f);
+     std::fclose(f);
+     log("audio: wrote %s (%zu frames)", path, pcm.size() / 2);
+ }
+
+ // Called by the render thread after each 5 ms frame.
+ void render_submit() {
+     static const bool device = device_open();
+     static const char* dump_path = std::getenv("NX_AUDIO_DUMP");
+     std::lock_guard lk(g_render.lock);
+     RenderOut& o = g_render;
+     if (!o.mixed) return;
+     o.mixed = false;
+     int16_t pcm[kFrame * 2];
+     bool any = false;
+     for (int s = 0; s < kFrame * 2; s++) {
+         int v = std::clamp(o.mix[s], -32768, 32767);
+         pcm[s] = int16_t(v);
+         o.mix[s] = 0;
+         o.peak = std::max(o.peak, std::abs(v));
+         o.sum_sq += double(v) * v;
+         any |= v != 0;
+     }
+     o.silent += !any;
+     if (dump_path && o.dump.size() < 48000 * 2 * 10 && (any || !o.dump.empty())) {
+         o.dump.insert(o.dump.end(), pcm, pcm + kFrame * 2);
+         if (o.dump.size() >= 48000 * 2 * 10) write_wav(dump_path, o.dump);
+     }
+     if (++o.frames % 2000 == 0) {
+         log("audio: mix out: peak %d, rms %.0f, %llu of 2000 frames silent, %llu dropped, %llu underruns, queue %u",
+             o.peak, std::sqrt(o.sum_sq / (2000.0 * kFrame * 2)), (unsigned long long)o.silent,
+             (unsigned long long)o.dropped, (unsigned long long)o.underruns, device ? plat::audio_queued() : 0);
+         o.peak = 0, o.sum_sq = 0, o.silent = o.dropped = o.underruns = 0;
+     }
+     if (!device) return;
+     uint32_t queued = plat::audio_queued();
+     if (queued + o.held.size() >= kMaxQueued || o.free.empty()) {  // the device fell behind: keep latency bounded
+         o.dropped++;
+         return;
+     }
+     if (queued == 0 && !o.priming) o.priming = true, o.underruns++;
+     int k = o.free.back();
+     o.free.pop_back();
+     std::memcpy(o.blocks[k], pcm, sizeof pcm);
+     o.held.push_back(k);
+     if (o.priming && o.held.size() < kPrime) return;
+     o.priming = false;
+     for (int h : o.held) plat::audio_submit(o.blocks[h], sizeof pcm, o.blocks[h]);
+     o.held.clear();
+ }
+
+ void audio_render_thread(CPU& c) {
+     log("audio: render thread running");
+     uint64_t next = plat::monotonic_ns();
+     for (;;) {
+         next += 5'000'000;
+         int64_t wait = int64_t(next - plat::monotonic_ns());
+         if (wait > 0) plat::sleep_ns(wait);
+         std::vector<uint64_t> list;
+         {
+             std::lock_guard lk(g_renderers_lock);
+             list = g_renderers;
+         }
+         static uint64_t frames = 0, busy_ns = 0, last_rc = 0;
+         uint64_t t0 = plat::monotonic_ns();
+         for (uint64_t impl : list) {
+             uint64_t saved[31];
+             std::memcpy(saved, c.x, sizeof saved);
+             c.x[0] = impl;
+             std::lock_guard lk(g_render_system);
+             call(c, sdk_base() + kExecuteRendering);
+             last_rc = c.x[0];
+             std::memcpy(c.x, saved, sizeof saved);
+             std::lock_guard pk(g_pace_lock);  // counted under the render lock (AudioRenderSystemUpdate)
+             g_renders++;
+             g_pace_cv.notify_all();
+         }
+         busy_ns += plat::monotonic_ns() - t0;
+         render_submit();
+         if (++frames % 2000 == 0)
+             log("audio: %llu frames rendered, %.1f us each, last result %llx", (unsigned long long)frames,
+                 double(busy_ns) / 1000.0 / 2000.0, (unsigned long long)last_rc), busy_ns = 0;
+-        g_audio_frame->signaled = true;
+-        notify_all();
++        event_signal(g_audio_frame);
+     }
+ }
+
+ void start_render_thread(CPU& c) {
+     uint64_t create = find_symbol("_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mi");
+     uint64_t start = find_symbol("_ZN2nn2os11StartThreadEPNS0_10ThreadTypeE");
+     if (!create || !start) {
+         log("audio: nn::os::CreateThread/StartThread not found, no render thread");
+         return;
+     }
+     uint64_t thread = kernel_alloc(0x1000), stack = kernel_alloc(0x40000);
+     uint64_t saved[31];
+     std::memcpy(saved, c.x, sizeof saved);
+     c.x[0] = thread, c.x[1] = hle_address("__audio_render_thread"), c.x[2] = 0, c.x[3] = stack, c.x[4] = 0x40000;
+     c.x[5] = 16;  // high priority, like the audio system's own threads
+     call(c, create);
+     uint64_t rc = c.x[0];
+     c.x[0] = thread;
+     if (rc == 0) call(c, start);
+     std::memcpy(c.x, saved, sizeof saved);
+     if (rc) log("audio: CreateThread failed (%llx)", (unsigned long long)rc);
+ }
+
+ // OpenAudioRenderer(AudioRendererHandle*, os::SystemEvent*, const AudioRendererParameter&, void* work, size_t)
+ void OpenAudioRenderer(CPU& c) {
+     static uint64_t real = find_symbol(
+         "_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm");
+     uint64_t handle = c.x[0], sysev = c.x[1];
+     call(c, real);
+     if (c.x[0] == 0 && ld<uint32_t>(sysev + 0x14) == 0) {
+-        auto r = std::make_shared<KEvent>(), w = std::make_shared<KEvent>();
+-        r->state = w->state = g_audio_frame;
++        auto r = std::make_shared<KEvent>(EventEndpoint::Readable, g_audio_frame);
++        auto w = std::make_shared<KEvent>(EventEndpoint::Writable, g_audio_frame);
+         st<uint32_t>(sysev + 0x14, handle_add(r));
+         st<uint32_t>(sysev + 0x18, handle_add(w));
+     }
+     uint64_t rc = c.x[0];
+     uint64_t impl = rc == 0 ? find_renderer(handle) : 0;
+     log("audio: renderer opened (result %llx), impl %llx", (unsigned long long)rc, (unsigned long long)impl);
+     if (!impl) return;
+     // ExecuteAudioRendererRendering only renders in the manual execution mode on the CPU rendering device
+     // (AudioRenderSystem::GetExecutionMode / GetRenderingDevice == 1, at render system + 0x2d0 / + 0x2d4); the game
+     // opens the renderer in the automatic mode, where the ADSP renders on its own. Our 5 ms thread is that ADSP, so
+     // the renderer is switched to manual/CPU; otherwise every call failed with 0x40299 and nothing was ever rendered
+     // (streamed music never advanced, and the opening cutscene waited for it forever).
+     uint64_t system = impl + 0x60;
+     log("audio: execution mode %u, rendering device %u -> 1, 1", ld<uint32_t>(system + 0x2d0), ld<uint32_t>(system + 0x2d4));
+     st<uint32_t>(system + 0x2d0, 1);
+     st<uint32_t>(system + 0x2d4, 1);
+     {
+         std::lock_guard lk(g_renderers_lock);
+         g_renderers.push_back(impl);
+     }
+     static bool started = false;
+     if (!started) {
+         started = true;
+         start_render_thread(c);
+     }
+     c.x[0] = rc;
+ }
+
+ // The audio device (output) side: one stereo output that never changes.
+ constexpr const char* kOutputName = "AudioTvOutput";
+
+ void AcquireAudioDeviceNotificationForOutput(CPU& c) {  // (os::SystemEvent*): an event that is never signaled
+-    auto w = std::make_shared<KEvent>(), r = std::make_shared<KEvent>();
+-    r->state = w->state = std::make_shared<EventState>();
++    auto state = std::make_shared<EventState>();
++    auto w = std::make_shared<KEvent>(EventEndpoint::Writable, state);
++    auto r = std::make_shared<KEvent>(EventEndpoint::Readable, state);
+     uint32_t hr = handle_add(r), hw = handle_add(w);
+     uint64_t attach = find_symbol("_ZN2nn2os17AttachSystemEventEPNS0_15SystemEventTypeEjbjbNS0_14EventClearModeE");
+     uint64_t saved[8];
+     for (int k = 0; k < 8; k++) saved[k] = c.x[k];
+     c.x[1] = hr, c.x[2] = 1, c.x[3] = hw, c.x[4] = 1, c.x[5] = 1;  // x0: the SystemEvent's SystemEventType
+     call(c, attach);
+     for (int k = 0; k < 8; k++) c.x[k] = saved[k];
+     c.x[0] = 0;
+ }
+
+ void ListAudioOutputDeviceName(CPU& c) {  // int (AudioDeviceName* names, int count): 256 chars each
+     if (int(c.x[1]) < 1) {
+         c.x[0] = 0;
+         return;
+     }
+     std::memset(reinterpret_cast<void*>(c.x[0]), 0, 256);
+     std::strcpy(reinterpret_cast<char*>(c.x[0]), kOutputName);
+     c.x[0] = 1;
+ }
+
+ void GetActiveAudioOutputDeviceName(CPU& c) {  // (AudioDeviceName*)
+     std::memset(reinterpret_cast<void*>(c.x[0]), 0, 256);
+     std::strcpy(reinterpret_cast<char*>(c.x[0]), kOutputName);
+     c.x[0] = 0;
+ }
+
+ void two(CPU& c) { c.x[0] = 2; }
+
+ }  // namespace
+
+ NX_HLE("_ZN2nn5audio39AcquireAudioDeviceNotificationForOutputEPNS_2os11SystemEventE", AcquireAudioDeviceNotificationForOutput);
+ NX_HLE("_ZN2nn5audio25ListAudioOutputDeviceNameEPNS0_15AudioDeviceNameEi", ListAudioOutputDeviceName);
+ NX_HLE("_ZN2nn5audio30GetActiveAudioOutputDeviceNameEPNS0_15AudioDeviceNameE", GetActiveAudioOutputDeviceName);
+ NX_HLE("_ZN2nn5audio26SetAudioDeviceOutputVolumeEPKNS0_15AudioDeviceNameEf", zero);
+ NX_HLE("_ZN2nn5audio41GetActiveAudioDeviceChannelCountForOutputEv", two);
+ NX_HLE("_ZN2nn5audio27InitializeAudioOutParameterEPNS0_17AudioOutParameterE", InitializeAudioOutParameter);
+ NX_HLE("_ZN2nn5audio19OpenDefaultAudioOutEPNS0_8AudioOutEPNS_2os11SystemEventERKNS0_17AudioOutParameterE", OpenDefaultAudioOut);
+ NX_HLE("_ZN2nn5audio13StartAudioOutEPNS0_8AudioOutE", StartAudioOut);
+ NX_HLE("_ZN2nn5audio12StopAudioOutEPNS0_8AudioOutE", StopAudioOut);
+ NX_HLE("_ZN2nn5audio13CloseAudioOutEPNS0_8AudioOutE", CloseAudioOut);
+ NX_HLE("_ZN2nn5audio21SetAudioOutBufferInfoEPNS0_14AudioOutBufferEPvmm", SetAudioOutBufferInfo);
+ NX_HLE("_ZN2nn5audio28GetAudioOutBufferDataPointerEPKNS0_14AudioOutBufferE", GetAudioOutBufferDataPointer);
+ NX_HLE("_ZN2nn5audio20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE", AppendAudioOutBuffer);
+ NX_HLE("_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE", GetReleasedAudioOutBuffer);
+ NX_HLE("_ZN2nn5audio12ListAudioInsEPNS0_11AudioInInfoEi", ListAudioIns);
+ NX_HLE("_ZN2nn5audio11OpenAudioInEPNS0_7AudioInEPKcRKNS0_16AudioInParameterE", audio_in_fail);
+ NX_HLE("_ZN2nn5audio26InitializeAudioInParameterEPNS0_16AudioInParameterE", zero);
+ NX_HLE("_ZN2nn5audio32CreateAudioRendererManagerByHipcEv", CreateAudioRendererManagerByHipc);
+ NX_HLE("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm", OpenAudioRenderer);
+ NX_HLE("__audio_render_thread", audio_render_thread);
+ NX_HLE("_ZN2nn5audio3dsp20CommandListProcessor7ProcessEv", CommandListProcessorProcess);
+ NX_HLE("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm", AudioRenderSystemUpdate);
+
+ }  // namespace nx
+diff --git a/runtime/src/svc_misc.cpp b/runtime/src/svc_misc.cpp
+--- a/runtime/src/svc_misc.cpp
++++ b/runtime/src/svc_misc.cpp
+@@ -1,64 +1,237 @@
+-// Small services that only need to answer "yes, fine": parental controls, add-on content, logging, power.
++// Miscellaneous services; Astral parental context and logging are validated adapters.
+ #include <cstdlib>
+ #include "ipc.h"
+
+ namespace nx {
+
+ namespace {
+
+ std::shared_ptr<Service> make(const char* name, std::function<void(Service&)> setup = {}) {
+     auto s = std::make_shared<Service>(name);
+     if (setup) setup(*s);
+     return s;
+ }
+
+-std::shared_ptr<Service> parental_control() {
+-    return make("IParentalControlService", [](Service& s) {
+-        s.cmds[1403] = [](IpcCtx& c) { c.push<uint8_t>(0); return 0u; };  // IsRestrictionEnabled
+-        s.cmds[1001] = [](IpcCtx&) { return 0u; };                          // CheckFreeCommunicationPermission
+-    });
++// Initialize is application-context loading, not an account/permission decision.
++// No pairing, user restriction settings or network permission is synthesized.
++struct ParentalState {
++    const uint64_t pid;
++    const std::shared_ptr<const ControlMetadata> metadata;
++    bool initialized = false;
++    explicit ParentalState(uint64_t caller) : pid(caller), metadata(process_control_metadata(caller)) {
++        if (!metadata || !metadata->application_id || metadata->program_id != metadata->application_id ||
++            (metadata->parental_flags & ~1u) || !metadata->receipt_sha256 ||
++            std::strlen(metadata->receipt_sha256) != 64)
++            fatal("parental: missing or unsupported process control metadata");
++    }
++    void caller(IpcCtx& c) const {
++        if (c.authenticated_pid() != pid || process_control_metadata(pid) != metadata)
++            fatal("parental: caller does not own bound application context");
++    }
++    void initialize(IpcCtx& c) {
++        caller(c);
++        if (c.in_size || !c.a.empty() || !c.b.empty() || !c.x.empty() || !c.c.empty() ||
++            !c.in_objects.empty() || !c.in_copy.empty() || !c.in_move.empty())
++            fatal("parental: unsupported Initialize payload");
++        load();
++    }
++    void load() {
++        if (initialized) fatal("parental: repeated Initialize unsupported");
++        initialized = true;
++        log("parental: Initialize loaded authenticated application context pid=%llu program=%016llX flags=%u; account policy unknown",
++            (unsigned long long)pid, (unsigned long long)metadata->program_id, metadata->parental_flags);
++    }
++};
++std::shared_ptr<Service> parental_control(IpcCtx& factory, bool initialize) {
++    if (!factory.has_pid_descriptor() || !factory.pid() || factory.pid() != factory.authenticated_pid() ||
++        factory.in_size != 8 || factory.arg<uint64_t>(0) != 0 ||
++        !factory.a.empty() || !factory.b.empty() || !factory.x.empty() || !factory.c.empty() ||
++        !factory.in_objects.empty() || !factory.in_copy.empty() || !factory.in_move.empty())
++        fatal("parental: factory requires authenticated PID and reserved-zero argument");
++    auto state = std::make_shared<ParentalState>(factory.pid());
++    auto service = make("IParentalControlService");
++    service->cmds[1] = [state](IpcCtx& c) { state->initialize(c); return 0u; };
++    // These previously returned blanket success/false. Their account-backed
++    // semantics remain unknown; keep the exact boundary visible.
++    for (uint32_t command : {1001u, 1403u})
++        service->cmds[command] = [state](IpcCtx& c) -> uint32_t {
++            state->caller(c);
++            if (!state->initialized) fatal("parental: service not initialized");
++            fatal("parental: account policy unavailable command=%u", c.cmd);
++        };
++    if (initialize) {
++        // Legacy CreateService loads the same context immediately.
++        state->caller(factory);
++        state->load();
++    }
++    return service;
+ }
+
+ void pctl(Service& s) {
+-    s.cmds[0] = [](IpcCtx& c) { c.push_object(parental_control()); return 0u; };  // CreateService
+-    s.cmds[1] = [](IpcCtx& c) { c.push_object(parental_control()); return 0u; };  // CreateServiceWithoutInitialize
++    s.cmds[0] = [](IpcCtx& c) { c.push_object(parental_control(c, true)); return 0u; };
++    s.cmds[1] = [](IpcCtx& c) { c.push_object(parental_control(c, false)); return 0u; };
+ }
+
+ ServiceRegistrar r_pctl("pctl", [] { return make("pctl", pctl); });
+ ServiceRegistrar r_pctl_s("pctl:s", [] { return make("pctl:s", pctl); });
+ ServiceRegistrar r_pctl_a("pctl:a", [] { return make("pctl:a", pctl); });
+ ServiceRegistrar r_pctl_r("pctl:r", [] { return make("pctl:r", pctl); });
+
++// ILogger uses a bounded process-private memory sink. Payload is never formatted,
++// written to a host file, or interpreted as a format string. IPC serializes access.
++// Invalid/unsupported contracts are adapter fatals, not invented Horizon results.
++struct LoggerState {
++    static constexpr size_t kLimit = 64 * 1024, kStreams = 16;
++    struct Message { uint8_t severity, verbosity; std::vector<uint8_t> data; };
++    const uint64_t pid;
++    const std::shared_ptr<const ControlMetadata> owner;
++    std::map<uint64_t, Message> pending;
++    std::vector<Message> sink;
++    size_t pending_bytes = 0, sink_bytes = 0;
++    uint64_t packets = 0, messages = 0, evicted = 0;
++    explicit LoggerState(uint64_t p) : pid(p), owner(process_control_metadata(p)) {
++        if (!pid || !owner) fatal("logger: missing live process");
++    }
++    static uint64_t le(const uint8_t* p, size_t n) {
++        uint64_t v = 0;
++        for (size_t i = 0; i < n; ++i) v |= uint64_t(p[i]) << (8 * i);
++        return v;
++    }
++    static void chunks(const std::vector<uint8_t>& data, bool tail) {
++        size_t offset = 0;
++        // Metadata may be split over packets. Incomplete non-tail data is kept,
++        // but all already decidable overflow/unknown-key errors fail immediately.
++        auto uleb = [&](uint64_t& value) {
++            value = 0;
++            for (unsigned n = 0; n < 10; ++n) {
++                if (offset == data.size()) return false;
++                uint8_t byte = data[offset++];
++                if (n == 9 && (byte & 0xfe)) fatal("logger: ULEB128 overflow");
++                value |= uint64_t(byte & 0x7f) << (7 * n);
++                if (!(byte & 0x80)) return true;
++            }
++            fatal("logger: ULEB128 overflow");
++        };
++        while (offset < data.size()) {
++            uint64_t key, length;
++            if (!uleb(key)) { if (tail) fatal("logger: truncated chunk key"); return; }
++            if (key > 10) fatal("logger: unsupported chunk key");
++            if (!uleb(length)) { if (tail) fatal("logger: truncated chunk size"); return; }
++            if (length > kLimit) fatal("logger: chunk exceeds limit");
++            if (length > data.size() - offset) {
++                if (tail) fatal("logger: truncated chunk data");
++                return;
++            }
++            offset += size_t(length);
++        }
++    }
++    uint32_t consume(IpcCtx& c) {
++        if (c.authenticated_pid() != pid || process_control_metadata(pid) != owner)
++            fatal("logger: caller does not own logger");
++        if (c.in_size || !c.b.empty() || !c.c.empty() || !c.w.empty() ||
++            !c.in_objects.empty() || !c.in_copy.empty() || !c.in_move.empty() || c.has_pid_descriptor() ||
++            c.a.size() > 1 || c.x.size() > 1)
++            fatal("logger: unsupported Log request");
++        // Auto-select permits an inactive all-zero A or X placeholder, but only
++        // one active descriptor. Never silently prefer one of two live buffers.
++        Buffer buffer; unsigned active = 0;
++        for (const auto* list : {&c.a, &c.x}) for (const auto& b : *list) {
++            if (!b.addr && !b.size) continue;
++            if (!b.addr || !b.size) fatal("logger: invalid buffer descriptor");
++            buffer = b; ++active;
++        }
++        if (active != 1 || buffer.size < 24 || buffer.size > kLimit ||
++            buffer.addr > ~uint64_t(0) - buffer.size)
++            fatal("logger: invalid packet extent");
++        // Check every covered VM block before dereferencing any guest byte.
++        const uint64_t end = buffer.addr + buffer.size;
++        for (uint64_t at = buffer.addr; at < end;) {
++            auto v = vm_query(at);
++            if (!(v.perm & 1) || v.addr > at || !v.size || v.addr > ~uint64_t(0) - v.size ||
++                v.addr + v.size <= at)
++                fatal("logger: unreadable packet buffer");
++            at = std::min(end, v.addr + v.size);
++        }
++        std::vector<uint8_t> packet(buffer.size);
++        std::memcpy(packet.data(), reinterpret_cast<const void*>(buffer.addr), packet.size());
++        const auto* h = packet.data();
++        const uint8_t flags = h[16], severity = h[18], verbosity = h[19];
++        if ((flags & ~7u) || !(flags & 4) || h[17] || severity > 4)
++            fatal("logger: unsupported packet header");
++        if (le(h + 20, 4) != packet.size() - 24) fatal("logger: packet length mismatch");
++        const uint64_t thread = le(h + 8, 8);
++        // Header PID is untrusted. Binding comes exclusively from OpenLogger.
++        const bool head = flags & 1, tail = flags & 2;
++        auto it = pending.find(thread);
++        if ((head && it != pending.end()) || (!head && it == pending.end()))
++            fatal("logger: invalid packet sequence");
++        if (head && pending.size() >= kStreams) fatal("logger: stream limit");
++        Message next = head ? Message{severity, verbosity, {}} : it->second;
++        if (next.severity != severity || next.verbosity != verbosity)
++            fatal("logger: continuation metadata mismatch");
++        const size_t added = packet.size() - 24;
++        if (added > kLimit - pending_bytes || added > kLimit - next.data.size())
++            fatal("logger: message memory limit");
++        next.data.insert(next.data.end(), packet.begin() + 24, packet.end());
++        chunks(next.data, tail);  // No state or counters change on validation error.
++        if (tail) {
++            while (!sink.empty() && (sink_bytes + next.data.size() > kLimit || sink.size() >= 64)) {
++                sink_bytes -= sink.front().data.size(); sink.erase(sink.begin()); ++evicted;
++            }
++            if (it != pending.end()) { pending_bytes -= it->second.data.size(); pending.erase(it); }
++            sink_bytes += next.data.size(); sink.push_back(std::move(next)); ++messages;
++        } else {
++            pending_bytes += added; pending[thread] = std::move(next);
++        }
++        ++packets;
++        if (g_trace) log("logger: accepted packet bytes=%llu flags=%u packets=%llu messages=%llu evicted=%llu",
++            (unsigned long long)buffer.size, flags, (unsigned long long)packets,
++            (unsigned long long)messages, (unsigned long long)evicted);
++        return 0u;
++    }
++};
++
++std::shared_ptr<Service> open_logger(IpcCtx& c) {
++    if (!c.has_pid_descriptor() || !c.pid() || c.pid() != c.authenticated_pid() || c.in_size != 8 ||
++        !c.a.empty() || !c.b.empty() || !c.x.empty() || !c.c.empty() || !c.w.empty() ||
++        !c.in_objects.empty() || !c.in_copy.empty() || !c.in_move.empty())
++        fatal("logger: OpenLogger requires authenticated PID");
++    // ClientProcessId's raw u64 is not an authorization source.
++    auto state = std::make_shared<LoggerState>(c.pid());
++    auto logger = make("ILogger");
++    logger->cmds[0] = [state](IpcCtx& request) { return state->consume(request); };
++    return logger;
++}
++
+ ServiceRegistrar r_lm("lm", [] {
+     return make("lm", [](Service& s) {
+-        s.cmds[0] = [](IpcCtx& c) { c.push_object(make("ILogger")); return 0u; };  // OpenLogger
++        s.cmds[0] = [](IpcCtx& c) { c.push_object(open_logger(c)); return 0u; };  // OpenLogger
+     });
+ });
+
+ ServiceRegistrar r_apm("apm", [] {
+     return make("apm", [](Service& s) {
+         s.cmds[0] = [](IpcCtx& c) { c.push_object(make("ISession")); return 0u; };  // OpenSession
+         s.cmds[1] = [](IpcCtx& c) {  // GetPerformanceMode: boost (docked), normal with NX_HANDHELD (svc_am.cpp)
+             c.push<uint32_t>(std::getenv("NX_HANDHELD") ? 0 : 1);
+             return 0u;
+         };
+     });
+ });
+
+ ServiceRegistrar r_aoc("aoc:u", [] {
+     return make("aoc:u", [](Service& s) {
+         s.cmds[2] = [](IpcCtx& c) { c.push<uint32_t>(0); return 0u; };  // CountAddOnContent (old)
+         s.cmds[3] = [](IpcCtx& c) { c.push<uint32_t>(0); return 0u; };  // ListAddOnContent (old)
+         s.cmds[7] = [](IpcCtx& c) { c.push<uint32_t>(0); return 0u; };
+         s.cmds[8] = [](IpcCtx& c) {                                       // GetAddOnContentListChangedEvent
+-            auto e = std::make_shared<KEvent>();
+-            e->state = std::make_shared<EventState>();
++            auto e = std::make_shared<KEvent>(EventEndpoint::Readable, std::make_shared<EventState>());
+             c.out_copy.push_back(handle_add(e));
+             return 0u;
+         };
+     });
+ });
+
+ }  // namespace
+
+ }  // namespace nx

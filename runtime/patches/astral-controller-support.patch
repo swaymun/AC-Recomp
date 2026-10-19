@@ -1,0 +1,61 @@
+diff --git a/runtime/src/hle_hid.cpp b/runtime/src/hle_hid.cpp
+--- a/runtime/src/hle_hid.cpp
++++ b/runtime/src/hle_hid.cpp
+@@ -142,6 +142,40 @@
+ void zero(CPU& c) { c.x[0]=0; }
+ void noop(CPU&) {} // Initialization of explicitly absent raw devices only.
+ void unsupported(CPU&) { fatal("hid: unsupported host capability: %s",hle_current_name()); }
++// Pinned SDK 0x24f230: argument storage 0x21c; result info is 8 bytes.
++// This is an automatic check of the existing logical FullKey endpoint, not a UI.
++// SDK core returns 0x183aca on applet failure; no user cancellation is invented.
++constexpr uint32_t kControllerSupportUnavailable = 0x183aca;
++void ControllerSupport(CPU& c, bool with_result) {
++    std::lock_guard lk(hid_lock); require_init();
++    const uint64_t out = with_result ? c.x[0] : 0;
++    const uint64_t arg = c.x[with_result ? 1 : 0];
++    require_memory(arg,0x21c,1);
++    if (with_result) require_memory(out,8,2);
++    // Snapshot first: even an overlapping output cannot change validation.
++    std::array<uint8_t,0x21c> a{};
++    std::memcpy(a.data(),reinterpret_cast<const void*>(arg),a.size());
++    const int minimum=int8_t(a[0]), maximum=int8_t(a[1]);
++    if(minimum<0 || minimum>4 || maximum<1 || maximum>4 || minimum>maximum)
++        fatal("hid: malformed controller support player range");
++    for(unsigned i=2;i<=6;i++)
++        if(a[i]>1) fatal("hid: malformed controller support flag");
++    if(a[23]>1) fatal("hid: malformed controller support text flag");
++    // A one-player existing endpoint needs no connection takeover, reassignment,
++    // extra controller, rendered explanation/color UI or selection dialog.
++    // Multiple-player ranges and disabled takeover need an unavailable applet.
++    const bool eligible = connected(0) && minimum<=1 && maximum==1 &&
++        a[2]==1 && a[6]==0 && a[23]==0;
++    log("hid: controller support logical FullKey policy min=%d max=%d takeover=%u single=%u connected=%u result=%#x",
++        minimum,maximum,a[2],a[5],unsigned(connected(0)),eligible?0:kControllerSupportUnavailable);
++    if(eligible && with_result) {
++        std::array<uint8_t,8> result{}; result[0]=1; // existing No1, id 0
++        std::memcpy(reinterpret_cast<void*>(out),result.data(),result.size());
++    }
++    c.x[0]=eligible?0:kControllerSupportUnavailable;
++}
++void ShowControllerSupportArg(CPU& c) { ControllerSupport(c,false); }
++void ShowControllerSupportResult(CPU& c) { ControllerSupport(c,true); }
+ void BindNpadStyleSetUpdateEvent(CPU&) {
+     // Host API has no connection-change notification source. Do not fabricate a signalled event.
+     fatal("hid: host style update event unavailable");
+@@ -159,7 +193,7 @@
+ NX_HLE("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", zero);
+ NX_HLE("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", unsupported);
+ NX_HLE("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", unsupported);
+-NX_HLE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE", unsupported);
++NX_HLE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE", ShowControllerSupportResult);
+ // SDK 16 (Super Mario Bros. Wonder)
+ NX_HLE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj", GetNpadStates);
+ NX_HLE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj", GetNpadStates);
+@@ -190,6 +224,6 @@
+ NX_HLE("_ZN2nn3hid21InitializeTouchScreenEv", noop);
+ NX_HLE("_ZN2nn3hid19GetTouchScreenStateILm16EEEvPNS0_16TouchScreenStateIXT_EEE", NoRawDeviceState);
+ NX_HLE("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", unsupported);
+-NX_HLE("_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE", unsupported);
++NX_HLE("_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE", ShowControllerSupportArg);
+
+ }  // namespace nx

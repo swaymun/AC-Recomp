@@ -1,0 +1,29 @@
+diff --git a/recomp/emit_neon.py b/recomp/emit_neon.py
+index 62354bf..f12fd91 100644
+--- a/recomp/emit_neon.py
++++ b/recomp/emit_neon.py
+@@ -209,6 +209,24 @@ class NeonOps:
+         bits = self.vinfo(ops[0])[0]
+         return self.v_bin(i, ops, f"nx::sat<int{bits}_t>((int64_t(a) * int64_t(b) * 2) >> {bits})", signed=True)
+
++    def i_sqshl(self, f, i, ops):
++        # Observed scope only: AdvSIMD vector register SQSHL, 4S arrangement.
++        # Reject all other forms so the emitter retains its fatal trap path.
++        if (len(ops) != 3 or any(o.type != A.ARM64_OP_REG or
++                o.vas != A.ARM64_VAS_4S or o.vector_index != -1 for o in ops)):
++            raise Unhandled("sqshl requires vector register 4S")
++        d, n, m = [self.regop(i, o) for o in ops]
++        return (f"{{ nx::V128 S = c.v[{n.n}], T = c.v[{m.n}]; "
++                "nx::V128 r = nx::vzero(); for (int k = 0; k < 4; k++) { "
++                "int shift = int(T.u32[k] & 255u); if (shift >= 128) shift -= 256; "
++                "int64_t a = S.s32[k], v; "
++                "if (shift < 0) v = shift <= -32 ? (a < 0 ? -1 : 0) : (a >> -shift); "
++                "else if (shift >= 32) v = a == 0 ? 0 : (a < 0 ? -2147483649ll : 2147483648ll); "
++                "else v = a * (int64_t(1) << shift); "
++                "if (v > 2147483647ll) { v = 2147483647ll; c.fpsr |= uint64_t(1) << 27; } "
++                "else if (v < -2147483648ll) { v = -2147483648ll; c.fpsr |= uint64_t(1) << 27; } "
++                f"r.s32[k] = int32_t(v); }} c.v[{d.n}] = r; }}")
++
+     def i_sshl(self, f, i, ops):
+         bits = self.vinfo(ops[0])[0]
+         return self.v_bin(i, ops, f"int8_t(S1.u{bits}[k]) >= 0 ? (int8_t(S1.u{bits}[k]) >= {bits} ? 0 : int64_t(a) << int8_t(S1.u{bits}[k])) : (int8_t(S1.u{bits}[k]) <= -{bits} ? (a < 0 ? -1 : 0) : int64_t(a) >> -int8_t(S1.u{bits}[k]))", signed=True)

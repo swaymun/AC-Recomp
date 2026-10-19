@@ -1,0 +1,27 @@
+astral-perf-hud.patch provenance
+
+The HUD statistics, host probes, rasteriser, Vulkan copy, dump compositing, the
+hand-over to Apple's Metal HUD and MangoHud (both used, not included) and
+tests are original work. The patch carries context from the pinned public
+runtime (SuperMarioWonderRecomp at 010ed7a596a621c15d3a8dfa5795ca8c3668b066).
+
+runtime/src/font8x8_basic.h (added by the patch) holds the printable ASCII
+rows (U+0020..U+007E) of font8x8_basic.h from
+https://github.com/dhepper/font8x8, reformatted into a C++ constant table:
+
+  8x8 monochrome bitmap fonts for rendering
+  Author: Daniel Hepper <daniel@hepper.net>
+  License: Public Domain
+
+  Based on:
+  // Summary: font8x8.h
+  // 8x8 monochrome bitmap fonts for rendering
+  //
+  // Author:
+  //     Marcel Sondaar
+  //     International Business Machines (public domain VGA fonts)
+  //
+  // License:
+  //     Public Domain
+
+The glyph data is in the public domain. No other third-party code is used.

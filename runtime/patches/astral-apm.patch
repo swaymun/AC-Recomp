@@ -1,0 +1,51 @@
+diff --git a/runtime/src/svc_misc.cpp b/runtime/src/svc_misc.cpp
+--- a/runtime/src/svc_misc.cpp
++++ b/runtime/src/svc_misc.cpp
+@@ -212,6 +212,46 @@
++// Host policy acknowledgement only: never changes or reports host clocks.
++// Public libnx apm Set/Get wire contract; bounded profiles corroborated against
++// the imported SDK. Fresh sessions have no invented console default profile.
++void apm_payload(const IpcCtx& c, size_t bytes) {
++    if (c.in_size != bytes || (bytes && !c.in) || c.has_pid_descriptor() ||
++        !c.a.empty() || !c.b.empty() || !c.x.empty() || !c.c.empty() ||
++        !c.in_objects.empty() || !c.in_copy.empty() || !c.in_move.empty())
++        fatal("apm: malformed policy payload");
++}
++std::shared_ptr<Service> apm_session() {
++    struct Policy {
++        uint32_t configuration[2]{};
++        bool acknowledged[2]{};
++    };
++    auto policy = std::make_shared<Policy>();
++    auto session = make("ISession");
++    session->cmds[0] = [policy](IpcCtx& c) {
++        apm_payload(c, 8);
++        const auto mode = c.arg<uint32_t>(0), configuration = c.arg<uint32_t>(4);
++        if (mode > 1) fatal("apm: invalid performance mode");
++        // These three profile IDs are public libnx startup examples and are
++        // admitted for both modes by this guest SDK. All others stay unsupported.
++        if (configuration != 0x20004u && configuration != 0x92220007u && configuration != 0x92220008u)
++            fatal("apm: unsupported performance configuration");
++        policy->configuration[mode] = configuration;
++        policy->acknowledged[mode] = true;
++        log("apm: acknowledged host policy mode=%u configuration=%08X; host clocks unchanged", mode, configuration);
++        return 0u;
++    };
++    session->cmds[1] = [policy](IpcCtx& c) {
++        apm_payload(c, 4);
++        const auto mode = c.arg<uint32_t>(0);
++        if (mode > 1) fatal("apm: invalid performance mode");
++        if (!policy->acknowledged[mode]) fatal("apm: no acknowledged performance configuration");
++        c.push<uint32_t>(policy->configuration[mode]);
++        return 0u;
++    };
++    return session;
++}
++
+ ServiceRegistrar r_apm("apm", [] {
+     return make("apm", [](Service& s) {
+-        s.cmds[0] = [](IpcCtx& c) { c.push_object(make("ISession")); return 0u; };  // OpenSession
++        s.cmds[0] = [](IpcCtx& c) { apm_payload(c, 0); c.push_object(apm_session()); return 0u; };  // OpenSession
+         s.cmds[1] = [](IpcCtx& c) {  // GetPerformanceMode: boost (docked), normal with NX_HANDHELD (svc_am.cpp)
+             c.push<uint32_t>(std::getenv("NX_HANDHELD") ? 0 : 1);
+             return 0u;

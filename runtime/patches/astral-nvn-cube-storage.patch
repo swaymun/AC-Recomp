@@ -1,0 +1,18 @@
+--- a/runtime/src/nvn/nvn_texture_layout.cpp
++++ b/runtime/src/nvn/nvn_texture_layout.cpp
+@@ -123,6 +123,15 @@
+     uint32_t samples = std::max<uint32_t>(1, uint32_t(driver(c, "nvnTextureBuilderGetSamples", {builder})));
+     uint32_t stride = uint32_t(driver(c, "nvnTextureBuilderGetStride", {builder}));
+     FormatInfo f = format_info(format);
++#if defined(NX_ASTRAL_STRICT)
++    // A cube map (target 8) has 6 faces, each a layer one block-aligned mip chain apart, whatever the builder's depth
++    // (Astral leaves it 1; nvn_image.cpp makes the image 6 layers). The size was one face's, so untiling the 6 faces
++    // read past it and the upload was dropped ("could not untile"). Any other depth is not a cube map.
++    if (uint32_t(driver(c, "nvnTextureBuilderGetTarget", {builder})) == 8) {
++        if (depth != 1 && depth != 6) fatal("strict NVN texture: cube map of depth %u", depth);
++        depth = 6;
++    }
++#endif
+     Layout l;
+     if (stride) {  // linear (pitch) texture
+         l.size = uint64_t(stride) * div_up(height, f.block_h) * depth;

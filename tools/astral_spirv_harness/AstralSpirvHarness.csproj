@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Wonder's offline spirv_harness (MIT) with astral-headerless-compute.patch applied, linked against an already
+       built Ryujinx.Graphics.Shader translator (MIT). Neither upstream source nor the translator is vendored here:
+         HarnessSourceDir  a private copy of Wonder's tools/maxwell/spirv_harness (Program.cs patched)
+         TranslatorDir     the directory holding Ryujinx.Graphics.Shader.dll, Ryujinx.Common.dll, Spv.Generator.dll
+       See README.md. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>astral_spirv_harness</AssemblyName>
+    <RootNamespace>SpirvHarness</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <Target Name="AstralHarnessInputs" BeforeTargets="ResolveAssemblyReferences;CoreCompile">
+    <Error Condition="'$(HarnessSourceDir)' == '' Or !Exists('$(HarnessSourceDir)/Program.cs')"
+           Text="Set HarnessSourceDir to the patched private copy of Wonder's tools/maxwell/spirv_harness." />
+    <Error Condition="!$([System.IO.File]::ReadAllText('$(HarnessSourceDir)/Program.cs').Contains('--astral-headerless-compute'))"
+           Text="$(HarnessSourceDir)/Program.cs lacks astral-headerless-compute.patch." />
+    <Error Condition="'$(TranslatorDir)' == '' Or !Exists('$(TranslatorDir)/Ryujinx.Graphics.Shader.dll')"
+           Text="Set TranslatorDir to the directory holding the built Ryujinx.Graphics.Shader.dll." />
+  </Target>
+  <ItemGroup>
+    <Compile Include="$(HarnessSourceDir)/Program.cs" />
+    <Compile Include="$(HarnessSourceDir)/StaticGpuAccessor.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="Ryujinx.Graphics.Shader"><HintPath>$(TranslatorDir)/Ryujinx.Graphics.Shader.dll</HintPath></Reference>
+    <Reference Include="Ryujinx.Common"><HintPath>$(TranslatorDir)/Ryujinx.Common.dll</HintPath></Reference>
+    <Reference Include="Spv.Generator"><HintPath>$(TranslatorDir)/Spv.Generator.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

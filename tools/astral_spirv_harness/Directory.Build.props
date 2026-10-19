@@ -1,0 +1,7 @@
+<Project>
+  <!-- Build products stay in the ignored .local/ store, never next to the sources. Set before the SDK import. -->
+  <PropertyGroup>
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)../../.local/astral-spirv-harness/obj/</BaseIntermediateOutputPath>
+    <BaseOutputPath>$(MSBuildThisFileDirectory)../../.local/astral-spirv-harness/bin/</BaseOutputPath>
+  </PropertyGroup>
+</Project>

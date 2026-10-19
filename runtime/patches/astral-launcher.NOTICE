@@ -1,0 +1,24 @@
+astral-launcher.patch and assets/launcher provenance
+
+The launcher, input remapping, layout, drawing code and tests are original work. The patch carries context from the
+pinned public runtime (SuperMarioWonderRecomp at 010ed7a596a621c15d3a8dfa5795ca8c3668b066).
+
+Third-party code added by the patch, unmodified:
+
+  runtime/src/third_party/stb_truetype.h  stb_truetype v1.26, Sean Barrett, https://github.com/nothings/stb
+  runtime/src/third_party/stb_image.h     stb_image v2.30, Sean Barrett and contributors, same repository
+
+  Both are dual-licensed by their authors: public domain (unlicense.org) or the MIT License,
+  Copyright (c) 2017 Sean Barrett; the full text is at the end of each header. They are used here
+  under the public domain alternative.
+
+Assets (assets/launcher, outside the patch; the runtime loads them at run time):
+
+  Baloo2-Bold.ttf  Baloo 2, Copyright 2019 The Baloo 2 Project Authors (https://github.com/EkType/Baloo2),
+                   SIL Open Font License 1.1 (assets/launcher/OFL.txt). Made from google/fonts
+                   ofl/baloo2/Baloo2[wght].ttf: instanced at wght=700 and subset to Latin (U+0020-007E,
+                   U+00A0-00FF and a few punctuation marks) with fontTools. No Reserved Font Name is declared.
+  title-bg.jpg     Original AI-generated artwork made for this project (no game assets, characters or logos),
+                   resized to 1600x900 and JPEG-compressed.
+
+No game material is included.

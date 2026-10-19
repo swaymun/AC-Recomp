@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Run on the Linux GPU host; output must remain in ignored private storage.
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+out=${1:?usage: check-linux-gpu IGNORED_OUTPUT_DIRECTORY}
+[[ $(uname -s) == Linux ]] || { echo 'Requires actual Linux GPU host' >&2; exit 2; }
+mkdir -p -- "$out"
+out=$(cd -- "$out" && pwd)
+git -C "$root" check-ignore -q -- "$out/receipt.json" || { echo 'Output must be gitignored under this checkout' >&2; exit 2; }
+[[ $out == "$root"/.local/* ]] || { echo 'Output must be inside repository .local' >&2; exit 2; }
+[[ ! -e $out/receipt.json ]] || { echo 'Use a fresh output directory' >&2; exit 2; }
+exec > >(tee "$out/check.log") 2>&1
+cxx=${CXX:-clang++}
+"$cxx" --version
+cmake --version
+ninja --version
+pkg-config --modversion vulkan
+nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+# Preserve loader/ICD and extension evidence; do not force a software ICD.
+for d in /etc/vulkan/icd.d /usr/share/vulkan/icd.d; do
+    if [[ -d $d ]]; then
+        for f in "$d"/*.json; do [[ ! -f $f ]] || { echo "$f"; cat "$f"; }; done
+    fi
+done
+vulkaninfo --summary > "$out/vulkan-summary.txt" 2>&1
+vulkaninfo > "$out/vulkaninfo.txt" 2>&1
+"$cxx" -std=c++20 -O2 -Wall -Wextra -Wno-missing-field-initializers "$root/tools/linux_gpu_probe.cpp" -lvulkan -o "$out/linux_gpu_probe"
+"$out/linux_gpu_probe" "$out/nvidia-clear.ppm" "$out/receipt.json"
+if [[ ${2:-} == --surface ]]; then
+    # Force the observed NVIDIA ICD for the upstream synthetic presentation check.
+    export VK_ICD_FILENAMES=${NVIDIA_ICD:-/etc/vulkan/icd.d/nvidia_icd.json}
+    [[ -r $VK_ICD_FILENAMES ]] || { echo 'NVIDIA ICD missing' >&2; exit 1; }
+    xvfb-run -a -s '-screen 0 640x480x24 -nolisten tcp' bash -s -- "$out" <<'SURFACE'
+set -euo pipefail
+out=$1
+export XDG_RUNTIME_DIR="$out/xdg"
+mkdir -m 700 -p "$XDG_RUNTIME_DIR"
+timeout 6s stdbuf -oL vkcube --validate --gpu_number 0 --width 320 --height 240 --c 1000000 > "$out/vkcube.log" 2>&1 &
+cube_pid=$!
+trap 'kill "$cube_pid" 2>/dev/null || true' EXIT
+sleep 1
+kill -0 "$cube_pid"
+xwininfo -root -tree > "$out/windows.txt"
+import -window root "$out/surface.png"
+set +e
+wait "$cube_pid"
+status=$?
+set -e
+[[ $status == 124 ]] # Deliberately bounded presentation, not an unexpected crash.
+grep -q 'Selected GPU 0: NVIDIA' "$out/vkcube.log"
+! grep -Ei 'Validation Error|ERROR' "$out/vkcube.log"
+[[ $(identify -format '%k' "$out/surface.png") -gt 1 ]]
+printf '%s\n' '{"synthetic_surface_capture":true,"renderer":"NVIDIA (see vkcube.log)","vkcube_bounded_exit":124,"game_frame":false}' > "$out/surface-receipt.json"
+SURFACE
+fi

@@ -1,0 +1,155 @@
+# Targeted control metadata extraction changes against Wonder 010ed7a596a621c15d3a8dfa5795ca8c3668b066.
+# MIT License
+#
+# Copyright (c) 2026 BelmanteGu
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+--- a/android/wonder/importer/nximport.cpp
++++ b/android/wonder/importer/nximport.cpp
+@@ -989,6 +989,75 @@
+     }
+ }
+
++
++// Targeted metadata producer: verify PFS hashes, retain only CNMT/NPDM;
++// Control RomFS uses the pinned IVFC reader and retains only control.nacp.
++std::vector<uint8_t> control_pfs(Nca& n, int i) {
++    auto* st = plain_section(n, i); const auto* fs=n.sec[i].fs;
++    if (n.sec[i].is_patch() || n.sec[i].is_sparse()) fail("metadata: unsupported section mapping");
++    uint32_t bs=rd32(fs+0x28);
++    uint64_t ho=rd64(fs+0x30), hs=rd64(fs+0x38), po=rd64(fs+0x40), ps=rd64(fs+0x48);
++    if (!bs || hs>(64u<<20) || ps>(256u<<20) || ho>st->size || hs>st->size-ho || po>st->size || ps>st->size-po)
++        fail("metadata: invalid PFS extent");
++    std::vector<uint8_t> hashes(hs), pfs(ps); uint8_t d[32];
++    st->read(ho,hashes.data(),hashes.size()); sha256(hashes.data(),hashes.size(),d);
++    if(memcmp(d,fs+8,32)) fail("metadata: PFS master hash mismatch");
++    st->read(po,pfs.data(),pfs.size());
++    for(uint64_t b=0;b*bs<ps;++b) {
++        sha256(pfs.data()+b*bs,size_t(std::min<uint64_t>(bs,ps-b*bs)),d);
++        if((b+1)*32>hs || memcmp(d,hashes.data()+b*32,32)) fail("metadata: PFS block hash mismatch");
++    }
++    return pfs;
++}
++struct MetadataMemory : Storage {
++    const std::vector<uint8_t>& v;
++    explicit MetadataMemory(const std::vector<uint8_t>& x):v(x){size=x.size();}
++    void read(uint64_t off,void* p,size_t n) override {
++        if(off>size || n>size-off) fail("metadata: PFS read extent");
++        memcpy(p,v.data()+off,n);
++    }
++};
++void control_extract(Nca& n, const std::string& root, unsigned index, std::ostream& report) {
++    std::string prefix=std::to_string(index); unsigned retained=0;
++    std::string raw_name;
++    for(int i=0;i<4;++i) if(n.sec[i].present) {
++        if(n.sec[i].partition()==1 && (n.content_type==0 || n.content_type==1)) {
++            auto pfs=control_pfs(n,i); MetadataMemory memory(pfs);
++            for(auto& e:read_pfs(&memory,0,false,"metadata")) {
++                bool wanted=n.content_type==0 ? e.name=="main.npdm" : ends_with(e.name,".cnmt");
++                if(!wanted) continue;
++                if(++retained!=1 || e.size>(4u<<20)) fail("metadata: ambiguous or oversized metadata");
++                raw_name=prefix+(n.content_type==0?".npdm":".cnmt");
++                Writer w(root+"/"+raw_name);w.write(pfs.data()+e.off,size_t(e.size));w.commit();
++            }
++        } else if(n.sec[i].partition()==0 && n.content_type==2) {
++            if(n.sec[i].is_patch() || n.sec[i].is_sparse()) fail("metadata: unsupported Control mapping");
++            auto rom=open_ivfc(plain_section(n,i),n.sec[i].fs,"control");
++            uint8_t h[0x50];rom->read(0,h,sizeof h);
++            uint64_t doff=rd64(h+0x18),ds=rd64(h+0x20),foff=rd64(h+0x38),fs=rd64(h+0x40),data=rd64(h+0x48);
++            if(rd64(h)!=0x50 || ds>(4u<<20) || fs>(4u<<20)) fail("metadata: invalid Control RomFS");
++            std::vector<uint8_t> dirs(ds),files(fs);rom->read(doff,dirs.data(),dirs.size());rom->read(foff,files.data(),files.size());
++            std::vector<RomfsFile> list;std::vector<std::string> dirlist;
++            walk_romfs(dirs,files,0,"",list,dirlist,0);
++            for(auto& f:list) if(f.path=="control.nacp") {
++                if(++retained!=1 || f.size!=0x4000 || data>rom->size || f.off>rom->size-data || f.size>rom->size-data-f.off)
++                    fail("metadata: invalid Control NACP");
++                std::vector<uint8_t> nacp(f.size);rom->read(data+f.off,nacp.data(),nacp.size());
++                raw_name=prefix+".nacp";Writer w(root+"/"+raw_name);w.write(nacp.data(),nacp.size());w.commit();
++            }
++        }
++    }
++    if(retained!=1) fail("metadata: missing metadata");
++    // Hash encrypted content, as referenced by CNMT, rather than plaintext.
++    Sha256 hash;std::vector<uint8_t> chunk(kChunk);uint8_t digest[32];
++    for(uint64_t off=0;off<n.file->size;) {
++        size_t m=size_t(std::min<uint64_t>(chunk.size(),n.file->size-off));n.file->read(off,chunk.data(),m);hash.update(chunk.data(),m);off+=m;
++    }
++    hash.final(digest);
++    report << "{\"type\":" << unsigned(n.content_type) << ",\"program_id\":\"" << tid_str(n.title_id)
++           << "\",\"size\":" << n.file->size << ",\"sha256\":\"" << hex(digest,32) << "\",\"raw\":\"" << raw_name << "\"}";
++}
++
+ struct Run {
+     const Options& opt;
+     std::chrono::steady_clock::time_point last_report{};
+@@ -1088,7 +1157,8 @@
+     const Options& opt = run.opt;
+     if (!crypto_self_test()) fail("internal error: crypto self-test failed");
+     if (opt.out_dir.empty()) fail("no output folder");
+-    mkdirs(opt.out_dir + "/.import");
++    if (opt.control_metadata && (opt.verify_only || opt.keep_exefs || opt.title_id)) fail("metadata: conflicting options");
++    if (!opt.control_metadata) mkdirs(opt.out_dir + "/.import");
+     if (opt.verify_only) return verify_outputs(run, opt.out_dir, error);
+
+     // inputs
+@@ -1187,7 +1257,7 @@
+         if (!ends_with(n, ".nca") && !ends_with(n, ".ncz")) continue;
+         if (ends_with(n, ".ncz")) fail("%s: compressed NCZ content is not supported; use an uncompressed NSP/XCI", e.name.c_str());
+         auto nca = open_nca(e.nsp, e.off, e.size, e.name, keys, hk, tickets);
+-        if (nca && nca->content_type == 0) {
++        if (nca && (nca->content_type == 0 || (opt.control_metadata && (nca->content_type == 1 || nca->content_type == 2)))) {
+             nca->src = e.cont;
+             run.log("found program %s in %s: title %s%s%s", e.name.c_str(), e.cont.c_str(), tid_str(nca->title_id).c_str(),
+                     nca->key_ok ? "" : " (no key: ", nca->key_ok ? "" : (nca->key_problem + ")").c_str());
+@@ -1200,6 +1270,14 @@
+         }
+     }
+     secure_zero(hk, sizeof hk);
++
++    if (opt.control_metadata) {
++        if(ncas.size()>64) fail("metadata: too many contents");
++        std::ofstream report(opt.out_dir+"/native.json");
++        report << "{\"schema\":1,\"contents\":[";
++        for(size_t i=0;i<ncas.size();++i) {if(i) report << ",";control_extract(*ncas[i],opt.out_dir,unsigned(i),report);}
++        report << "]}\n";report.close();if(!report) fail("metadata: receipt write failed");return 0;
++    }
+
+     // choose the title: the base program and at most one update program
+     std::set<uint64_t> titles;
+--- a/android/wonder/importer/nximport_cli.cpp
++++ b/android/wonder/importer/nximport_cli.cpp
+@@ -23,6 +23,8 @@
+             opt.out_dir = argv[++i];
+         } else if (a == "--title" && i + 1 < argc) {
+             opt.title_id = strtoull(argv[++i], nullptr, 16);
++        } else if (a == "--control-metadata") {
++            opt.control_metadata = true;
+         } else if (a == "--exefs") {
+             opt.keep_exefs = true;
+         } else if (a == "--verify") {
+--- a/android/wonder/importer/nximport.h
++++ b/android/wonder/importer/nximport.h
+@@ -30,6 +30,7 @@
+ struct Options {
+     std::string out_dir;
+     uint64_t title_id = 0;  // the application (base) title; 0: the only one found
++    bool control_metadata = false; // Targeted verified CNMT/NACP/NPDM only.
+     bool verify_only = false;  // re-read the outputs and compare with the CRC index
+     bool keep_exefs = false;   // also write the raw NSOs to <out>/exefs/ (the input of python -m recomp)
+     std::atomic<bool>* cancel = nullptr;

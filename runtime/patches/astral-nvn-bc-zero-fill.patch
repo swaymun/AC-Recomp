@@ -1,0 +1,111 @@
+--- a/runtime/src/nvn/nvn_upload.cpp
++++ b/runtime/src/nvn/nvn_upload.cpp
+@@ -114,11 +114,75 @@
+ bool vk_1d_images() {
+     static const bool on = std::getenv("NX_1D_IMAGES") != nullptr;
+     return on;
++}
++
++#if defined(NX_ASTRAL_STRICT)
++namespace {
++// Bytes per 4x4 block of a BC format; 0 for any other.
++uint32_t bc_block_bytes(VkFormat f) {
++    switch (f) {
++        case VK_FORMAT_BC1_RGB_UNORM_BLOCK: case VK_FORMAT_BC1_RGB_SRGB_BLOCK: case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
++        case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: case VK_FORMAT_BC4_UNORM_BLOCK: case VK_FORMAT_BC4_SNORM_BLOCK: return 8;
++        case VK_FORMAT_BC2_UNORM_BLOCK: case VK_FORMAT_BC2_SRGB_BLOCK: case VK_FORMAT_BC3_UNORM_BLOCK:
++        case VK_FORMAT_BC3_SRGB_BLOCK: case VK_FORMAT_BC5_UNORM_BLOCK: case VK_FORMAT_BC5_SNORM_BLOCK:
++        case VK_FORMAT_BC6H_UFLOAT_BLOCK: case VK_FORMAT_BC6H_SFLOAT_BLOCK: case VK_FORMAT_BC7_UNORM_BLOCK:
++        case VK_FORMAT_BC7_SRGB_BLOCK: return 16;
++        default: return 0;
++    }
++}
++}  // namespace
++
++std::vector<VkBufferImageCopy> bc_zero_fill_regions(const GpuImage& img, const VkImageSubresourceRange& r,
++                                                    uint64_t& total) {
++    std::vector<VkBufferImageCopy> regions;
++    total = 0;
++    const uint32_t block = bc_block_bytes(img.format);
++    if (!block) return regions;
++    const uint32_t end = std::min<uint64_t>(img.levels, uint64_t(r.baseMipLevel) + r.levelCount);
++    for (uint32_t l = r.baseMipLevel; l < end; l++) {
++        // 3D images have one layer and `depth` slices (nvn_image.cpp); every other image has depth 1.
++        const uint32_t w = std::max(1u, img.width >> l), h = std::max(1u, img.height >> l);
++        const uint32_t d = std::max(1u, img.depth >> l);
++        VkBufferImageCopy c{};
++        c.bufferOffset = total;  // tightly packed: bufferRowLength and bufferImageHeight 0
++        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, r.baseArrayLayer, r.layerCount};
++        c.imageExtent = {w, h, d};
++        regions.push_back(c);
++        total += uint64_t((w + 3) / 4) * ((h + 3) / 4) * d * r.layerCount * block;
++    }
++    return regions;
+ }
+ 
++bool zero_fill_compressed(VkCommandBuffer cb, GpuImage& img, const VkImageSubresourceRange& r) {
++    if (!bc_block_bytes(img.format)) return false;
++    uint64_t total = 0;
++    std::vector<VkBufferImageCopy> regions = bc_zero_fill_regions(img, r, total);
++    if (regions.empty()) return true;
++    // A big fill gets a staging buffer of its own on the same terms as a big texture upload, so a scene load's
++    // fills cannot wrap the ring over the uploads of the same submit (DEBUG-2 #72).
++    Upload u = total >= (1u << 20) && !std::getenv("NX_STAGING_RING") && staging_wanted(total)
++                   ? staging_alloc(total)
++                   : upload_alloc(total, 16);
++    std::memset(u.ptr, 0, total);
++    for (VkBufferImageCopy& c : regions) c.bufferOffset += u.offset;
++    p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
++                             regions.data());
++    return true;
++}
++#endif
++
+ void clear_image(VkCommandBuffer cb, GpuImage& img, bool magenta) {
+     transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+     VkImageSubresourceRange r{img.aspect, 0, img.levels, 0, img.layers};
++#if defined(NX_ASTRAL_STRICT)
++    if (img.aspect == VK_IMAGE_ASPECT_COLOR_BIT && zero_fill_compressed(cb, img, r)) {
++        static bool logged = false;  // the magenta debug colour cannot be written into BC blocks
++        if (magenta && !logged)
++            log("nvn/vk: magenta clear of a BC image (Vulkan format %d): zero-filled instead", int(img.format)),
++                logged = true;
++        return;
++    }
++#endif
+     if (img.aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+         VkClearColorValue v{};
+         if (magenta) v = {{1.0f, 0.0f, 1.0f, 1.0f}};
+--- a/runtime/src/nvn/nvn_pipeline.cpp
++++ b/runtime/src/nvn/nvn_pipeline.cpp
+@@ -615,6 +615,9 @@
+         VkImageSubresourceRange r{img->aspect, 0, img->levels, 0, img->layers};
+         if (img->aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+             VkClearColorValue v{};
++#if defined(NX_ASTRAL_STRICT)
++            if (!zero_fill_compressed(cb, *img, r))  // BC: zero blocks (nvn_pipeline.h)
++#endif
+             p_vkCmdClearColorImage(cb, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
+         }
+     }
+--- a/runtime/src/nvn/nvn_pipeline.h
++++ b/runtime/src/nvn/nvn_pipeline.h
+@@ -124,6 +124,18 @@
+ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img, uint64_t lo = 0, uint64_t hi = UINT64_MAX);
+ // Every level and layer to zero (colour; magenta with `magenta`), depth and stencil to 0. Leaves TRANSFER_DST.
+ void clear_image(VkCommandBuffer cb, GpuImage& img, bool magenta = false);
++#if defined(NX_ASTRAL_STRICT)
++// Block-compressed (BC1-BC7) images cannot be cleared on Metal: MoltenVK fails the whole submit with
++// VK_ERROR_FEATURE_NOT_PRESENT, losing every command in it. The range is zero-filled with buffer copies instead (and
++// clear_image's magenta is not shown). All-zero blocks decode to black: alpha 0 in BC2, BC3 and BC7 (mode byte 0 is
++// BC7's reserved mode, all zero), alpha 1 in BC1 (colour0 == colour1 selects the 3-colour mode, index 0 opaque
++// black) and in the formats without alpha (BC4, BC5, BC6H). False for any other format; the image must be in
++// TRANSFER_DST. Large fills use a staging buffer of their own, as large uploads do.
++bool zero_fill_compressed(VkCommandBuffer cb, GpuImage& img, const VkImageSubresourceRange& r);
++// The copies for that, offsets from 0, with `total` the zero bytes they read (empty, 0: not BC or nothing in range).
++std::vector<VkBufferImageCopy> bc_zero_fill_regions(const GpuImage& img, const VkImageSubresourceRange& r,
++                                                    uint64_t& total);
++#endif
+ // A single level and layer of an image, for rendering to.
+ void sampled_ready_log();
+ void check_linear_content(Texture& t);  // nvn_sampler.cpp

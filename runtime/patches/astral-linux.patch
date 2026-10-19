@@ -1,0 +1,238 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -248,7 +248,9 @@ elseif(UNIX)
+     find_package(SDL3 REQUIRED CONFIG)
+     find_package(Threads REQUIRED)
+     find_path(NX_VULKAN_INCLUDE vulkan/vulkan.h HINTS "${NX_VULKAN_SDK}/include" /usr/include /usr/local/include)
+-    add_executable(${NX_GAME} ${NX_RUNTIME_SOURCES} runtime/src/platform_linux.cpp runtime/src/memguard_linux.cpp)
++    enable_language(ASM)
++    add_executable(${NX_GAME} ${NX_RUNTIME_SOURCES} runtime/src/platform_linux.cpp runtime/src/memguard_linux.cpp
++        runtime/src/hle_fiber.cpp runtime/src/fiber_context_linux.S)
+     target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}" "${NX_VULKAN_INCLUDE}")
+     target_link_libraries(${NX_GAME} PRIVATE game_main game_sdk SDL3::SDL3 Threads::Threads ${CMAKE_DL_LIBS})
+     target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden -march=x86-64-v3 -ffp-contract=off)
+diff --git a/runtime/src/fiber_context_linux.S b/runtime/src/fiber_context_linux.S
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/fiber_context_linux.S
+@@ -0,0 +1,96 @@
++// Linux (ELF) host stack switch for the fiber bridge. No guest instructions or addresses.
++// nx_fiber_swap(from, to): save the caller's callee-saved host state in *from and resume *to.
++// nx_fiber_enter: first-entry trampoline; calls entry(arg) on the fresh host stack and never returns.
++#if defined(__x86_64__)
++// System V AMD64: rbx, rbp, r12-r15, the x87 control word and the MXCSR control bits are callee-saved. They are
++// pushed on the outgoing stack and HostContext holds only the stack pointer (offset 0). hle_fiber.cpp prepares a
++// fresh stack as [fpcw][mxcsr][r15][r14][r13][r12][rbx][rbp][ret=nx_fiber_enter], low to high.
++    .text
++    .p2align 4
++    .globl nx_fiber_swap
++    .type nx_fiber_swap,@function
++nx_fiber_swap:
++    pushq %rbp
++    pushq %rbx
++    pushq %r12
++    pushq %r13
++    pushq %r14
++    pushq %r15
++    subq $0x10, %rsp
++    fnstcw (%rsp)
++    stmxcsr 8(%rsp)
++    movq %rsp, (%rdi)
++    movq (%rsi), %rsp
++    fldcw (%rsp)
++    ldmxcsr 8(%rsp)
++    addq $0x10, %rsp
++    popq %r15
++    popq %r14
++    popq %r13
++    popq %r12
++    popq %rbx
++    popq %rbp
++    ret
++    .size nx_fiber_swap, .-nx_fiber_swap
++
++    .p2align 4
++    .globl nx_fiber_enter
++    .type nx_fiber_enter,@function
++nx_fiber_enter:
++    // Reached by ret with a 16-byte aligned rsp: rbx = argument, r12 = entry.
++    movq %rbx, %rdi
++    callq *%r12
++    ud2
++    .size nx_fiber_enter, .-nx_fiber_enter
++#elif defined(__aarch64__)
++// AAPCS64, the layout of fiber_context_mac.S: x19..x30 at 0, sp at 96, q8..q15 at 112, fpcr/fpsr at 240.
++    .text
++    .p2align 2
++    .globl nx_fiber_swap
++    .type nx_fiber_swap,%function
++nx_fiber_swap:
++    stp x19, x20, [x0, #0]
++    stp x21, x22, [x0, #16]
++    stp x23, x24, [x0, #32]
++    stp x25, x26, [x0, #48]
++    stp x27, x28, [x0, #64]
++    stp x29, x30, [x0, #80]
++    mov x9, sp
++    str x9, [x0, #96]
++    stp q8, q9, [x0, #112]
++    stp q10, q11, [x0, #144]
++    stp q12, q13, [x0, #176]
++    stp q14, q15, [x0, #208]
++    mrs x9, fpcr
++    mrs x10, fpsr
++    stp x9, x10, [x0, #240]
++    ldp x19, x20, [x1, #0]
++    ldp x21, x22, [x1, #16]
++    ldp x23, x24, [x1, #32]
++    ldp x25, x26, [x1, #48]
++    ldp x27, x28, [x1, #64]
++    ldp x29, x30, [x1, #80]
++    ldr x9, [x1, #96]
++    mov sp, x9
++    ldp q8, q9, [x1, #112]
++    ldp q10, q11, [x1, #144]
++    ldp q12, q13, [x1, #176]
++    ldp q14, q15, [x1, #208]
++    ldp x9, x10, [x1, #240]
++    msr fpcr, x9
++    msr fpsr, x10
++    ret
++    .size nx_fiber_swap, .-nx_fiber_swap
++
++    .p2align 2
++    .globl nx_fiber_enter
++    .type nx_fiber_enter,%function
++nx_fiber_enter:
++    mov x0, x19
++    blr x20
++    brk #0
++    .size nx_fiber_enter, .-nx_fiber_enter
++#else
++#error fiber_context_linux.S supports x86-64 and aarch64
++#endif
++    .section .note.GNU-stack,"",%progbits
+diff --git a/runtime/src/hle_fiber.cpp b/runtime/src/hle_fiber.cpp
+--- a/runtime/src/hle_fiber.cpp
++++ b/runtime/src/hle_fiber.cpp
+@@ -10,8 +10,8 @@
+ #include <mutex>
+ #include <cstring>
+ 
+-#if !defined(__APPLE__) || !defined(__aarch64__)
+-#error The fiber adapter requires the Apple arm64 backend
++#if !(defined(__APPLE__) && defined(__aarch64__)) && !(defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__)))
++#error The fiber adapter requires the Apple arm64, Linux x86-64 or Linux arm64 backend
+ #endif
+ namespace nx {
+ const char* fiber_exchange_hle_name(const char*);
+@@ -20,6 +20,7 @@ constexpr size_t frame_bytes = 240;
+ constexpr size_t host_stack_bytes = 8 * 1024 * 1024;
+ constexpr const char* dispatch_name = "_ZN2nn2os6detail20DispatchFiberContextEPPNS1_22FiberContextForHorizonES4_";
+ constexpr const char* finalize_name = "_ZN2nn2os13FinalizeFiberEPNS0_9FiberTypeE";
++#if defined(__aarch64__)
+ struct alignas(16) HostContext {
+     uint64_t x[12]{}; // x19..x30
+     uint64_t sp{}, reserved{};
+@@ -27,8 +28,36 @@ struct alignas(16) HostContext {
+     uint64_t fpcr{}, fpsr{};
+ };
+ static_assert(offsetof(HostContext, sp)==96 && offsetof(HostContext,q)==112 && offsetof(HostContext,fpcr)==240);
++#else
++// x86-64 (fiber_context_linux.S): the callee-saved state lives on the suspended stack; only its pointer is kept.
++struct alignas(16) HostContext {
++    uint64_t sp{}, reserved{};
++};
++static_assert(offsetof(HostContext, sp)==0);
++#endif
+ extern "C" void nx_fiber_swap(HostContext*, const HostContext*);
+ extern "C" void nx_fiber_enter();
++[[noreturn]] void enter(void*);
++// A fresh host stack whose first swap runs nx_fiber_enter, which calls enter(nullptr).
++void prepare_entry(HostContext& h, uintptr_t top) {
++#if defined(__aarch64__)
++    h.sp=top;
++    h.x[0]=0;h.x[1]=reinterpret_cast<uint64_t>(&enter);
++    h.x[11]=reinterpret_cast<uint64_t>(&nx_fiber_enter);
++#else
++    auto* s=reinterpret_cast<uint64_t*>(top);
++    uint16_t fpcw=0;
++    __asm__ volatile("fnstcw %0" : "=m"(fpcw));
++    s[-3]=reinterpret_cast<uint64_t>(&nx_fiber_enter); // return slot: rsp is 16-byte aligned after ret
++    s[-4]=0;                                            // rbp
++    s[-5]=0;                                            // rbx: argument
++    s[-6]=reinterpret_cast<uint64_t>(&enter);           // r12: entry
++    s[-7]=s[-8]=s[-9]=0;                                // r13, r14, r15
++    s[-11]=fpcw;
++    s[-10]=__builtin_ia32_stmxcsr();
++    h.sp=reinterpret_cast<uint64_t>(&s[-11]);
++#endif
++}
+ struct Context {
+     HostContext host;
+     uint64_t slot{}, saved{}, pc{}, object{};
+@@ -134,9 +163,7 @@ Context* destination(uint64_t slot) {
+     if (d->allocation==MAP_FAILED) {d->allocation=nullptr;fatal("fiber: stack reservation failed");}
+     auto start=reinterpret_cast<uintptr_t>(d->allocation)+page;
+     if (mprotect(reinterpret_cast<void*>(start),host_stack_bytes,PROT_READ|PROT_WRITE)) fatal("fiber: stack commit failed");
+-    d->host.sp=start+host_stack_bytes;
+-    d->host.x[0]=0;d->host.x[1]=reinterpret_cast<uint64_t>(&enter);
+-    d->host.x[11]=reinterpret_cast<uint64_t>(&nx_fiber_enter);
++    prepare_entry(d->host,start+host_stack_bytes);
+     claim(slot);auto* result=d.get();state.contexts.emplace(slot,std::move(d));return result;
+ }
+ void clear() {
+diff --git a/runtime/src/kernel.cpp b/runtime/src/kernel.cpp
+--- a/runtime/src/kernel.cpp
++++ b/runtime/src/kernel.cpp
+@@ -24,7 +24,8 @@
+ #endif
+ 
+ namespace nx {
+-#if defined(__APPLE__) && defined(__aarch64__) && !defined(NX_IOS_RUNTIME)
++#if ((defined(__APPLE__) && defined(__aarch64__)) || (defined(__linux__) && !defined(__ANDROID__))) && \
++    !defined(NX_IOS_RUNTIME)
+ void fiber_retire_thread();
+ #else
+ static void fiber_retire_thread() {}
+diff --git a/runtime/src/nvn/nvn_caps.cpp b/runtime/src/nvn/nvn_caps.cpp
+--- a/runtime/src/nvn/nvn_caps.cpp
++++ b/runtime/src/nvn/nvn_caps.cpp
+@@ -93,6 +93,12 @@ bool ubwc_flags() {
+ uint32_t upload_memory_type(uint32_t bits) {
+     const VkMemoryPropertyFlags plain = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+     const char* e = std::getenv("NX_RING_CACHED");
++#if defined(__linux__) && !defined(__ANDROID__)
++    // Linux desktop GPUs: compute results are read back from the ring (apply_write_back, ~35 MB a frame on the
++    // title screen). Reading write-combined memory held the title at 1.5 fps on a discrete GPU; host-cached is
++    // the default here (NX_RING_CACHED=0: the plain type).
++    if (!e) e = "1";
++#endif
+     if (e && e[0] == '1') {
+         VkPhysicalDeviceMemoryProperties mp{};
+         p_vkGetPhysicalDeviceMemoryProperties(vk_physical(), &mp);
+diff --git a/runtime/src/nvn/nvn_vk.cpp b/runtime/src/nvn/nvn_vk.cpp
+--- a/runtime/src/nvn/nvn_vk.cpp
++++ b/runtime/src/nvn/nvn_vk.cpp
+@@ -159,15 +159,17 @@ bool init() {
+         plat::request_performance_profile();
+ 
+     g_gipa = reinterpret_cast<void*>(gipa);
+-    if (!make_surface()) return false;
++    // Headless (NX_HEADLESS) only reads frames back: without a display (Linux, SDL's offscreen driver) there is no
++    // surface to present to, and any graphics queue will do.
++    if (!make_surface() && !plat::headless()) return false;
+ 
+     p_vkGetPhysicalDeviceQueueFamilyProperties(g_physical, &n, nullptr);
+     std::vector<VkQueueFamilyProperties> families(n);
+     p_vkGetPhysicalDeviceQueueFamilyProperties(g_physical, &n, families.data());
+     g_family = UINT32_MAX;
+     for (uint32_t k = 0; k < n; k++) {
+-        VkBool32 present = VK_FALSE;
+-        p_vkGetPhysicalDeviceSurfaceSupportKHR(g_physical, k, g_surface, &present);
++        VkBool32 present = g_surface ? VK_FALSE : VK_TRUE;
++        if (g_surface) p_vkGetPhysicalDeviceSurfaceSupportKHR(g_physical, k, g_surface, &present);
+         if ((families[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present) {
+             g_family = k;
+             break;

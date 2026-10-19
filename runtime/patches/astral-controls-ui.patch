@@ -1,0 +1,526 @@
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index 0a634b2..0935ec7 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -219,7 +219,7 @@ Event translate(const SDL_Event& e, const input::Controls& c, bool capturing, St
+ int Menu::count() const {
+     switch (screen) {
+     case Screen::Main: return kMainCount;
+-    case Screen::Controls: return input::kActionCount + 2;  // the actions, Reset to defaults, Back
++    case Screen::Controls: return kCtlItems;  // the actions, Reset to defaults, Back, the Gamepad and Keyboard tabs
+     case Screen::Settings: return input::kSettingCount + 1;  // the settings, Back
+     case Screen::Profiles: return int(profiles.size()) + 2;  // the profiles, New profile, Back
+     }
+@@ -236,14 +236,15 @@ std::vector<std::vector<std::string>> Menu::cells() const {
+         break;
+     case Screen::Controls:
+         for (int a = 0; a < input::kActionCount; a++) {
+-            if (a == capturing)
+-                out.push_back({input::action_label(a), "Press a button or key... (5 s)", ""});
+-            else
+-                out.push_back({input::action_label(a), pad_text(controls.pad[a], pad_type),
+-                               input::binding_text(controls.keys[a])});
++            std::string pad = pad_text(controls.pad[a], pad_type), keys = input::binding_text(controls.keys[a]);
++            if (a == capturing) (tab == ControlsTab::Gamepad ? pad : keys) =
++                                    tab == ControlsTab::Gamepad ? "Press a button..." : "Press a key...";
++            out.push_back({input::action_label(a), pad, keys});
+         }
+         out.push_back({"Reset to defaults"});
+         out.push_back({"Back"});
++        out.push_back({"Gamepad"});
++        out.push_back({"Keyboard"});
+         break;
+     case Screen::Settings:
+         for (int k = 0; k < input::kSettingCount; k++)
+@@ -274,9 +275,15 @@ SDL_FRect Menu::row_rect(int i) const {
+     switch (screen) {
+     case Screen::Main: return {0, 352 + 50.0f * i, 520, 46};
+     case Screen::Controls: {
+-        int j = i - scroll;
+-        if (j < 0 || j >= kControlsVisible) return {80, 0, 0, 0};
+-        return {80, 156 + 24.0f * j, 1120, 23};
++        if (i == kCtlTabPad || i == kCtlTabKeys) return {i == kCtlTabPad ? 392.0f : 552.0f, 50, 150, 38};
++        if (i == kCtlReset || i == kCtlBack) return {i == kCtlReset ? 692.0f : 970.0f, 562, 250, 44};
++        for (const ControlsPanel& p : controls_panels())
++            for (size_t k = 0; k < p.actions.size(); k++) {
++                if (p.actions[k] != i) continue;
++                float w = (p.w - 16) / float(p.columns);
++                return {p.x + 8 + w * float(int(k) % p.columns), p.y + 40 + 34.0f * float(int(k) / p.columns), w, 30};
++            }
++        return {0, 0, 0, 0};
+     }
+     case Screen::Settings: return {80, 170 + 56.0f * i, 900, 48};
+     case Screen::Profiles: {  // a scrolling list in the centred panel
+@@ -346,6 +353,7 @@ void Menu::change_setting(int k, int delta) {
+ }
+ 
+ void Menu::nav(Nav n, uint64_t now_ms) {
++    if (screen == Screen::Controls) return controls_nav(n, now_ms);
+     if (n == Nav::Up) return move(-1);
+     if (n == Nav::Down) return move(1);
+     switch (screen) {
+@@ -367,18 +375,7 @@ void Menu::nav(Nav n, uint64_t now_ms) {
+         if (cursor == 2) open(Screen::Settings, 0);
+         if (cursor == 3) result = Result::Quit;
+         return;
+-    case Screen::Controls:
+-        if (n == Nav::Back || (n == Nav::Confirm && cursor == input::kActionCount + 1)) return open(Screen::Main, 1);
+-        if (n != Nav::Confirm) return;
+-        if (cursor == input::kActionCount) {
+-            controls = input::default_controls();
+-            controls_dirty = true;
+-            notice = "Controls reset to defaults";
+-            return;
+-        }
+-        capturing = cursor;
+-        capture_until = now_ms + kCaptureMs;
+-        notice.clear();
++    case Screen::Controls:  // controls_nav
+         return;
+     case Screen::Settings:
+         if (n == Nav::Back || (n == Nav::Confirm && cursor == input::kSettingCount)) return open(Screen::Main, 2);
+@@ -410,19 +407,22 @@ void Menu::handle(const Event& e, uint64_t now_ms) {
+         result = Result::Quit;
+         return;
+     }
+-    if (capturing >= 0) {
+-        if (e.kind == Event::kKey) {
++    if (capturing >= 0) {  // the selected tab's device binds; the other device or a click cancels
++        const bool keys = tab == ControlsTab::Keyboard;
++        bool bound = true;
++        if (e.kind == Event::kKey && keys) {
+             controls.keys[capturing] = {e.key};
+             notice = std::string(input::action_label(capturing)) + ": key " + input::key_name(e.key);
+-        } else if (e.kind == Event::kPad) {
++        } else if (e.kind == Event::kPad && !keys) {
+             controls.pad[capturing] = {e.pad};
+             notice = std::string(input::action_label(capturing)) + ": gamepad " + pad_text_one(e.pad, pad_type);
+-        } else if (e.kind == Event::kClick) {
++        } else if (e.kind == Event::kClick || e.kind == Event::kKey || e.kind == Event::kPad) {
+             notice = "Rebinding cancelled";
++            bound = false;
+         } else {
+             return;
+         }
+-        if (e.kind != Event::kClick) controls_dirty = true;
++        if (bound) controls_dirty = true;
+         capturing = -1;
+         return;
+     }
+@@ -450,6 +450,107 @@ void Menu::tick(uint64_t now_ms) {
+     }
+ }
+ 
++// ---- the Controls screen's layout and navigation ----
++
++const std::vector<ControlsPanel>& controls_panels() {
++    using namespace input;
++    static const std::vector<ControlsPanel> panels = {
++        {"Buttons", 60, 112, 300, 1, {kActA, kActB, kActX, kActY, kActPlus, kActMinus}},
++        {"D-pad", 60, 362, 300, 1, {kActDUp, kActDDown, kActDLeft, kActDRight}},
++        {"Left Stick", 376, 112, 300, 1, {kActLStick, kActLSUp, kActLSDown, kActLSLeft, kActLSRight}},
++        {"Right Stick", 376, 330, 300, 1, {kActRStick, kActRSUp, kActRSDown, kActRSLeft, kActRSRight}},
++        {"Triggers", 692, 112, 528, 2, {kActL, kActR, kActZL, kActZR}},
++    };
++    return panels;
++}
++
++SDL_FRect controls_panel_rect(const ControlsPanel& p) {
++    int rows = (int(p.actions.size()) + p.columns - 1) / p.columns;
++    return {p.x, p.y, p.w, 40 + 34.0f * float(rows) + 4};
++}
++
++SDL_FRect controls_diagram_rect() { return {692, 232, 528, 318}; }
++
++const char* control_row_label(int a) {
++    using namespace input;
++    switch (a) {
++    case kActA: return "A";
++    case kActB: return "B";
++    case kActX: return "X";
++    case kActY: return "Y";
++    case kActL: return "L";
++    case kActR: return "R";
++    case kActZL: return "ZL";
++    case kActZR: return "ZR";
++    case kActPlus: return "Plus";
++    case kActMinus: return "Minus";
++    case kActLStick: case kActRStick: return "Click";
++    case kActDUp: case kActLSUp: case kActRSUp: return "Up";
++    case kActDDown: case kActLSDown: case kActRSDown: return "Down";
++    case kActDLeft: case kActLSLeft: case kActRSLeft: return "Left";
++    case kActDRight: case kActLSRight: case kActRSRight: return "Right";
++    default: return "";
++    }
++}
++
++int Menu::controls_step(Nav n) const {
++    const SDL_FRect c = row_rect(cursor);
++    const bool vertical = n == Nav::Up || n == Nav::Down, forward = n == Nav::Down || n == Nav::Right;
++    // Along the move: from the cursor's leading edge to the candidate's near edge. Across: the gap between the two
++    // spans (0 when they overlap). Overlapping candidates win, then the nearest along, the nearest across, centres.
++    auto span = [&](const SDL_FRect& r, bool along) {
++        return along == vertical ? std::pair{r.y, r.y + r.h} : std::pair{r.x, r.x + r.w};
++    };
++    auto [c0, c1] = span(c, true);
++    auto [d0, d1] = span(c, false);
++    int best = cursor;
++    std::array<float, 4> best_score{};
++    for (int i = 0; i < kCtlItems; i++) {
++        if (i == cursor) continue;
++        SDL_FRect r = row_rect(i);
++        if (r.w <= 0) continue;
++        auto [r0, r1] = span(r, true);
++        auto [s0, s1] = span(r, false);
++        float along = forward ? r0 - c1 : c0 - r1;
++        if (along < -1) continue;  // not in that direction
++        float across = std::max({0.0f, s0 - d1, d0 - s1});
++        float centre = std::fabs((s0 + s1) - (d0 + d1)) / 2;
++        std::array<float, 4> score{across > 0 ? 1.0f : 0.0f, std::max(along, 0.0f), across, centre};
++        if (best == cursor || score < best_score) best = i, best_score = score;
++    }
++    return best;
++}
++
++void Menu::controls_nav(Nav n, uint64_t now_ms) {
++    switch (n) {
++    case Nav::Up: case Nav::Down: case Nav::Left: case Nav::Right:
++        cursor = controls_step(n);
++        return;
++    case Nav::Back:
++        return open(Screen::Main, 1);
++    case Nav::Confirm:
++        break;
++    default:
++        return;
++    }
++    if (cursor == kCtlBack) return open(Screen::Main, 1);
++    if (cursor == kCtlTabPad || cursor == kCtlTabKeys) {
++        tab = cursor == kCtlTabPad ? ControlsTab::Gamepad : ControlsTab::Keyboard;
++        notice.clear();
++        return;
++    }
++    if (cursor == kCtlReset) {
++        controls = input::default_controls();
++        controls_dirty = true;
++        notice = "Controls reset to defaults";
++        return;
++    }
++    if (cursor < 0 || cursor >= input::kActionCount) return;
++    capturing = cursor;
++    capture_until = now_ms + kCaptureMs;
++    notice.clear();
++}
++
+ // ---- assets ----
+ 
+ std::string asset_dir() {
+@@ -800,6 +901,219 @@ void footer(Art* a, const std::string& hint, const std::string& notice) {
+     text(a, hint, kWidth / 2, 694, 17, kHint, kCentre);
+ }
+ 
++// ---- the Controls screen: panels and a drawn controller (original shapes, SDL_Renderer geometry) ----
++
++void poly(Art* a, float cx, float cy, const std::vector<SDL_FPoint>& pts, Rgba c) {  // a fan around (cx, cy)
++    if (pts.size() < 3) return;
++    SDL_FColor col{c.r / 255.f, c.g / 255.f, c.b / 255.f, c.a / 255.f};
++    std::vector<SDL_Vertex> vs(pts.size() + 1);
++    vs[0] = {{X(a, cx), Y(a, cy)}, col, {0, 0}};
++    for (size_t i = 0; i < pts.size(); i++) vs[i + 1] = {{X(a, pts[i].x), Y(a, pts[i].y)}, col, {0, 0}};
++    std::vector<int> idx;
++    for (size_t i = 0; i < pts.size(); i++) idx.insert(idx.end(), {0, int(i + 1), int((i + 1) % pts.size() + 1)});
++    SDL_RenderGeometry(a->r, nullptr, vs.data(), int(vs.size()), idx.data(), int(idx.size()));
++}
++
++void ellipse(Art* a, float cx, float cy, float rx, float ry, float rot, Rgba c) {
++    std::vector<SDL_FPoint> pts;
++    const float cr = std::cos(rot), sr = std::sin(rot);
++    for (int i = 0; i < 64; i++) {
++        float t = 6.2831853f * float(i) / 64, x = rx * std::cos(t), y = ry * std::sin(t);
++        pts.push_back({cx + x * cr - y * sr, cy + x * sr + y * cr});
++    }
++    poly(a, cx, cy, pts, c);
++}
++
++void circle(Art* a, float cx, float cy, float r, Rgba c) { ellipse(a, cx, cy, r, r, 0, c); }
++
++void ring(Art* a, float cx, float cy, float r, float thick, Rgba c) {
++    SDL_FColor col{c.r / 255.f, c.g / 255.f, c.b / 255.f, c.a / 255.f};
++    std::vector<SDL_Vertex> vs;
++    std::vector<int> idx;
++    const int n = 64;
++    for (int i = 0; i < n; i++) {
++        float t = 6.2831853f * float(i) / n;
++        for (float rr : {r, r - thick})
++            vs.push_back({{X(a, cx + rr * std::cos(t)), Y(a, cy + rr * std::sin(t))}, col, {0, 0}});
++        int o = 2 * i, p = 2 * ((i + 1) % n);
++        idx.insert(idx.end(), {o, o + 1, p, p, o + 1, p + 1});
++    }
++    SDL_RenderGeometry(a->r, nullptr, vs.data(), int(vs.size()), idx.data(), int(idx.size()));
++}
++
++void rrect(Art* a, const SDL_FRect& b, float rad, Rgba c) {  // a rounded rectangle, layout space
++    rad = std::min({rad, b.w / 2, b.h / 2});
++    std::vector<SDL_FPoint> pts;
++    const float cx[4] = {b.x + b.w - rad, b.x + rad, b.x + rad, b.x + b.w - rad};
++    const float cy[4] = {b.y + b.h - rad, b.y + b.h - rad, b.y + rad, b.y + rad};
++    for (int q = 0; q < 4; q++)
++        for (int i = 0; i <= 8; i++) {
++            float t = 1.5707963f * (float(q) + float(i) / 8);
++            pts.push_back({cx[q] + rad * std::cos(t), cy[q] + rad * std::sin(t)});
++        }
++    poly(a, b.x + b.w / 2, b.y + b.h / 2, pts, c);
++}
++
++// Text fitted to a width: a smaller size down to `min_em`, then cut with an ellipsis.
++float text_width(Art* a, const std::string& s, float em) {
++    return a->font.ok ? advance(a->font, codepoints(s), em) : float(s.size()) * em * 0.8f;
++}
++
++void fitted(Art* a, std::string s, float x, float y, float em, float min_em, float max_w, Rgba c, Align align) {
++    while (em > min_em && text_width(a, s, em) > max_w) em -= 1;
++    if (text_width(a, s, em) > max_w) {
++        while (!s.empty() && text_width(a, s + "\xe2\x80\xa6", em) > max_w) s.pop_back();
++        s += "\xe2\x80\xa6";
++    }
++    text(a, s, x, y, em, c, align);
++}
++
++const Rgba kHot{255, 204, 112, 255}, kCapture{255, 150, 60, 255}, kInk{20, 22, 40, 255};
++
++// The controller, centred at (cx, cy) in layout space: the control under the cursor (`focus`, an action or -1) is lit.
++void controller(Art* a, float cx, float cy, int focus, bool capturing) {
++    using namespace input;
++    const Rgba hot = capturing ? kCapture : kHot, edge{104, 116, 170, 255}, body{40, 46, 80, 255},
++               part{24, 27, 48, 255}, cap{62, 68, 108, 255}, mark{170, 180, 220, 255};
++    auto lit = [&](int act) { return focus == act; };
++    auto P = [&](float x, float y) { return SDL_FPoint{cx + x, cy + y}; };
++    auto box = [&](float x0, float y0, float x1, float y1) { return SDL_FRect{cx + x0, cy + y0, x1 - x0, y1 - y0}; };
++    // Shoulders: ZL / ZR behind L / R, both behind the body.
++    for (int side : {-1, 1}) {
++        float x0 = side < 0 ? -166 : 78, x1 = side < 0 ? -78 : 166;
++        bool z = lit(side < 0 ? kActZL : kActZR), s = lit(side < 0 ? kActL : kActR);
++        rrect(a, box(x0 - 1, -151, x1 + 1, -117), 13, edge);
++        rrect(a, box(x0, -150, x1, -118), 12, z ? hot : part);
++        text(a, side < 0 ? "ZL" : "ZR", cx + (x0 + x1) / 2, cy - 130, 14, z ? kInk : mark, kCentre);
++        float l0 = side < 0 ? -178 : 70, l1 = side < 0 ? -70 : 178;
++        rrect(a, box(l0 - 1, -127, l1 + 1, -91), 14, edge);
++        rrect(a, box(l0, -126, l1, -92), 13, s ? hot : cap);
++        text(a, side < 0 ? "L" : "R", cx + (l0 + l1) / 2, cy - 107, 14, s ? kInk : mark, kCentre);
++    }
++    // The body: a rounded top and two grips, an edge first, then the fill.
++    for (int pass = 0; pass < 2; pass++) {
++        float g = pass ? 0 : 2;
++        Rgba c = pass ? body : edge;
++        rrect(a, box(-180 - g, -102 - g, 180 + g, 32 + g), 58 + g, c);
++        ellipse(a, cx - 128, cy + 36, 62 + g, 88 + g, 0.32f, c);
++        ellipse(a, cx + 128, cy + 36, 62 + g, 88 + g, -0.32f, c);
++    }
++    // A stick: its well, the cap, a ring when its click is the focus, an arrow for a direction.
++    auto stick = [&](float x, float y, int click, int up) {
++        circle(a, cx + x, cy + y, 31, part);
++        bool dir = focus >= up && focus < up + 4, c = lit(click);
++        circle(a, cx + x, cy + y, 21, c ? hot : cap);
++        circle(a, cx + x, cy + y, 13, c ? Rgba{255, 226, 170, 255} : Rgba{74, 80, 124, 255});
++        if (c) ring(a, cx + x, cy + y, 36, 3, hot);
++        if (dir) {
++            int d = focus - up;  // up, down, left, right
++            float ux = d == 2 ? -1.f : d == 3 ? 1.f : 0.f, uy = d == 0 ? -1.f : d == 1 ? 1.f : 0.f;
++            float tip = 50, base = 36, half = 10;
++            SDL_FPoint p0 = P(x + ux * tip, y + uy * tip), p1 = P(x + ux * base - uy * half, y + uy * base + ux * half),
++                       p2 = P(x + ux * base + uy * half, y + uy * base - ux * half);
++            poly(a, (p0.x + p1.x + p2.x) / 3, (p0.y + p1.y + p2.y) / 3, {p0, p1, p2}, hot);
++            circle(a, cx + x + ux * 6, cy + y + uy * 6, 21, hot);  // the cap pushed that way
++            circle(a, cx + x + ux * 6, cy + y + uy * 6, 13, {255, 226, 170, 255});
++        }
++    };
++    stick(-100, -40, kActLStick, kActLSUp);
++    stick(52, 18, kActRStick, kActRSUp);
++    // Face buttons.
++    struct Face { float x, y; const char* l; int act; };
++    for (const Face& f : {Face{100, -66, "X", kActX}, Face{128, -40, "A", kActA}, Face{100, -14, "B", kActB},
++                          Face{72, -40, "Y", kActY}}) {
++        circle(a, cx + f.x, cy + f.y, 13, lit(f.act) ? hot : part);
++        text(a, f.l, cx + f.x, cy + f.y + 6, 16, lit(f.act) ? kInk : mark, kCentre);
++    }
++    // Minus and Plus; the capture and home buttons are drawn for the look only.
++    for (int side : {-1, 1}) {
++        bool on = lit(side < 0 ? kActMinus : kActPlus);
++        float x = 40.0f * float(side), y = -64;
++        circle(a, cx + x, cy + y, 10, on ? hot : part);
++        Rgba m = on ? kInk : mark;
++        rrect(a, box(x - 5, y - 1.5f, x + 5, y + 1.5f), 1, m);
++        if (side > 0) rrect(a, box(x - 1.5f, y - 5, x + 1.5f, y + 5), 1, m);
++    }
++    rrect(a, box(-31, -34, -19, -22), 3, part);
++    circle(a, cx + 25, cy - 28, 7, part);
++    // The D-pad: a cross, each arm lit on its own, with a small arrow.
++    const float dx = -52, dy = 18;
++    rrect(a, box(dx - 30, dy - 10, dx + 30, dy + 10), 4, part);
++    rrect(a, box(dx - 10, dy - 30, dx + 10, dy + 30), 4, part);
++    for (int d = 0; d < 4; d++) {
++        float ux = d == 2 ? -1.f : d == 3 ? 1.f : 0.f, uy = d == 0 ? -1.f : d == 1 ? 1.f : 0.f;
++        bool on = lit(kActDUp + d);
++        if (on) {
++            float x0 = dx + (ux != 0 ? ux * 30 : -10), x1 = dx + (ux != 0 ? ux * 9 : 10);
++            float y0 = dy + (uy != 0 ? uy * 30 : -10), y1 = dy + (uy != 0 ? uy * 9 : 10);
++            rrect(a, box(std::min(x0, x1), std::min(y0, y1), std::max(x0, x1), std::max(y0, y1)), 4, hot);
++        }
++        float tx = dx + ux * 20, ty = dy + uy * 20;
++        SDL_FPoint p0 = P(tx + ux * 5, ty + uy * 5), p1 = P(tx - uy * 5, ty + ux * 5), p2 = P(tx + uy * 5, ty - ux * 5);
++        poly(a, (p0.x + p1.x + p2.x) / 3, (p0.y + p1.y + p2.y) / 3, {p0, p1, p2}, on ? kInk : mark);
++    }
++}
++
++void draw_controls(Art* a, const Menu& m, const Status& s) {
++    const auto cells = m.cells();
++    const bool keys = m.tab == ControlsTab::Keyboard;
++    const Rgba panel{10, 14, 40, 205}, slot{255, 255, 255, 22};
++    text(a, "CONTROLS", 60, 88, 52, kWarmTop, kWarmBottom, kLeft, true);
++    fitted(a, s.controller, 1220, 78, 18, 14, 500, kSoft, kRight);
++    // The tabs: the selected one filled, the cursor's outlined.
++    for (int i : {kCtlTabPad, kCtlTabKeys}) {
++        SDL_FRect b = m.row_rect(i);
++        bool sel = (i == kCtlTabKeys) == keys, on = m.cursor == i;
++        if (on) rrect(a, {b.x - 3, b.y - 3, b.w + 6, b.h + 6}, b.h / 2 + 3, sel ? kWhite : kSelected);
++        rrect(a, b, b.h / 2, sel ? Rgba{255, 204, 112, 240} : on ? Rgba{40, 44, 80, 240} : Rgba{20, 24, 56, 220});
++        text(a, cells[i][0], b.x + b.w / 2, b.y + 27, 20, sel ? kInk : on ? kSelected : kSoft, kCentre);
++    }
++    // The panels and their rows: "control  [binding]".
++    for (const ControlsPanel& p : controls_panels()) {
++        SDL_FRect pr = controls_panel_rect(p);
++        rrect(a, pr, 14, panel);
++        text(a, p.title, p.x + 16, p.y + 26, 19, kWarmTop, kWarmBottom);
++        SDL_FRect line{X(a, p.x + 12), Y(a, p.y + 34), (p.w - 24) * a->s, std::max(1.0f, a->s)};
++        SDL_SetRenderDrawColor(a->r, 255, 236, 200, 46);
++        SDL_RenderFillRect(a->r, &line);
++        for (int act : p.actions) {
++            SDL_FRect r = m.row_rect(act);
++            bool on = m.cursor == act, cap = m.capturing == act;
++            if (on) rrect(a, r, 8, {255, 236, 200, 30});
++            float lw = p.columns > 1 ? 44 : 92;
++            text(a, control_row_label(act), r.x + 10, r.y + 22, 18, on ? kSelected : kWhite);
++            SDL_FRect b{r.x + lw, r.y + 2, r.w - lw - 4, r.h - 4};
++            rrect(a, b, 7, cap ? Rgba{255, 150, 60, 150} : on ? Rgba{255, 204, 112, 64} : slot);
++            const std::string& v = cells[act][keys ? 2 : 1];
++            fitted(a, v, b.x + b.w / 2, b.y + 19, 16, 12, b.w - 14, cap ? kWhite : on ? kSelected : kSoft, kCentre);
++        }
++    }
++    // The controller, with the focused control (and its binding) named above it.
++    SDL_FRect d = controls_diagram_rect();
++    rrect(a, d, 14, panel);
++    int focus = m.capturing >= 0 ? m.capturing : m.cursor < input::kActionCount ? m.cursor : -1;
++    if (focus >= 0) {
++        text(a, input::action_label(focus), d.x + 16, d.y + 28, 19, m.capturing >= 0 ? kCapture : kSelected);
++        fitted(a, cells[focus][keys ? 2 : 1], d.x + d.w - 16, d.y + 28, 17, 12, d.w / 2 - 24, kSoft, kRight);
++    } else {
++        text(a, keys ? "Keyboard bindings" : "Gamepad bindings", d.x + 16, d.y + 28, 19, kSoft);
++    }
++    controller(a, d.x + d.w / 2, d.y + 190, focus, m.capturing >= 0);
++    // Reset to defaults and Back.
++    for (int i : {kCtlReset, kCtlBack}) {
++        SDL_FRect b = m.row_rect(i);
++        bool on = m.cursor == i;
++        rrect(a, b, 12, on ? Rgba{255, 204, 112, 72} : panel);
++        text(a, cells[i][0], b.x + b.w / 2, b.y + 30, 22, on ? kSelected : kWhite, kCentre, true);
++    }
++    text(a, "Saved to controls.ini in the data folder", 60, 590, 16, kHint);
++    std::string hint =
++        m.capturing < 0 ? "Arrows / D-pad: move   \xc2\xb7   Enter / A: rebind or choose   \xc2\xb7   Esc / B: back"
++        : keys ? "Press a key for it   \xc2\xb7   a gamepad button or a click cancels   \xc2\xb7   5 s"
++               : "Press a button or push a stick or trigger   \xc2\xb7   a key or a click cancels   \xc2\xb7   5 s";
++    footer(a, hint, m.notice);
++}
++
+ }  // namespace
+ 
+ void to_layout(SDL_Renderer* r, float& x, float& y) {
+@@ -836,30 +1150,7 @@ void draw(SDL_Renderer* r, Art* a, const Menu& m, const Status& s) {
+         if (!m.notice.empty()) text(a, m.notice, 90, 560, 18, kSelected);
+         return;
+     }
+-    if (m.screen == Screen::Controls) {
+-        text(a, "CONTROLS", 88, 92, 52, kWarmTop, kWarmBottom, kLeft, true);
+-        text(a, fit(s.controller, 60), 1200, 92, 18, kSoft, kRight);
+-        text(a, "SWITCH", 100, 140, 16, kDim);
+-        text(a, "GAMEPAD", 360, 140, 16, kDim);
+-        text(a, "KEYBOARD", 800, 140, 16, kDim);
+-        for (int i = 0; i < m.count(); i++) {
+-            SDL_FRect box = m.row_rect(i);
+-            if (box.w <= 0) continue;
+-            bool on = i == m.cursor, cap = i == m.capturing;
+-            if (on) band(a, box, cap ? Rgba{255, 150, 60, 110} : Rgba{255, 236, 200, 56});
+-            Rgba c = on ? kSelected : kWhite;
+-            float y = box.y + 17;
+-            text(a, cells[i][0], 100, y, 18, c);
+-            if (cells[i].size() > 2) {
+-                text(a, fit(cells[i][1], 44), 360, y, 18, cap ? kSelected : kSoft);
+-                text(a, fit(cells[i][2], 40), 800, y, 18, kSoft);
+-            }
+-        }
+-        if (m.scroll > 0) text(a, "\xe2\x80\xa6", 1190, 150, 18, kDim, kRight);
+-        if (m.scroll + kControlsVisible < m.count()) text(a, "\xe2\x80\xa6", 1190, 650, 18, kDim, kRight);
+-        footer(a, "Enter / A: rebind, then press a button or key   \xc2\xb7   Esc / B: back", m.notice);
+-        return;
+-    }
++    if (m.screen == Screen::Controls) return draw_controls(a, m, s);
+     if (m.screen == Screen::Profiles) {  // PLAY's save picker: a panel over the dimmed art
+         SDL_FRect panel{X(a, 200), Y(a, 90), 880 * a->s, 560 * a->s};
+         SDL_SetRenderDrawColor(r, 10, 14, 40, 235);
+diff --git a/runtime/src/launcher.h b/runtime/src/launcher.h
+index 21e1e29..37c0987 100644
+--- a/runtime/src/launcher.h
++++ b/runtime/src/launcher.h
+@@ -41,6 +41,26 @@ constexpr float kWidth = 1280, kHeight = 720;
+ constexpr int kControlsVisible = 20, kProfilesVisible = 8;
+ constexpr uint64_t kCaptureMs = 5000;
+ 
++// The Controls screen (astral-controls-ui.patch): every Switch control at once, grouped in panels like a controller
++// settings page (Buttons, Left Stick, Right Stick, D-pad, Triggers), each row "control -> binding" for the selected
++// Gamepad or Keyboard tab, beside a drawn controller that marks the control under the cursor. Its items: the actions
++// (0 .. kActionCount - 1), then Reset to defaults, Back and the two tabs. Arrows / D-pad / left stick move to the
++// nearest item in that direction; nothing scrolls.
++constexpr int kCtlReset = input::kActionCount, kCtlBack = input::kActionCount + 1,
++              kCtlTabPad = input::kActionCount + 2, kCtlTabKeys = input::kActionCount + 3,
++              kCtlItems = input::kActionCount + 4;
++enum class ControlsTab { Gamepad, Keyboard };
++struct ControlsPanel {
++    const char* title;
++    float x, y, w;  // layout space; the height follows from the rows
++    int columns;    // the actions fill the rows left to right
++    std::vector<int> actions;
++};
++const std::vector<ControlsPanel>& controls_panels();
++SDL_FRect controls_panel_rect(const ControlsPanel& p);
++SDL_FRect controls_diagram_rect();         // the drawn controller's panel
++const char* control_row_label(int action);  // the label inside its panel: "A", "Plus", "Click", "Up", "ZL"
++
+ struct Menu {
+     Screen screen = Screen::Main;
+     int cursor = 0, scroll = 0;
+@@ -50,6 +70,7 @@ struct Menu {
+     input::Settings settings;
+     input::EnvOverrides env;
+     SDL_GamepadType pad_type = SDL_GAMEPAD_TYPE_UNKNOWN;  // for button labels (A/B/X/Y, Cross/Circle, ...)
++    ControlsTab tab = ControlsTab::Gamepad;  // the bindings the Controls screen shows and rebinds
+     bool controls_dirty = false, settings_dirty = false;
+     Result result = Result::None;
+     std::string notice;
+@@ -59,7 +80,7 @@ struct Menu {
+     bool profile_env = false;
+ 
+     int count() const;
+-    // Each row's cells: Main {item}; Controls {control, gamepad, keyboard} (the last two rows: {label});
++    // Each row's cells: Main {item}; Controls {control, gamepad, keyboard} (Reset, Back and the tabs: {label});
+     // Settings {setting, value} (the last row: {Back}).
+     std::vector<std::vector<std::string>> cells() const;
+     std::vector<std::string> rows() const;  // the cells joined in columns, as text
+@@ -74,6 +95,8 @@ struct Menu {
+     void move(int delta);
+     void open(Screen s, int cursor_at);
+     void change_setting(int k, int delta);
++    void controls_nav(Nav n, uint64_t now_ms);
++    int controls_step(Nav n) const;  // the item nearest the cursor in that direction (the cursor when none)
+ };
+ 
+ std::string pad_text(const std::vector<input::Source>& s, SDL_GamepadType type);

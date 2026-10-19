@@ -1,0 +1,225 @@
+diff --git a/runtime/src/hle_audio.cpp b/runtime/src/hle_audio.cpp
+--- a/runtime/src/hle_audio.cpp
++++ b/runtime/src/hle_audio.cpp
+@@ -18,6 +18,9 @@
+ 
+ #include "kernel.h"
+ #include "platform.h"
++#if defined(NX_ASTRAL_STRICT)
++#include "wav_stream.h"
++#endif
+ 
+ namespace nx {
+ 
+@@ -82,6 +85,65 @@ void release(void* ctx) {
+     g_out.cv.notify_all();
+ }
+ 
++#if defined(NX_ASTRAL_STRICT)
++// NX_AUDIO_DUMP=<file.wav>: the mixed output (what goes to the device, or would with NX_MUTE / no device) from the
++// first sound, streamed to the file as it is produced (WavStream: sizes fixed up every 0.25 s, so a killed process
++// leaves a playable file). NX_AUDIO_DUMP_SECONDS=<N> how many seconds, 0 the whole session; unset: 10, as before.
++// The first path that sounds (AudioOut buffers or the AudioRenderer's final mix) owns the file.
++enum DumpSource { kDumpAudioOut = 1, kDumpRenderer = 2 };
++struct AudioDump {
++    std::mutex lock;
++    WavStream wav;
++    int owner = 0;
++    bool done = false;
++};
++AudioDump& audio_dump() {
++    static AudioDump d;
++    return d;
++}
++void audio_dump_close() {
++    AudioDump& d = audio_dump();
++    std::lock_guard lk(d.lock);
++    d.wav.close();
++    d.done = true;  // no later sound may reopen (and truncate) the finished file
++}
++void dump_pcm(int source, const int16_t* pcm, size_t frames) {
++    static const char* path = [] {
++        const char* p = std::getenv("NX_AUDIO_DUMP");
++        return p && *p ? p : nullptr;
++    }();
++    if (!path) return;
++    static const uint64_t limit = [] {
++        const char* s = std::getenv("NX_AUDIO_DUMP_SECONDS");
++        char* end = nullptr;
++        unsigned long long n = s && *s && *s != '-' ? std::strtoull(s, &end, 10) : 10;
++        return (end && (*end || n > 24 * 3600) ? 10ull : n) * 48000;  // 0: the whole session; malformed: 10
++    }();
++    AudioDump& d = audio_dump();
++    std::lock_guard lk(d.lock);
++    if (d.done || (d.owner && d.owner != source)) return;
++    if (!d.wav.is_open()) {
++        if (std::all_of(pcm, pcm + frames * 2, [](int16_t v) { return v == 0; })) return;  // from the first sound
++        if (!d.wav.open(path, limit)) {
++            log("audio: NX_AUDIO_DUMP: cannot create %s", path);
++            d.done = true;
++            return;
++        }
++        d.owner = source;
++        std::atexit(audio_dump_close);  // a normal exit; a killed process keeps the last fix-up
++        const char* what = source == kDumpAudioOut ? "AudioOut output" : "renderer mix";
++        if (limit)
++            log("audio: dumping the %s to %s, %llu s", what, path, (unsigned long long)(limit / 48000));
++        else
++            log("audio: dumping the %s to %s, the whole session", what, path);
++    }
++    if (!d.wav.write(pcm, frames)) {
++        d.done = true;
++        log("audio: wrote %s (%llu frames%s)", path, (unsigned long long)d.wav.frames(),
++            d.wav.failed() ? ", stopped by a write error" : "");
++    }
++}
++#endif
+ void render_block_done(void* ctx);
+ bool render_owns(void* ctx);
+ void device_done(void* ctx) {
+@@ -110,6 +172,9 @@ void player() {
+             g_out.queued.pop_front();
+             g_out.inflight.emplace(packet.get(), packet);
+         }
++#if defined(NX_ASTRAL_STRICT)
++        dump_pcm(kDumpAudioOut, reinterpret_cast<const int16_t*>(packet->pcm.data()), packet->pcm.size() / 4);
++#endif
+         if (device && plat::audio_submit(packet->pcm.data(), packet->pcm.size(), packet.get())) continue;
+         // A missing/rejecting sink never establishes audible output. Pace, then release.
+         std::unique_lock lk(g_out.lock);
+@@ -407,6 +472,7 @@ void CommandListProcessorProcess(CPU& c) {
+     capture_device_sink(proc);
+ }
+ 
++#if !defined(NX_ASTRAL_STRICT)  // strict: dump_pcm streams it instead
+ void write_wav(const char* path, const std::vector<int16_t>& pcm) {
+     FILE* f = std::fopen(path, "wb");
+     if (!f) return;
+@@ -419,6 +485,7 @@ void write_wav(const char* path, const std::vector<int16_t>& pcm) {
+     std::fclose(f);
+     log("audio: wrote %s (%zu frames)", path, pcm.size() / 2);
+ }
++#endif
+ 
+ // Called by the render thread after each 5 ms frame.
+ void render_submit() {
+@@ -439,10 +506,15 @@ void render_submit() {
+         any |= v != 0;
+     }
+     o.silent += !any;
++#if defined(NX_ASTRAL_STRICT)
++    (void)dump_path;
++    dump_pcm(kDumpRenderer, pcm, kFrame);
++#else
+     if (dump_path && o.dump.size() < 48000 * 2 * 10 && (any || !o.dump.empty())) {
+         o.dump.insert(o.dump.end(), pcm, pcm + kFrame * 2);
+         if (o.dump.size() >= 48000 * 2 * 10) write_wav(dump_path, o.dump);
+     }
++#endif
+     if (++o.frames % 2000 == 0) {
+         log("audio: mix out: peak %d, rms %.0f, %llu of 2000 frames silent, %llu dropped, %llu underruns, queue %u",
+             o.peak, std::sqrt(o.sum_sq / (2000.0 * kFrame * 2)), (unsigned long long)o.silent,
+diff --git a/runtime/src/wav_stream.h b/runtime/src/wav_stream.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/wav_stream.h
+@@ -0,0 +1,99 @@
++// A WAV file written while the audio is produced (hle_audio.cpp: NX_AUDIO_DUMP with NX_AUDIO_DUMP_SECONDS, Astral
++// strict; docs/ASTRAL_AUDIO_DUMP.md). s16 stereo 48 kHz. The RIFF and data sizes in the header are fixed up every
++// `fixup_frames` frames and at close, each time followed by a flush, so a process killed at any moment leaves a
++// playable file holding at least everything up to the last fix-up. Not thread-safe: the caller serialises.
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++
++namespace nx {
++
++class WavStream {
++public:
++    static constexpr uint32_t kRate = 48000, kChannels = 2, kFrameBytes = 4, kHeaderBytes = 44;
++    // The data chunk's size is a u32: at most this many frames (about 6.2 hours) go into one file.
++    static constexpr uint64_t kMaxFrames = (0xffffffffull - 36) / kFrameBytes;
++
++    ~WavStream() { close(); }
++
++    // limit_frames 0: no limit but kMaxFrames. False: the file could not be created.
++    bool open(const char* path, uint64_t limit_frames, uint32_t fixup_frames = kRate / 4) {
++        close();
++        f_ = std::fopen(path, "wb");
++        if (!f_) return false;
++        frames_ = since_fixup_ = 0;
++        limit_ = limit_frames && limit_frames < kMaxFrames ? limit_frames : kMaxFrames;
++        every_ = fixup_frames ? fixup_frames : 1;
++        uint8_t h[kHeaderBytes] = {'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' '};
++        put32(h + 16, 16);
++        put16(h + 20, 1);  // PCM
++        put16(h + 22, kChannels);
++        put32(h + 24, kRate);
++        put32(h + 28, kRate * kFrameBytes);
++        put16(h + 32, kFrameBytes);
++        put16(h + 34, 16);
++        h[36] = 'd', h[37] = 'a', h[38] = 't', h[39] = 'a';
++        if (std::fwrite(h, 1, sizeof h, f_) != sizeof h) return fail();
++        fixup();  // sizes 36 and 0: an empty but valid file from the start
++        return f_ != nullptr;
++    }
++
++    // Appends `frames` interleaved stereo frames, cut at the limit. False once the limit is reached or a write failed
++    // (the file is then closed, its header final).
++    bool write(const int16_t* pcm, size_t frames) {
++        if (!f_) return false;
++        uint64_t n = frames < limit_ - frames_ ? frames : limit_ - frames_;
++        if (n && std::fwrite(pcm, kFrameBytes, size_t(n), f_) != n) return fail();
++        frames_ += n, since_fixup_ += n;
++        if (frames_ >= limit_) {
++            close();
++            return false;
++        }
++        if (since_fixup_ >= every_) fixup();
++        return f_ != nullptr;
++    }
++
++    // The header's sizes become what was written so far; everything is flushed to the OS.
++    void fixup() {
++        if (!f_) return;
++        uint8_t riff[4], data[4];
++        uint64_t bytes = frames_ * kFrameBytes;
++        put32(riff, uint32_t(36 + bytes));
++        put32(data, uint32_t(bytes));
++        bool ok = std::fflush(f_) == 0 && std::fseek(f_, 4, SEEK_SET) == 0 && std::fwrite(riff, 1, 4, f_) == 4 &&
++                  std::fseek(f_, 40, SEEK_SET) == 0 && std::fwrite(data, 1, 4, f_) == 4 &&
++                  std::fseek(f_, 0, SEEK_END) == 0 && std::fflush(f_) == 0;
++        since_fixup_ = 0;
++        if (!ok) fail();
++    }
++
++    void close() {
++        if (!f_) return;
++        fixup();
++        if (f_) std::fclose(f_);
++        f_ = nullptr;
++    }
++
++    bool is_open() const { return f_ != nullptr; }
++    uint64_t frames() const { return frames_; }
++    bool failed() const { return failed_; }
++
++private:
++    static void put16(uint8_t* p, uint32_t v) { p[0] = uint8_t(v), p[1] = uint8_t(v >> 8); }
++    static void put32(uint8_t* p, uint32_t v) { put16(p, v), put16(p + 2, v >> 16); }
++    bool fail() {
++        if (f_) std::fclose(f_);
++        f_ = nullptr;
++        failed_ = true;
++        return false;
++    }
++
++    FILE* f_ = nullptr;
++    uint64_t frames_ = 0, since_fixup_ = 0, limit_ = 0;
++    uint32_t every_ = kRate / 4;
++    bool failed_ = false;
++};
++
++}  // namespace nx

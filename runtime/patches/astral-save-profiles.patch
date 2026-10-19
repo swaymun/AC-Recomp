@@ -1,0 +1,396 @@
+diff --git a/runtime/src/hle_fs.cpp b/runtime/src/hle_fs.cpp
+index 8943790..7e181ff 100644
+--- a/runtime/src/hle_fs.cpp
++++ b/runtime/src/hle_fs.cpp
+@@ -21,6 +21,9 @@
+ #include <nx/runtime.h>
+ 
+ #include "platform.h"
++#if defined(NX_ASTRAL_STRICT)
++#include "save_profile.h"
++#endif
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -189,7 +192,19 @@ void MountSaveData(CPU& c) {
+     std::error_code ec;
+     fs::path root = fs::weakly_canonical(data_root(), ec);
+     if (ec) { c.x[0] = kPathNotFound; return; }
++#if defined(NX_ASTRAL_STRICT)
++    // NX_SAVE_PROFILE (the launcher's save picker, save_profile.h): Default is user/save, others
++    // user/profiles/<name>/save; an unusable name is Default.
++    const char* requested = std::getenv("NX_SAVE_PROFILE");
++    const std::string profile = saves::normalise(requested);
++    if (requested && *requested && !saves::valid_name(requested))
++        log("fs: NX_SAVE_PROFILE=%s is not a valid profile name (letters, digits, space, - or _, up to 32): Default",
++            requested);
++    fs::path p = fs::weakly_canonical(saves::save_dir(root, profile), ec);
++    log("fs: save data %s: profile %s", name.c_str(), profile.c_str());
++#else
+     fs::path p = fs::weakly_canonical(root / "user" / "save", ec);
++#endif
+     if (ec || !beneath(root, p)) { c.x[0] = kPathNotFound; return; }
+     fs::create_directories(p, ec);
+     if (ec) { c.x[0] = kPathNotFound; return; }
+diff --git a/runtime/src/input_map.cpp b/runtime/src/input_map.cpp
+index 55c6487..39c9a94 100644
+--- a/runtime/src/input_map.cpp
++++ b/runtime/src/input_map.cpp
+@@ -2,6 +2,7 @@
+ // docs/ASTRAL_LAUNCHER.md).
+ #if defined(NX_ASTRAL_STRICT)
+ #include "input_map.h"
++#include "save_profile.h"
+ 
+ #include <algorithm>
+ #include <cctype>
+@@ -429,6 +430,7 @@ std::string write_settings(const Settings& s) {
+     out += "resolution = " + s.resolution + "\n";
+     out += std::string("mute = ") + (s.mute ? "1" : "0") + "\n";
+     out += "upscale = " + s.upscale + "\n";
++    out += "save_profile = " + s.save_profile + "\n";
+     return out;
+ }
+ 
+@@ -443,6 +445,7 @@ Settings parse_settings(const std::string& text) {
+         if (k == "perf_hud") s.perf_hud = flag(value);
+         else if (k == "fullscreen") s.fullscreen = flag(value);
+         else if (k == "mute") s.mute = flag(value);
++        else if (k == "save_profile") s.save_profile = saves::normalise(value.c_str());
+         else if (k == "upscale") {
+             std::string v = lower(value);
+             if (v == "metalfx") v = "fsr";  // an earlier choice: MetalFX is not built, FSR 1 stands in
+@@ -490,6 +493,9 @@ void export_env(const Settings& s) {
+     if (s.resolution != Settings().resolution) put(kSetResolution, s.resolution);
+     if (s.mute) put(kSetMute, "1");
+     if (s.upscale != Settings().upscale) put(kSetUpscale, s.upscale);
++    // Always, Default too: a restart (macOS Metal HUD) must boot the profile chosen, even if settings.ini was not
++    // written.
++    setenv("NX_SAVE_PROFILE", s.save_profile.c_str(), 0);
+ }
+ 
+ std::string settings_path() { return plat::data_root() + "/settings.ini"; }
+diff --git a/runtime/src/input_map.h b/runtime/src/input_map.h
+index d8c60b4..6dc6500 100644
+--- a/runtime/src/input_map.h
++++ b/runtime/src/input_map.h
+@@ -81,6 +81,7 @@ struct Settings {
+     bool perf_hud = false, fullscreen = false, mute = false;
+     std::string resolution = "1280x720";
+     std::string upscale = "bilinear";  // bilinear | fsr
++    std::string save_profile = "Default";  // the PLAY picker's last choice (save_profile.h): NX_SAVE_PROFILE
+     bool operator==(const Settings&) const = default;
+ };
+ std::string setting_text(const Settings& s, int k);  // "On", "Off", "1280x720"
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index ca59e3a..0a634b2 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -221,6 +221,7 @@ int Menu::count() const {
+     case Screen::Main: return kMainCount;
+     case Screen::Controls: return input::kActionCount + 2;  // the actions, Reset to defaults, Back
+     case Screen::Settings: return input::kSettingCount + 1;  // the settings, Back
++    case Screen::Profiles: return int(profiles.size()) + 2;  // the profiles, New profile, Back
+     }
+     return 0;
+ }
+@@ -250,6 +251,11 @@ std::vector<std::vector<std::string>> Menu::cells() const {
+                                                          : input::setting_text(settings, k)});
+         out.push_back({"Back"});
+         break;
++    case Screen::Profiles:
++        for (const saves::Profile& p : profiles) out.push_back({p.name, saves::modified_text(p.modified)});
++        out.push_back({"New profile"});
++        out.push_back({"Back"});
++        break;
+     }
+     return out;
+ }
+@@ -273,6 +279,11 @@ SDL_FRect Menu::row_rect(int i) const {
+         return {80, 156 + 24.0f * j, 1120, 23};
+     }
+     case Screen::Settings: return {80, 170 + 56.0f * i, 900, 48};
++    case Screen::Profiles: {  // a scrolling list in the centred panel
++        int j = i - scroll;
++        if (j < 0 || j >= kProfilesVisible) return {240, 0, 0, 0};
++        return {240, 190 + 50.0f * j, 800, 46};
++    }
+     }
+     return {};
+ }
+@@ -288,9 +299,10 @@ int Menu::hit(float x, float y) const {
+ void Menu::move(int delta) {
+     int n = count();
+     cursor = ((cursor + delta) % n + n) % n;
+-    if (screen == Screen::Controls) {
++    int visible = screen == Screen::Controls ? kControlsVisible : screen == Screen::Profiles ? kProfilesVisible : 0;
++    if (visible) {
+         if (cursor < scroll) scroll = cursor;
+-        if (cursor >= scroll + kControlsVisible) scroll = cursor - kControlsVisible + 1;
++        if (cursor >= scroll + visible) scroll = cursor - visible + 1;
+     }
+ }
+ 
+@@ -339,7 +351,18 @@ void Menu::nav(Nav n, uint64_t now_ms) {
+     switch (screen) {
+     case Screen::Main:
+         if (n != Nav::Confirm) return;
+-        if (cursor == 0) result = Result::Start;
++        if (cursor == 0) {
++            if (profile_env) {  // NX_SAVE_PROFILE decides: no picker
++                result = Result::Start;
++                return;
++            }
++            int last = 0;  // the picker opens on the profile used last
++            for (size_t p = 0; p < profiles.size(); p++)
++                if (profiles[p].name == settings.save_profile) last = int(p);
++            open(Screen::Profiles, 0);
++            move(last);
++            return;
++        }
+         if (cursor == 1) open(Screen::Controls, 0);
+         if (cursor == 2) open(Screen::Settings, 0);
+         if (cursor == 3) result = Result::Quit;
+@@ -362,6 +385,23 @@ void Menu::nav(Nav n, uint64_t now_ms) {
+         if (cursor < input::kSettingCount && (n == Nav::Confirm || n == Nav::Right)) change_setting(cursor, 1);
+         if (cursor < input::kSettingCount && n == Nav::Left) change_setting(cursor, -1);
+         return;
++    case Screen::Profiles: {
++        const int n_prof = int(profiles.size());
++        if (n == Nav::Back || (n == Nav::Confirm && cursor == n_prof + 1)) return open(Screen::Main, 0);
++        if (n != Nav::Confirm) return;
++        if (cursor == n_prof) {  // a new, empty profile
++            profiles.push_back({saves::next_name(profiles), 0});  // its folder is made when the game mounts it
++            int at = int(profiles.size()) - 1;
++            cursor = 0, scroll = 0;
++            move(at);
++            notice = profiles[at].name + " added: choose it to start a new save";
++            return;
++        }
++        if (settings.save_profile != profiles[cursor].name) settings_dirty = true;
++        settings.save_profile = profiles[cursor].name;
++        result = Result::Start;
++        return;
++    }
+     }
+ }
+ 
+@@ -820,6 +860,28 @@ void draw(SDL_Renderer* r, Art* a, const Menu& m, const Status& s) {
+         footer(a, "Enter / A: rebind, then press a button or key   \xc2\xb7   Esc / B: back", m.notice);
+         return;
+     }
++    if (m.screen == Screen::Profiles) {  // PLAY's save picker: a panel over the dimmed art
++        SDL_FRect panel{X(a, 200), Y(a, 90), 880 * a->s, 560 * a->s};
++        SDL_SetRenderDrawColor(r, 10, 14, 40, 235);
++        SDL_RenderFillRect(r, &panel);
++        SDL_SetRenderDrawColor(r, 255, 236, 200, 120);
++        SDL_RenderRect(r, &panel);
++        text(a, "CHOOSE A SAVE PROFILE", kWidth / 2, 150, 38, kWarmTop, kWarmBottom, kCentre, true);
++        for (int i = 0; i < m.count(); i++) {
++            SDL_FRect box = m.row_rect(i);
++            if (box.w <= 0) continue;
++            bool on = i == m.cursor;
++            if (on) band(a, box, {255, 236, 200, 60});
++            Rgba c = on ? kSelected : kWhite;
++            float y = box.y + 32;
++            text(a, fit(cells[i][0], 32), 270, y, 26, c, kLeft, true);
++            if (cells[i].size() > 1) text(a, cells[i][1], 1010, y, 18, on ? kSelected : kSoft, kRight);
++        }
++        if (m.scroll > 0) text(a, "\xe2\x80\xa6", 1040, 196, 18, kDim, kRight);
++        if (m.scroll + kProfilesVisible < m.count()) text(a, "\xe2\x80\xa6", 1040, 630, 18, kDim, kRight);
++        footer(a, "Enter / A: play with this profile   \xc2\xb7   Esc / B: back", m.notice);
++        return;
++    }
+     text(a, "SETTINGS", 88, 110, 52, kWarmTop, kWarmBottom, kLeft, true);
+     for (int i = 0; i < m.count(); i++) {
+         SDL_FRect box = m.row_rect(i);
+@@ -921,9 +983,19 @@ bool start() {
+         m.settings = s;
+         m.controls = input::active();
+         m.env = input::env_overrides();
++        m.profiles = saves::list(plat::data_root());
++        // NX_SAVE_PROFILE decides only when it is a usable name; otherwise the picker shows, with a warning, and
++        // the choice replaces it.
++        const char* chosen = std::getenv("NX_SAVE_PROFILE");
++        m.profile_env = chosen && saves::valid_name(chosen);
++        if (chosen && !m.profile_env) {
++            nx::log("launcher: NX_SAVE_PROFILE=%s is not a valid profile name; ignored", chosen);
++            m.notice = "NX_SAVE_PROFILE is not a valid profile name: choose a profile";
++        }
+         if (!run(m)) return false;
+         s = m.settings;
+         input::set_active(m.controls);
++        if (!m.profile_env) setenv("NX_SAVE_PROFILE", s.save_profile.c_str(), 1);  // the picker's choice
+     }
+     input::export_env(s);
+     return true;
+diff --git a/runtime/src/launcher.h b/runtime/src/launcher.h
+index b4021a8..21e1e29 100644
+--- a/runtime/src/launcher.h
++++ b/runtime/src/launcher.h
+@@ -13,10 +13,11 @@
+ #include <SDL3/SDL.h>
+ 
+ #include "input_map.h"
++#include "save_profile.h"
+ 
+ namespace nx::launcher {
+ 
+-enum class Screen { Main, Controls, Settings };
++enum class Screen { Main, Controls, Settings, Profiles };
+ enum class Result { None, Start, Quit };
+ enum class Nav { None, Up, Down, Left, Right, Confirm, Back };
+ 
+@@ -37,7 +38,7 @@ Event translate(const SDL_Event& e, const input::Controls& c, bool capturing, St
+ 
+ // Layout space: 1280x720, scaled uniformly to the window's pixels and centred; the art covers the whole window.
+ constexpr float kWidth = 1280, kHeight = 720;
+-constexpr int kControlsVisible = 20;
++constexpr int kControlsVisible = 20, kProfilesVisible = 8;
+ constexpr uint64_t kCaptureMs = 5000;
+ 
+ struct Menu {
+@@ -52,6 +53,10 @@ struct Menu {
+     bool controls_dirty = false, settings_dirty = false;
+     Result result = Result::None;
+     std::string notice;
++    // PLAY's save picker (Screen::Profiles, save_profile.h): the profiles found, then "New profile", then "Back".
++    // Choosing one sets settings.save_profile (saved) and starts. NX_SAVE_PROFILE in the environment skips it.
++    std::vector<saves::Profile> profiles{{saves::kDefault, 0}};
++    bool profile_env = false;
+ 
+     int count() const;
+     // Each row's cells: Main {item}; Controls {control, gamepad, keyboard} (the last two rows: {label});
+diff --git a/runtime/src/save_profile.h b/runtime/src/save_profile.h
+new file mode 100644
+index 0000000..2e6e7ef
+--- /dev/null
++++ b/runtime/src/save_profile.h
+@@ -0,0 +1,127 @@
++// Save profiles (Astral strict, docs/ASTRAL_LAUNCHER.md): separate save folders the launcher's PLAY picker chooses
++// from. "Default" is <data root>/user/save, where saves have always been (never moved or deleted); every other
++// profile <name> is <data root>/user/profiles/<name>/save. The choice reaches the runtime as NX_SAVE_PROFILE
++// (hle_fs.cpp MountSaveData) and is remembered in settings.ini (`save_profile`). Names are 1 to 32 letters, digits,
++// spaces, '-' or '_', not starting or ending with a space: never a path separator, "." or "..", so a profile's folder
++// is always inside <data root>/user/profiles.
++#pragma once
++#if defined(NX_ASTRAL_STRICT)
++#include <algorithm>
++#include <cctype>
++#include <chrono>
++#include <cstdint>
++#include <ctime>
++#include <filesystem>
++#include <string>
++#include <system_error>
++#include <vector>
++
++namespace nx::saves {
++
++constexpr const char* kDefault = "Default";
++constexpr size_t kMaxName = 32;
++
++inline bool is_default(const std::string& name) {
++    static const char kLower[] = "default";
++    if (name.size() != sizeof kLower - 1) return false;
++    for (size_t i = 0; i < name.size(); i++)
++        if (std::tolower(static_cast<unsigned char>(name[i])) != kLower[i]) return false;
++    return true;
++}
++
++// A profile name as given (any case of "Default" included), or not one.
++inline bool valid_name(const std::string& name) {
++    if (name.empty() || name.size() > kMaxName || name.front() == ' ' || name.back() == ' ') return false;
++    for (char c : name) {
++        unsigned char u = static_cast<unsigned char>(c);
++        if (!(std::isalnum(u) || c == ' ' || c == '-' || c == '_') || u >= 0x80) return false;
++    }
++    return true;
++}
++
++// The name a request stands for: "Default" for unset, empty, invalid or any case of "default".
++inline std::string normalise(const char* requested) {
++    std::string n = requested ? requested : "";
++    if (!valid_name(n) || is_default(n)) return kDefault;
++    return n;
++}
++
++// The save folder of a profile (normalise()d), always beneath <data root>/user.
++inline std::filesystem::path save_dir(const std::filesystem::path& data_root, const std::string& profile) {
++    std::string n = normalise(profile.c_str());
++    if (n == kDefault) return data_root / "user" / "save";
++    return data_root / "user" / "profiles" / std::filesystem::path(n) / "save";
++}
++
++struct Profile {
++    std::string name;
++    int64_t modified = 0;  // newest save file's modification time, seconds since the epoch; 0: no saves yet
++};
++
++// The newest modification time of the files in `dir` (one level of folders below too); 0 when there are none.
++inline int64_t newest(const std::filesystem::path& dir) {
++    namespace fs = std::filesystem;
++    std::error_code ec;
++    fs::file_time_type best = fs::file_time_type::min();
++    bool any = false;
++    for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
++        if (it.depth() > 1) continue;
++        std::error_code e2;
++        if (!it->is_regular_file(e2)) continue;
++        fs::file_time_type t = it->last_write_time(e2);
++        if (!e2 && (!any || t > best)) best = t, any = true;
++    }
++    if (!any) return 0;
++    auto sys = std::chrono::time_point_cast<std::chrono::seconds>(
++        best - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
++    return int64_t(sys.time_since_epoch().count());
++}
++
++// Default first, then every valid folder in <data root>/user/profiles, by name.
++inline std::vector<Profile> list(const std::filesystem::path& data_root) {
++    namespace fs = std::filesystem;
++    std::vector<Profile> out{{kDefault, newest(save_dir(data_root, kDefault))}};
++    std::vector<std::string> names;
++    std::error_code ec;
++    for (fs::directory_iterator it(data_root / "user" / "profiles", ec), end; !ec && it != end; it.increment(ec)) {
++        std::error_code e2;
++        if (it->is_symlink(e2) || !it->is_directory(e2)) continue;  // a link could lead out of the data root
++        std::string n = it->path().filename().string();  // valid names are ASCII
++        if (valid_name(n) && !is_default(n)) names.push_back(n);
++    }
++    std::sort(names.begin(), names.end());
++    for (const std::string& n : names) out.push_back({n, newest(save_dir(data_root, n))});
++    return out;
++}
++
++// "Profile 2", "Profile 3", ...: the first not in `have` (case-insensitively).
++inline std::string next_name(const std::vector<Profile>& have) {
++    auto lower = [](std::string s) {
++        for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
++        return s;
++    };
++    for (int k = 2;; k++) {
++        std::string n = "Profile " + std::to_string(k);
++        bool used = false;
++        for (const Profile& p : have) used = used || lower(p.name) == lower(n);
++        if (!used) return n;
++    }
++}
++
++// "Last played 2026-10-19 15:44" (local time), or "No saves yet".
++inline std::string modified_text(int64_t t) {
++    if (t <= 0) return "No saves yet";
++    std::time_t tt = std::time_t(t);
++    std::tm tm{};
++#if defined(_WIN32)
++    localtime_s(&tm, &tt);
++#else
++    localtime_r(&tt, &tm);
++#endif
++    char buf[64];
++    std::strftime(buf, sizeof buf, "Last played %Y-%m-%d %H:%M", &tm);
++    return buf;
++}
++
++}  // namespace nx::saves
++#endif

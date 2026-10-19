@@ -1,0 +1,84 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -218,6 +218,34 @@
+         message(FATAL_ERROR "iOS requires Astral and the reviewed UIKit adapter")
+     endif()
+     find_path(NX_VULKAN_INCLUDE vulkan/vulkan.h REQUIRED)
++    # BEGIN PINNED IOS VULKAN DEPENDENCY
++    # Public MoltenVK 1.3.0 all-archive simulator slice, source tag 49b97f26.
++    if(NOT NX_IOS_MOLTENVK_LIBRARY OR NOT EXISTS "${NX_IOS_MOLTENVK_LIBRARY}")
++        message(FATAL_ERROR "missing pinned simulator MoltenVK library")
++    endif()
++    execute_process(COMMAND xcrun otool -arch arm64 -l "${NX_IOS_MOLTENVK_LIBRARY}"
++        RESULT_VARIABLE mvk_status OUTPUT_VARIABLE mvk_load ERROR_VARIABLE mvk_error)
++    string(REGEX MATCHALL "platform[ \t]+[A-Za-z0-9_]+" mvk_platforms "${mvk_load}")
++    if(NOT mvk_status EQUAL 0 OR NOT mvk_platforms)
++        message(FATAL_ERROR "missing arm64 simulator LC_BUILD_VERSION")
++    endif()
++    foreach(platform IN LISTS mvk_platforms)
++        if(NOT platform MATCHES "^platform[ \t]+(7|IOSSIMULATOR)$")
++            message(FATAL_ERROR "wrong-platform MoltenVK: ${platform}")
++        endif()
++    endforeach()
++    file(SHA256 "${NX_IOS_MOLTENVK_LIBRARY}" mvk_hash)
++    if(NOT mvk_hash STREQUAL "c6579190db24f622856c7fbc0bd2bdab7a2338f083945aa1ea0cab8afc38df27")
++        message(FATAL_ERROR "unpinned simulator MoltenVK bytes")
++    endif()
++    if(NOT EXISTS "${NX_VULKAN_INCLUDE}/vulkan/vulkan_core.h")
++        message(FATAL_ERROR "missing pinned Vulkan headers")
++    endif()
++    file(SHA256 "${NX_VULKAN_INCLUDE}/vulkan/vulkan_core.h" mvk_header_hash)
++    if(NOT mvk_header_hash STREQUAL "7895976b1c44a002b0670865d2dce844185530d5f25728fc575f70f941935483")
++        message(FATAL_ERROR "unpinned Vulkan headers")
++    endif()
++    # END PINNED IOS VULKAN DEPENDENCY
+     add_executable(${NX_GAME} MACOSX_BUNDLE ${NX_RUNTIME_SOURCES}
+         runtime/src/platform_ios.mm runtime/src/memguard_mac.cpp
+         "${NX_IOS_HOST_DIR}/App.mm" "${NX_IOS_HOST_DIR}/InputBridge.cpp")
+@@ -225,8 +253,8 @@
+         "${NX_VULKAN_INCLUDE}" "${NX_IOS_HOST_DIR}")
+     target_compile_definitions(${NX_GAME} PRIVATE NX_IOS_RUNTIME=1)
+     target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
+-    target_link_libraries(${NX_GAME} PRIVATE game_main game_sdk
+-        "-framework UIKit" "-framework Metal" "-framework MetalKit" "-framework QuartzCore"
++    target_link_libraries(${NX_GAME} PRIVATE game_main game_sdk "${NX_IOS_MOLTENVK_LIBRARY}"
++        "-framework IOSurface" "-framework UIKit" "-framework Metal" "-framework MetalKit" "-framework QuartzCore"
+         "-framework Foundation" "-framework CoreGraphics")
+     set_target_properties(${NX_GAME} PROPERTIES MACOSX_BUNDLE_INFO_PLIST "${NX_IOS_HOST_DIR}/Info.plist")
+ elseif(APPLE)
+diff --git a/runtime/src/platform_ios.mm b/runtime/src/platform_ios.mm
+--- a/runtime/src/platform_ios.mm
++++ b/runtime/src/platform_ios.mm
+@@ -1,5 +1,5 @@
+ // Original simulator adapter; POSIX memory/thread/file contracts follow reviewed platform_mac.cpp.
+-// No desktop entry or SDL dependency. Unsupported graphics/audio are fatal boundaries.
++// No desktop entry or SDL dependency. Audio remains an explicit unsupported boundary.
+ #import <Foundation/Foundation.h>
+ #import <TargetConditionals.h>
+ #if !TARGET_OS_SIMULATOR
+@@ -165,8 +165,8 @@
+ }
+
+
+-// Graphics SDK availability is checked by the preparation tool. Until a verified
+-// simulator library/surface integration exists, stop at the first host request.
++// Vulkan is statically linked to the pinned simulator MoltenVK release.
++// The UIKit host owns main-thread layer attachment and retained surface leases.
+ // Window ownership/state functions live with the main-thread UIKit host in App.mm.
+ float default_render_scale() { return 1.0f; }
+ bool headless() { return false; }
+@@ -195,7 +195,11 @@
+ bool audio_submit(const void*, size_t, void*) { nx::fatal("unsupported iOS host operation: audio_submit"); }
+ uint32_t audio_queued() { nx::fatal("unsupported iOS host operation: audio_queued"); }
+ void audio_pause(bool) { nx::fatal("unsupported iOS host operation: audio_pause"); }
+-void* vulkan_get_instance_proc_addr() { nx::fatal("unsupported iOS host operation: Vulkan loader (no verified simulator MoltenVK)"); }
++extern "C" void* acs_vulkan_get_instance_proc_addr();
++extern "C" int acs_vulkan_create_surface(void*, void*, uint64_t*, void*);
++void* vulkan_get_instance_proc_addr() { return acs_vulkan_get_instance_proc_addr(); }
+ const char* vulkan_surface_extension() { return "VK_EXT_metal_surface"; }
+-int vulkan_create_surface(void*, void*, uint64_t*, void*) { nx::fatal("unsupported iOS host operation: Vulkan surface"); }
++int vulkan_create_surface(void* instance, void* window, uint64_t* surface, void* gipa) {
++    return acs_vulkan_create_surface(instance, window, surface, gipa);
++}
+ } // namespace nx::plat

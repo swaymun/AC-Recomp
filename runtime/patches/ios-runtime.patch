@@ -1,0 +1,257 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7a35db2..aabae3c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -12,7 +12,9 @@ if(NX_GAME STREQUAL "astral")
+     add_compile_definitions(NX_ASTRAL_STRICT=1)
+     if(APPLE)
+         if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+-            message(FATAL_ERROR "Astral bootstrap is native macOS only; simulator integration pending")
++            if(NOT CMAKE_OSX_SYSROOT MATCHES "[iI][pP]hone[Ss]imulator" OR NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
++                message(FATAL_ERROR "Astral iOS supports arm64 simulator only")
++            endif()
+         endif()
+         add_compile_definitions(NX_APPLE_HIGH_MEMORY=1)
+     endif()
+@@ -93,6 +95,9 @@ foreach(mod main sdk)
+         # armv8.2-a+crypto: cpu.h's AES/SHA paths need __ARM_FEATURE_AES/SHA2 (the NDK default armv8-a has neither).
+         target_compile_options(game_${mod} PRIVATE -O2 -fPIC -fvisibility=hidden -fno-semantic-interposition
+                                -march=armv8.2-a+crypto)
++    elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++        # Bounded first-boundary build; no optimization/performance acceptance.
++        target_compile_options(game_${mod} PRIVATE -O0 -fvisibility=hidden -ffp-contract=off)
+     elseif(APPLE)
+         target_compile_options(game_${mod} PRIVATE -O2 -fvisibility=hidden)
+     elseif(UNIX)
+@@ -206,6 +211,24 @@ if(ANDROID)
+     target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden -fno-semantic-interposition -march=armv8.2-a+crypto)
+     # The glue's ANativeActivity_onCreate must be exported. 16 KB page alignment: Android 15+ devices with 16 KB pages.
+     target_link_options(${NX_GAME} PRIVATE -u ANativeActivity_onCreate -Wl,-z,max-page-size=16384)
++elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++    enable_language(OBJCXX)
++    set(CMAKE_OBJCXX_STANDARD 20)
++    if(NOT NX_GAME STREQUAL "astral" OR NOT NX_IOS_HOST_DIR)
++        message(FATAL_ERROR "iOS requires Astral and the reviewed UIKit adapter")
++    endif()
++    find_path(NX_VULKAN_INCLUDE vulkan/vulkan.h REQUIRED)
++    add_executable(${NX_GAME} MACOSX_BUNDLE ${NX_RUNTIME_SOURCES}
++        runtime/src/platform_ios.mm runtime/src/memguard_mac.cpp
++        "${NX_IOS_HOST_DIR}/App.mm" "${NX_IOS_HOST_DIR}/InputBridge.cpp")
++    target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}"
++        "${NX_VULKAN_INCLUDE}" "${NX_IOS_HOST_DIR}")
++    target_compile_definitions(${NX_GAME} PRIVATE NX_IOS_RUNTIME=1)
++    target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
++    target_link_libraries(${NX_GAME} PRIVATE game_main game_sdk
++        "-framework UIKit" "-framework Metal" "-framework MetalKit" "-framework QuartzCore"
++        "-framework Foundation" "-framework CoreGraphics")
++    set_target_properties(${NX_GAME} PROPERTIES MACOSX_BUNDLE_INFO_PLIST "${NX_IOS_HOST_DIR}/Info.plist")
+ elseif(APPLE)
+     # macOS: SDL3 (window, input, audio) and the Vulkan loader + MoltenVK from Homebrew
+     # (brew install sdl3 vulkan-headers vulkan-loader molten-vk).
+diff --git a/runtime/src/platform_ios.mm b/runtime/src/platform_ios.mm
+new file mode 100644
+index 0000000..a2680f7
+--- /dev/null
++++ b/runtime/src/platform_ios.mm
+@@ -0,0 +1,201 @@
++// Original simulator adapter; POSIX memory/thread/file contracts follow reviewed platform_mac.cpp.
++// No desktop entry or SDL dependency. Unsupported graphics/audio are fatal boundaries.
++#import <Foundation/Foundation.h>
++#import <TargetConditionals.h>
++#if !TARGET_OS_SIMULATOR
++#error Astral iOS runtime is simulator only
++#endif
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <climits>
++#include <cmath>
++#include <cstring>
++#include <cstdlib>
++#include <filesystem>
++#include <pthread.h>
++#include <sched.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <mach/mach.h>
++#include <mach/thread_switch.h>
++#include <nx/game.h>
++#include <nx/runtime.h>
++#include "platform.h"
++#include "InputBridge.h"
++namespace nx::plat {
++bool reserve(uint64_t addr, uint64_t size) {
++    void* p = mmap(reinterpret_cast<void*>(addr), size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
++    if (p == MAP_FAILED) return false;
++    if (uint64_t(p) != addr) {
++        munmap(p, size);
++        return false;
++    }
++    return true;
++}
++
++bool commit(uint64_t addr, uint64_t size) {
++    uint64_t page = uint64_t(getpagesize()) - 1;  // 16 KiB on Apple silicon
++    uint64_t a = addr & ~page, e = (addr + size + page) & ~page;
++    return mprotect(reinterpret_cast<void*>(a), e - a, PROT_READ | PROT_WRITE) == 0;
++}
++
++// The guest frees 4 KiB pages; Apple silicon pages are 16 KiB, and mprotect would take the neighbours of a partly
++// freed page with it (SIGBUS in Wonder when nn::os's VAMM unmapped single pages). Only whole host pages are
++// released; the freed part of a shared one is zeroed, which is what the guest would see if it maps it again.
++void decommit(uint64_t addr, uint64_t size) {
++    uint64_t page = uint64_t(getpagesize());
++    uint64_t lo = (addr + page - 1) & ~(page - 1), hi = (addr + size) & ~(page - 1);
++    if (lo >= hi) {
++        std::memset(reinterpret_cast<void*>(addr), 0, size);
++        return;
++    }
++    if (addr < lo) std::memset(reinterpret_cast<void*>(addr), 0, lo - addr);
++    if (hi < addr + size) std::memset(reinterpret_cast<void*>(hi), 0, addr + size - hi);
++    // MADV_FREE may retain old bytes indefinitely. Zero before lazy reclamation;
++    // either retained zeros or newly faulted anonymous zeros are safe on reuse.
++    // Only complete host pages lose access; shared 4 KiB edge neighbours stay RW.
++    // decommit has no error return: never silently report an unprotected guard.
++    if (mprotect(reinterpret_cast<void*>(lo), hi - lo, PROT_READ | PROT_WRITE) != 0) std::abort();
++    std::memset(reinterpret_cast<void*>(lo), 0, hi - lo);
++    // Advice is optional after explicit zeroing; protection is mandatory.
++    (void)madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_FREE);
++    if (mprotect(reinterpret_cast<void*>(lo), hi - lo, PROT_NONE) != 0) std::abort();
++}
++
++// ---- threads and time -----------------------------------------------------------------------------------------
++
++struct ThreadStart {
++    ThreadFn fn;
++    void* arg;
++};
++
++static void* thread_entry(void* p) {
++    ThreadStart s = *static_cast<ThreadStart*>(p);
++    delete static_cast<ThreadStart*>(p);
++    // The game's threads (render, jobs, audio) are latency critical: default QoS lets macOS run them on the M1's
++    // efficiency cores and stretch their sleeps and wakeups.
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++    s.fn(s.arg);
++    return nullptr;
++}
++
++void start_thread(ThreadFn fn, void* arg, size_t stack_size) {
++    pthread_attr_t a;
++    pthread_attr_init(&a);
++    if (pthread_attr_setstacksize(&a, (stack_size + 0x3FFF) & ~size_t(0x3FFF))) nx::fatal("iOS pthread stack rejected");
++    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
++    pthread_t t;
++    auto* start = new ThreadStart{fn, arg};
++    if (pthread_create(&t, &a, thread_entry, start)) { delete start; nx::fatal("iOS pthread_create failed"); }
++    pthread_attr_destroy(&a);
++}
++
++void exit_thread() { pthread_exit(nullptr); }
++void exit_process(int code) { _exit(code); }
++
++void sleep_ns(int64_t ns) {
++    timespec ts{time_t(ns / 1000000000), long(ns % 1000000000)};
++    nanosleep(&ts, nullptr);
++}
++
++// macOS sched_yield drops the caller to priority 0 for a while: measured 20-180 us per call on the M1, and Wonder's
++// job system yields after every job item and in its barriers, so the main thread spent ~60% of its frame there and
++// the game's governor fell to 30 fps (docs/nvn/DEBUG.md #44). thread_switch with no hint (2-4 us) gives the core to
++// another ready thread without that penalty. NX_YIELD=sched: the old call.
++void yield() {
++    static const bool sched = [] {
++        const char* e = std::getenv("NX_YIELD");
++        return e && std::strcmp(e, "sched") == 0;
++    }();
++    if (sched)
++        sched_yield();
++    else
++        thread_switch(MACH_PORT_NULL, SWITCH_OPTION_NONE, 0);
++}
++void set_thread_name(const char* name) { pthread_setname_np(name); }  // Darwin: the calling thread only
++
++int64_t current_thread_id() {
++    uint64_t tid = 0;
++    pthread_threadid_np(nullptr, &tid);
++    return int64_t(tid);
++}
++
++bool profile(const int64_t*, const uint64_t* const*, size_t, int, const std::string&) { nx::fatal("unsupported iOS host operation: profile"); }  // use Instruments
++
++uint64_t monotonic_ns() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
++
++// ---- files and output -----------------------------------------------------------------------------------------
++
++FILE* fopen_utf8(const std::string& path, const char* mode) { return std::fopen(path.c_str(), mode); }
++int64_t ftell64(FILE* f) { return ftello(f); }
++int fseek64(FILE* f, int64_t off, int origin) { return fseeko(f, off, origin); }
++
++uint64_t read_at(FILE* f, int64_t off, void* buf, uint64_t size) {
++    if (size > uint64_t(SSIZE_MAX)) return 0;  // the game passes -1 as "everything": fread read nothing
++    int fd = fileno(f);
++    uint64_t done = 0;
++    while (done < size) {
++        ssize_t n = pread(fd, static_cast<uint8_t*>(buf) + done, size_t(size - done), off + int64_t(done));
++        if (n < 0 && errno == EINTR) continue;
++        if (n <= 0) break;
++        done += uint64_t(n);
++    }
++    return done;
++}
++
++bool make_dirs(const std::string& path) {
++    std::error_code ec;
++    std::filesystem::create_directories(path, ec);
++    return !ec;
++}
++
++void log_line(const char* line) { std::fprintf(stderr, "%s\n", line); }
++
++std::string data_root() {
++    NSString* root = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"guest"];
++    return root.fileSystemRepresentation;
++}
++
++std::string setting(const std::string& key) {
++    std::string env = "NX_";
++    for (char ch : key) env += char(std::toupper(static_cast<unsigned char>(ch)));
++    const char* v = std::getenv(env.c_str());
++    return v ? v : "";
++}
++
++
++// Graphics SDK availability is checked by the preparation tool. Until a verified
++// simulator library/surface integration exists, stop at the first host request.
++// Window ownership/state functions live with the main-thread UIKit host in App.mm.
++float default_render_scale() { return 1.0f; }
++bool headless() { return false; }
++void read_pad(PadState& p) {
++    auto s = acs_input_poll();
++    if (s.abi_version != 1) nx::fatal("iOS input ABI mismatch");
++    struct Map { ACSInputControl source; uint64_t target; };
++    static const Map map[] = {{ACS_A,kA},{ACS_B,kB},{ACS_X,kX},{ACS_Y,kY},
++        {ACS_L,kL},{ACS_R,kR},{ACS_ZL,kZL},{ACS_ZR,kZR},{ACS_PLUS,kPlus},{ACS_MINUS,kMinus}};
++    for (auto m : map) if (s.buttons & ACS_BUTTON(m.source)) p.buttons |= m.target;
++    auto axis = [](float v) { return int32_t(std::lround(std::clamp(v, -1.0f, 1.0f) * kStickMax)); };
++    p.lx = axis(s.left_x); p.ly = axis(s.left_y); // both ABIs use up-positive Y
++    p.rx = axis(s.right_x); p.ry = axis(s.right_y);
++    if (s.left_trigger > .5f) p.buttons |= kZL;
++    if (s.right_trigger > .5f) p.buttons |= kZR;
++    if (p.lx < -16383) p.buttons |= kStickLLeft;
++    if (p.lx > 16383) p.buttons |= kStickLRight;
++    if (p.ly < -16383) p.buttons |= kStickLDown;
++    if (p.ly > 16383) p.buttons |= kStickLUp;
++    if (p.rx < -16383) p.buttons |= kStickRLeft;
++    if (p.rx > 16383) p.buttons |= kStickRRight;
++    if (p.ry < -16383) p.buttons |= kStickRDown;
++    if (p.ry > 16383) p.buttons |= kStickRUp;
++}
++bool audio_open(AudioDone) { nx::fatal("unsupported iOS host operation: audio_open"); }
++bool audio_submit(const void*, size_t, void*) { nx::fatal("unsupported iOS host operation: audio_submit"); }
++uint32_t audio_queued() { nx::fatal("unsupported iOS host operation: audio_queued"); }
++void audio_pause(bool) { nx::fatal("unsupported iOS host operation: audio_pause"); }
++void* vulkan_get_instance_proc_addr() { nx::fatal("unsupported iOS host operation: Vulkan loader (no verified simulator MoltenVK)"); }
++const char* vulkan_surface_extension() { return "VK_EXT_metal_surface"; }
++int vulkan_create_surface(void*, void*, uint64_t*, void*) { nx::fatal("unsupported iOS host operation: Vulkan surface"); }
++} // namespace nx::plat

@@ -1,0 +1,70 @@
+diff --git a/runtime/src/svc_am.cpp b/runtime/src/svc_am.cpp
+--- a/runtime/src/svc_am.cpp
++++ b/runtime/src/svc_am.cpp
+@@ -1,4 +1,5 @@
+ // am services (appletOE): application proxy, focus/operation-mode state, launch parameters.
++#include <algorithm>
+ #include <cstdlib>
+ #include <deque>
+ #include <mutex>
+@@ -18,11 +19,32 @@
+ enum class FocusHandlingMode { AlwaysSuspend, SuspendHomeSleep, NoSuspend };
+ 
+ struct AppletState {
+-    std::deque<uint32_t> messages{kMsgFocusStateChanged, kMsgOperationModeChanged, kMsgPerformanceModeChanged};
++    std::deque<uint32_t> messages{kMsgFocusStateChanged};
+     std::shared_ptr<EventState> message_event = std::make_shared<EventState>();
+     // Applet-owned policy, shared by all controller sessions and common getters.
++    bool operation_notify = true;
++    bool performance_notify = true;
++    bool resume_notify = false;
+     bool focus_notify = true;
+     FocusHandlingMode focus_mode = FocusHandlingMode::SuspendHomeSleep;
++
++    // Initial foreground mode snapshot is the only mode producer today. Keep
++    // one pending message per kind, matching the lifecycle manager's bits.
++    // Caller holds g_applet_events and refreshes the event after later requests.
++    void enqueue_mode_notifications() {
++        auto enqueue = [&](bool enabled, uint32_t message) {
++            if (!enabled || std::find(messages.begin(), messages.end(), message) != messages.end()) return;
++            // Preserve operation-before-performance priority even if performance
++            // was already pending when operation notifications were enabled.
++            auto before = message == kMsgOperationModeChanged
++                ? std::find(messages.begin(), messages.end(), kMsgPerformanceModeChanged)
++                : messages.end();
++            messages.insert(before, message);
++        };
++        enqueue(operation_notify, kMsgOperationModeChanged);
++        enqueue(performance_notify, kMsgPerformanceModeChanged);
++    }
++    AppletState() { enqueue_mode_notifications(); }
+ };
+ 
+ AppletState& applet() {
+@@ -111,6 +133,26 @@
+ // in this runtime; command 90 stays fatal rather than inventing tick accounting.
+ std::shared_ptr<Service> self_controller() {
+     return svc("ISelfController", [](Service& s) {
++        // libnx 20cbcfd9: u8 bool, result only. The oe resume API maps to
++        // wire command 14 (SetRestartMessageEnabled), not adjacent command 15.
++        for (uint32_t cmd : {11u, 12u, 14u}) {
++            s.cmds[cmd] = [cmd](IpcCtx& c) {
++                if (!c.in || c.in_size < 1 || c.arg<uint8_t>(0) > 1)
++                    fatal("ISelfController notification command %u: malformed boolean payload", cmd);
++                const bool enabled = c.arg<uint8_t>(0) != 0;
++                std::lock_guard lk(g_applet_events);  // IPC -> applet -> kernel
++                auto& a = applet();
++                if (cmd == 11) a.operation_notify = enabled;
++                else if (cmd == 12) a.performance_notify = enabled;
++                else a.resume_notify = enabled;
++                // These flags gate future producers, not already pending mode
++                // messages. Enabling is not itself a mode change or a resume.
++                update_message_event(a);
++                // Only ForegroundVisible is supported. No suspend/resume or
++                // host dock/performance transition is inferred from this call.
++                return 0u;
++            };
++        }
+         // libnx 20cbcfd9: three u8 booleans, no output. Observed behaviour
+         // applies notify/suspend to applet state; background is read but unused.
+         // Validate before mutation: malformed input must never look successful.
