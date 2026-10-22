@@ -271,3 +271,34 @@ When a player gives no firmware fonts, `tools/acr_build.py` downloads Noto Sans 
 `f2095b08bed08b23a6fe26112fcd679a2bee3f002eef077eb05d215ed1051bd8`). Copyright 2022 The Noto Project Authors, SIL
 Open Font License 1.1. It is not redistributed by this repository or its releases; the build checks both checksums,
 installs the font only on the player's machine and copies the license next to it.
+
+## Astral Chain Dynamic FPS port
+
+`tools/astral_fps_dynamic.py` adapts the timer, whole-tick input/action counter and camera designs of
+[yogesh1239/AstralChain-Dynamic-FPS](https://github.com/yogesh1239/AstralChain-Dynamic-FPS), v1.1.1,
+revision `79965b4df077f64b27b74456d0db88c6afac5bbe`. Its patch instructions target 1.0.1; this repository maps
+and validates its own 1.0.0 sites and emits a different, shared-helper cave for lift-time use. The upstream
+credits **theboy181** for the original Static 60 FPS patch that located the timer and display-cap code.
+The removed v1.1 whole-tick cutscene workaround is not included. Game images and derived code stay private.
+
+MIT License
+
+Copyright (c) 2026 yogesh1239
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

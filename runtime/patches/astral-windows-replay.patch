@@ -1,0 +1,401 @@
+diff --git a/runtime/src/nvn/nvn.h b/runtime/src/nvn/nvn.h
+index 433dc68..8e9ab54 100644
+--- a/runtime/src/nvn/nvn.h
++++ b/runtime/src/nvn/nvn.h
+@@ -23,6 +23,8 @@
+
+ #include "vk_bridge.h"  // Vulkan headers without prototypes; the dispatch table is vk_gen.h
+
++#include "nvn_command_storage.h"
++
+ namespace nx::nvn {
+
+ // The SDK driver's implementation of an NVN proc (0 if it has none). Resolved through its own nvnBootstrapLoader.
+@@ -330,7 +332,7 @@ struct Cmd {
+
+ struct CmdList {
+     std::vector<Cmd> cmds;
+-    std::vector<std::vector<uint8_t>> blobs;
++    CommandBlobs blobs;
+     uint64_t handle = 0;     // its NVNcommandHandle
+     uint64_t epoch = 0;      // the texture epoch when its recording ended (nvn_incarnation.cpp): what its draws name
+     uint32_t skinned = 0;    // NX_TRACE_SKINLISTS: binds of skinned programs (a vertex input at location 6) in it
+@@ -339,6 +341,10 @@ struct CmdList {
+     size_t scanned_size = SIZE_MAX;
+     uint32_t own_dispatches = 0;
+     std::vector<uint64_t> calls;
++    void reset() {
++        cmds.clear(); blobs.clear(); calls.clear(); handle=epoch=0; skinned=own_dispatches=0; scanned_size=SIZE_MAX;
++    }
++    size_t retained_bytes() const { return cmds.capacity()*sizeof(Cmd)+blobs.retained_bytes()+calls.capacity()*sizeof(uint64_t); }
+ };
+ // NX_TRACE_SKINLISTS (nvn_cmd.cpp): follows the lists that bind skinned programs, from recording to replay.
+ bool skin_lists_on();
+diff --git a/runtime/src/nvn/nvn_cmd.cpp b/runtime/src/nvn/nvn_cmd.cpp
+index 52ef32d..c48fd8f 100644
+--- a/runtime/src/nvn/nvn_cmd.cpp
++++ b/runtime/src/nvn/nvn_cmd.cpp
+@@ -24,9 +24,15 @@ std::shared_ptr<CmdList> peek_list(uint64_t handle);
+
+ namespace {
+
++std::shared_ptr<CmdList> new_command_list() {
++    if (!replay_options().pool) return std::make_shared<CmdList>();
++    static auto pool = std::make_shared<CommandListPool<CmdList>>();
++    return pool->acquire(pool);
++}
++
+ struct CommandBuffer : Object {
+     std::mutex lock;
+-    std::shared_ptr<CmdList> recording = std::make_shared<CmdList>();
++    std::shared_ptr<CmdList> recording = new_command_list();
+     // The memory the game hands over (AddCommandMemory / AddControlMemory) and what recording "uses" of it. Engines
+     // look at the used amounts right after EndRecording (a list that used nothing is dropped, never submitted) and
+     // at the free ones (to add memory in time), so usage grows with the commands recorded, survives EndRecording
+@@ -144,7 +150,7 @@ void CommandBufferFinalize(CPU& c) { destroy(c.x[0]); }
+ void CommandBufferBeginRecording(CPU& c) {
+     if (auto* cb = get<CommandBuffer>(c.x[0])) {
+         std::lock_guard lk(cb->lock);
+-        cb->recording = std::make_shared<CmdList>();
++        cb->recording = new_command_list();
+     }
+ }
+
+@@ -193,7 +199,7 @@ bool skinned_program(uint64_t program) {
+ }
+
+ void CommandBufferEndRecording(CPU& c) {  // NVNcommandHandle
+-    std::shared_ptr<CmdList> list = std::make_shared<CmdList>();
++    std::shared_ptr<CmdList> list = new_command_list();
+     uint64_t start = 0, end = 0, pool = 0;
+     const uint64_t cb_guest = c.x[0];
+     if (auto* cb = get<CommandBuffer>(c.x[0])) {
+diff --git a/runtime/src/nvn/nvn_command_storage.h b/runtime/src/nvn/nvn_command_storage.h
+new file mode 100644
+index 0000000..83965f8
+--- /dev/null
++++ b/runtime/src/nvn/nvn_command_storage.h
+@@ -0,0 +1,60 @@
++// Original immutable command payload arena and bounded final-owner recycling.
++#pragma once
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <vector>
++#include "nvn_replay_options.h"
++namespace nx::nvn {
++struct CommandBlobView {
++    const uint8_t* ptr; size_t bytes;
++    const uint8_t* data() const { return ptr; }
++    size_t size() const { return bytes; }
++};
++class CommandBlobs {
++    struct Span { size_t offset, bytes; };
++    bool packed_ = replay_options().pool;
++    std::vector<std::vector<uint8_t>> legacy_;
++    std::vector<uint8_t> data_;
++    std::vector<Span> spans_;
++public:
++    size_t size() const { return packed_ ? spans_.size() : legacy_.size(); }
++    CommandBlobView operator[](size_t i) const {
++        if (!packed_) return {legacy_[i].data(), legacy_[i].size()};
++        const auto& s = spans_[i]; return {data_.data()+s.offset, s.bytes};
++    }
++    void emplace_back(const uint8_t* first, const uint8_t* last) {
++        if (!packed_) { legacy_.emplace_back(first,last); return; }
++        // Vertex-state replay casts payloads to aligned POD arrays. Offsets survive arena growth.
++        const size_t at = (data_.size()+alignof(std::max_align_t)-1) & ~(alignof(std::max_align_t)-1);
++        data_.resize(at); const size_t count = size_t(last-first);
++        data_.insert(data_.end(),first,last); spans_.push_back({at,count});
++    }
++    void clear() { legacy_.clear(); data_.clear(); spans_.clear(); }
++    size_t retained_bytes() const { return data_.capacity()+spans_.capacity()*sizeof(Span); }
++};
++inline std::atomic<uint64_t> g_replay_created{0}, g_replay_reused{0}, g_replay_released{0};
++template<class T> class CommandListPool {
++    std::mutex lock_;
++    std::vector<std::unique_ptr<T>> free_;
++    size_t bytes_ = 0;
++    static constexpr size_t max_bytes = 32u<<20, max_lists = 256;
++public:
++    std::shared_ptr<T> acquire(const std::shared_ptr<CommandListPool>& owner) {
++        std::unique_ptr<T> item;
++        { std::lock_guard lk(lock_);
++          if (!free_.empty()) { item=std::move(free_.back()); free_.pop_back(); bytes_-=item->retained_bytes(); } }
++        if (item) ++g_replay_reused; else { item=std::make_unique<T>(); ++g_replay_created; }
++        return std::shared_ptr<T>(item.release(),[owner](T* p) { owner->release(std::unique_ptr<T>(p)); });
++    }
++    void release(std::unique_ptr<T> p) {
++        // Called only after the handle, recording and every queued replay release their shared owners.
++        p->reset(); const size_t bytes=p->retained_bytes(); std::lock_guard lk(lock_);
++        if (free_.size()<max_lists && bytes<=max_bytes-bytes_) { bytes_+=bytes; free_.push_back(std::move(p)); }
++        else ++g_replay_released;
++    }
++    size_t retained_bytes() { std::lock_guard lk(lock_); return bytes_; }
++};
++}  // namespace nx::nvn
+diff --git a/runtime/src/nvn/nvn_draw.cpp b/runtime/src/nvn/nvn_draw.cpp
+index a4d846e..a864581 100644
+--- a/runtime/src/nvn/nvn_draw.cpp
++++ b/runtime/src/nvn/nvn_draw.cpp
+@@ -112,8 +112,16 @@ void set_dynamic(VkCommandBuffer cb, const VkViewport& vp, const VkRect2D& sc) {
+     if (differs(!same_bytes(b.scissor, sc))) p_vkCmdSetScissor(cb, 0, 1, &sc), b.scissor = sc;
+     if (differs(std::memcmp(b.blend, s.blend_color, sizeof b.blend) != 0))
+         p_vkCmdSetBlendConstants(cb, s.blend_color), std::memcpy(b.blend, s.blend_color, sizeof b.blend);
+-    if (differs(std::memcmp(b.raster, raster, sizeof raster) != 0))  // stencil reference and masks, depth bias
+-        raster_dynamic(cb, slack), std::memcpy(b.raster, raster, sizeof raster);  // (nvn_raster.cpp)
++    if (differs(std::memcmp(b.raster, raster, sizeof raster) != 0)) {
++        uint32_t changed = 15;
++        if (replay_options().dynamic && !all) {
++            changed = 0;
++            for (uint32_t k=0; k<3; ++k)
++                if (std::memcmp(b.raster+2*k,raster+2*k,2*sizeof(uint32_t))) changed |= 1u<<k;
++            if (std::memcmp(b.raster+6,raster+6,4*sizeof(uint32_t))) changed |= 8;
++        }
++        raster_dynamic(cb, slack, changed); std::memcpy(b.raster, raster, sizeof raster);
++    }
+ }
+
+ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
+@@ -203,7 +211,9 @@ void dispatch(VkCommandBuffer cb, const Cmd& c) {
+     static const bool off = std::getenv("NX_NO_COMPUTE") != nullptr;  // debug: skip compute dispatches
+     if (off) return;
+ #if defined(NX_ASTRAL_STRICT)
+-    const auto selected = bound_shaders(true);
++    thread_local std::vector<const ShaderInfo*> selected;
++    if (replay_options().scratch) bound_shaders_into(true, selected);
++    else selected = bound_shaders(true);
+     const auto* shaders = &selected;
+ #else
+     const auto* shaders = program_shaders(g_state.program);
+@@ -264,7 +274,9 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
+     g_stats.total++;
+     if (g_state.rasterizer_discard || !g_state.render_enable) return false;  // nothing reaches the targets
+ #if defined(NX_ASTRAL_STRICT)
+-    const auto selected = bound_shaders(false);
++    thread_local std::vector<const ShaderInfo*> selected;
++    if (replay_options().scratch) bound_shaders_into(false, selected);
++    else selected = bound_shaders(false);
+     const auto* shaders = &selected;
+ #else
+     const auto* shaders = program_shaders(g_state.program);
+@@ -587,6 +599,9 @@ void draw_begin_submit() {
+ uint64_t recorded_draws();
+
+ void draw_log_stats() {
++    if (replay_options().pool) log("replay storage created=%llu reused=%llu released=%llu",
++        (unsigned long long)g_replay_created.load(), (unsigned long long)g_replay_reused.load(),
++        (unsigned long long)g_replay_released.load());
+     if (g_vertex_barriers) log("nvn passes: %llu vertex-read barriers (G4)", (unsigned long long)g_vertex_barriers);
+     dedup_log();
+     render_pass_log();
+diff --git a/runtime/src/nvn/nvn_draw_state.cpp b/runtime/src/nvn/nvn_draw_state.cpp
+index fc9c389..3b05bf0 100644
+--- a/runtime/src/nvn/nvn_draw_state.cpp
++++ b/runtime/src/nvn/nvn_draw_state.cpp
+@@ -12,8 +12,8 @@ namespace nx::nvn {
+ using namespace replay;
+
+ #if defined(NX_ASTRAL_STRICT)
+-std::vector<const ShaderInfo*> replay::bound_shaders(bool compute) {
+-    std::vector<const ShaderInfo*> stages;
++void replay::bound_shaders_into(bool compute, std::vector<const ShaderInfo*>& stages) {
++    stages.clear();
+     for (int slot : {0, 1, 5}) {
+         if ((slot == 5) != compute) continue;
+         const auto* shaders = program_shaders(g_state.stage_programs[slot]);
+@@ -22,7 +22,9 @@ std::vector<const ShaderInfo*> replay::bound_shaders(bool compute) {
+         for (const ShaderInfo* shader : *shaders)
+             if (shader->stage == wanted) stages.push_back(shader);
+     }
+-    return stages;
++}
++std::vector<const ShaderInfo*> replay::bound_shaders(bool compute) {
++    std::vector<const ShaderInfo*> stages; bound_shaders_into(compute, stages); return stages;
+ }
+ #endif
+
+diff --git a/runtime/src/nvn/nvn_draw_state.h b/runtime/src/nvn/nvn_draw_state.h
+index 65ae7bd..2592fb6 100644
+--- a/runtime/src/nvn/nvn_draw_state.h
++++ b/runtime/src/nvn/nvn_draw_state.h
+@@ -53,6 +53,7 @@ struct Stats {
+ #if defined(NX_ASTRAL_STRICT)
+ // Resolve the selected stage programs at replay time, like the original single-program path.
+ std::vector<const ShaderInfo*> bound_shaders(bool compute);
++void bound_shaders_into(bool compute, std::vector<const ShaderInfo*>& stages);
+ #endif
+
+ extern State g_state;
+@@ -158,7 +159,7 @@ bool debug_shader_overrides(const std::vector<const ShaderInfo*>*& shaders, cons
+ // nvn_raster.cpp: the stencil, polygon offset, depth bounds and depth clamp commands into g_state (false for other
+ // commands), and their dynamic state for the next draw (stencil reference and masks, depth bias).
+ bool raster_command(const Cmd& c);
+-void raster_dynamic(VkCommandBuffer cb, bool slack);  // slack: equal_slack_pass (nvn.h)
++void raster_dynamic(VkCommandBuffer cb, bool slack, uint32_t changed = 15);  // slack: equal_slack_pass (nvn.h)
+
+ void trace_compute_once(const ShaderInfo* cs, uint32_t x, uint32_t y, uint32_t z);
+
+diff --git a/runtime/src/nvn/nvn_pipeline.cpp b/runtime/src/nvn/nvn_pipeline.cpp
+index d571cad..cc3fd7d 100644
+--- a/runtime/src/nvn/nvn_pipeline.cpp
++++ b/runtime/src/nvn/nvn_pipeline.cpp
+@@ -17,6 +17,7 @@
+
+ #include "nvn_pipeline.h"
+ #include "nvn_depth_fidelity.h"
++#include "nvn_replay_keys.h"
+ #include "nvn_ultrawide.h"
+ #include "platform.h"
+ #if defined(NX_ASTRAL_STRICT) && defined(__APPLE__)
+@@ -528,6 +529,7 @@ VkPipeline graphics_pipeline(const PipelineKey& guest_key, const ProgramLayout&
+     std::memcpy(&key, &guest_key, sizeof key);  // retain deterministic padding
+     const uint32_t outputs = effective_fragment_outputs(key.fs);
+     for (uint32_t a = 0; a < 8; ++a) key.mask.mask[a] = fragment_color_mask(key.mask.mask[a], outputs, a);
++    if (replay_options().keys) canonical_replay_key(key);
+     // By the key's bytes, as before, but hashed (nvn_pipeline.h) instead of a ~700-byte std::string built and
+     // compared down a tree per draw; and the last entry first: consecutive draws mostly share their state.
+     using Key = ByteKey<sizeof(PipelineKey)>;
+diff --git a/runtime/src/nvn/nvn_raster.cpp b/runtime/src/nvn/nvn_raster.cpp
+index 9ba8696..3798567 100644
+--- a/runtime/src/nvn/nvn_raster.cpp
++++ b/runtime/src/nvn/nvn_raster.cpp
+@@ -115,7 +115,7 @@ bool raster_command(const Cmd& c) {
+ }
+
+ // Before each draw (every pipeline declares these dynamic, nvn_pipeline.cpp, so they must all be set).
+-void raster_dynamic(VkCommandBuffer cb, bool slack) {
++void raster_dynamic(VkCommandBuffer cb, bool slack, uint32_t changed) {
+     const State& s = g_state;
+     auto set = [&](PFN_vkCmdSetStencilReference fn, const uint8_t* v) {  // the three setters share the signature
+         if (v[0] == v[1]) {
+@@ -127,9 +127,9 @@ void raster_dynamic(VkCommandBuffer cb, bool slack) {
+     };
+     static const bool old = std::getenv("NX_OLD_STENCIL") != nullptr;  // bisecting: reference 0, masks 0xFF
+     static const uint8_t zero[2] = {0, 0}, all[2] = {0xFF, 0xFF};
+-    set(p_vkCmdSetStencilReference, old ? zero : s.stencil_ref);
+-    set(p_vkCmdSetStencilCompareMask, old ? all : s.stencil_compare_mask);
+-    set(p_vkCmdSetStencilWriteMask, old ? all : s.stencil_write_mask);
++    if (changed & 1) set(p_vkCmdSetStencilReference, old ? zero : s.stencil_ref);
++    if (changed & 2) set(p_vkCmdSetStencilCompareMask, old ? all : s.stencil_compare_mask);
++    if (changed & 4) set(p_vkCmdSetStencilWriteMask, old ? all : s.stencil_write_mask);
+     // Depth bias. NVN's call has glPolygonOffsetClamp's meaning, which is Vulkan's: units in minimum resolvable
+     // depth differences (r), factor per unit of slope. Ryujinx and yuzu halve the units, but that is of the Maxwell
+     // register the driver writes (units * 2); the API value needs no scaling. What does differ: D24 targets are
+@@ -142,7 +142,7 @@ void raster_dynamic(VkCommandBuffer cb, bool slack) {
+     float clamp = vk_features().depthBiasClamp ? s.bias_clamp : 0.0f;
+     float units = s.bias_units * units_scale, factor = s.bias_factor;
+     if (slack) units -= equal_slack_units(), factor -= equal_slack_units() / 4.0f, clamp = 0.0f;
+-    p_vkCmdSetDepthBias(cb, units, clamp, factor);
++    if (changed & 8) p_vkCmdSetDepthBias(cb, units, clamp, factor);
+ }
+
+ }  // namespace replay
+diff --git a/runtime/src/nvn/nvn_replay_keys.h b/runtime/src/nvn/nvn_replay_keys.h
+new file mode 100644
+index 0000000..5292866
+--- /dev/null
++++ b/runtime/src/nvn/nvn_replay_keys.h
+@@ -0,0 +1,27 @@
++// Original effective graphics-key canonicalization. Device feature policy is unchanged.
++#pragma once
++#include "nvn_pipeline.h"
++namespace nx::nvn {
++inline void canonical_replay_key(PipelineKey& key) {
++    uint32_t used=0, count=0, streams=0;
++    if (key.vs) for (const auto& in : key.vs->refl.inputs)
++        if (in.location<key.attrib_count && in.location<16) used |= 1u<<in.location;
++    for (uint32_t a=0; a<16; ++a) {
++        if (!(used>>a&1)) key.attribs[a] = {};
++        else { count=a+1; if (key.attribs[a].stream<15 && vk_vertex_format(key.attribs[a].format)!=VK_FORMAT_UNDEFINED)
++            streams |= 1u<<key.attribs[a].stream; }
++    }
++    key.attrib_count=count; key.stream_count=0;
++    for (uint32_t s=0; s<16; ++s)
++        if (!(streams>>s&1)) key.streams[s]={}; else key.stream_count=s+1;
++    // Alpha-test and logic-op fields are not consumed by this pipeline builder.
++    key.color.alpha_test=key.color.logic_op=0;
++    for (uint32_t a=0; a<8; ++a) {
++        if (a>=key.color_count) { key.color_formats[a]=VK_FORMAT_UNDEFINED; key.mask.mask[a]=0; key.color.blend_enable[a]=0; }
++        key.mask.mask[a] &= 15;
++        if (!key.color.blend_enable[a] || !key.mask.mask[a]) key.blend[a]={};
++        else key.blend[a].target=0;  // array index, not this metadata field, selects the attachment
++    }
++    if (key.color_count<8) key.ufloat_colors &= (1u<<key.color_count)-1;
++}
++}  // namespace nx::nvn
+diff --git a/runtime/src/nvn/nvn_replay_options.h b/runtime/src/nvn/nvn_replay_options.h
+new file mode 100644
+index 0000000..7b45b1a
+--- /dev/null
++++ b/runtime/src/nvn/nvn_replay_options.h
+@@ -0,0 +1,33 @@
++// Original Windows command replay experiments. Options freeze before the first recording.
++#pragma once
++#include <cstdlib>
++namespace nx::nvn {
++struct ReplayOptions {
++    bool environment = false, pool = false, keys = false, dynamic = false, scratch = false;
++    bool resident = false, resident_read = true, resident_storage = true;
++};
++inline const ReplayOptions& replay_options() {
++    static const ReplayOptions options = [] {
++        ReplayOptions o;
++#if defined(NX_ASTRAL_STRICT) && defined(_WIN32)
++        auto on = [](const char* name) { const char* e = std::getenv(name); return e && std::atoi(e) != 0; };
++        auto part = [](const char* name) { const char* e = std::getenv(name); return !e || std::atoi(e) != 0; };
++        o.environment = on("NX_REPLAY_ENV"); o.pool = on("NX_REPLAY_POOL");
++        o.keys = on("NX_REPLAY_KEYS"); o.dynamic = on("NX_REPLAY_DYNAMIC"); o.scratch = on("NX_REPLAY_SCRATCH");
++        o.resident = on("NX_RESIDENT"); o.resident_read = part("NX_RESIDENT_READ");
++        o.resident_storage = part("NX_RESIDENT_STORAGE");
++#endif
++        return o;
++    }();
++    return options;
++}
++inline bool replay_resident_enabled() {
++    if (replay_options().environment) return replay_options().resident;
++    const char* e = std::getenv("NX_RESIDENT"); return e && std::atoi(e) != 0;
++}
++inline bool replay_resident_part(bool storage) {
++    if (replay_options().environment) return storage ? replay_options().resident_storage : replay_options().resident_read;
++    const char* e = std::getenv(storage ? "NX_RESIDENT_STORAGE" : "NX_RESIDENT_READ");
++    return !e || std::atoi(e) != 0;
++}
++}  // namespace nx::nvn
+diff --git a/runtime/src/nvn/nvn_resident.h b/runtime/src/nvn/nvn_resident.h
+index ded0f1d..089e17c 100644
+--- a/runtime/src/nvn/nvn_resident.h
++++ b/runtime/src/nvn/nvn_resident.h
+@@ -5,6 +5,7 @@
+ #include <map>
+ #include <tuple>
+ #include "nvn_vk.h"
++#include "nvn_replay_options.h"
+ #include "nvn_writeback.h"
+ #include "platform.h"
+ #include "win_page_generations.h"
+@@ -43,9 +44,8 @@ inline void resident_note_graphics_writes() {
+     g_resident_graphics_writer = true;
+ }
+ inline bool resident_on() {
+-    const char* r = std::getenv("NX_RESIDENT");
+     // No cache refresh while any earlier GPU submission can use these allocations.
+-    return r && std::atoi(r) != 0 && (!async_gpu() || resident_flights_on()) && !g_resident_failed;
++    return replay_resident_enabled() && (!async_gpu() || resident_flights_on()) && !g_resident_failed;
+ }
+ inline bool resident_init() {
+     if (g_resident_ptr) return true;
+@@ -90,8 +90,8 @@ inline bool resident_upload(const uint8_t* p, uint64_t size, uint64_t padded, ui
+         const char* v = std::getenv("NX_RESIDENT_MIN_READ");
+         return v ? uint64_t(std::strtoull(v,nullptr,10)) : uint64_t(4096);
+     }();
+-    const char* part = std::getenv(storage ? "NX_RESIDENT_STORAGE" : "NX_RESIDENT_READ");
+-    if ((!storage && (size < min_read || g_resident_graphics_writer)) || (part && std::atoi(part) == 0) || !resident_on() || !p || !size || padded < size || size > (64ull<<20) || align > 256 || !align) {
++    const bool part_on = replay_resident_part(storage);  // preserve uncached control query order
++    if ((!storage && (size < min_read || g_resident_graphics_writer)) || !part_on || !resident_on() || !p || !size || padded < size || size > (64ull<<20) || align > 256 || !align) {
+         ++stats.bypass; return false;
+     }
+     uint64_t epoch = 0; std::vector<uint64_t> pages;

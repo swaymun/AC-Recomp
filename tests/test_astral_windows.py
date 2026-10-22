@@ -85,11 +85,56 @@ int main() {
 '''
 
 
+DESKTOP_FIXTURE = r'''
+#include <cassert>
+#include <cstdio>
+#include <fstream>
+#include <nx/runtime.h>
+#include "input_map.cpp"
+#include "launcher.cpp"
+namespace nx {
+void log(const char*, ...) {}
+namespace plat {
+std::string data_root() { return "fixture-data"; }
+FILE* fopen_utf8(const std::string& p, const char* m) { return std::fopen(p.c_str(), m); }
+bool headless() { return false; }
+}}
+int main(int argc, char** argv) {
+ using namespace nx;
+ if (argc > 1 && std::string(argv[1]) == "--child-minus-one") return -1;
+ if (argc > 1 && std::string(argv[1]) == "--reexec-test") {
+     launcher::reexec(argv[2], "exit forwarding regression");
+     std::puts("FAIL: reexec fell back after child exit");
+     return 42;
+ }
+ input::Settings s;
+ assert(input::save_settings(s)); s.fullscreen=true; s.fps=60;
+ assert(input::save_settings(s)); assert(input::load_settings()==s);
+ auto c=input::default_controls(); assert(input::save_controls(c));
+ c.pad[input::kActA]={{input::Source::kButton,1,SDL_GAMEPAD_BUTTON_SOUTH}};
+ assert(input::save_controls(c));
+ std::string text; assert(input::read_file(input::controls_path(),text)); assert(input::parse_controls(text)==c);
+ std::string self=launcher::self_exe(); assert(!self.empty()); assert(launcher::running_fps(self)==30);
+ auto other=std::filesystem::u8path(self); other.replace_filename("desktop_fixture-60fps.exe");
+ std::ofstream(other).put('x');
+ auto variant=launcher::fps_variant(self,true); assert(!variant.empty()); assert(launcher::running_fps(variant)==60);
+ assert(launcher::fps_variant(variant,false)==self);
+ setenv("NX_VALIDATION_ENV","first",1); setenv("NX_VALIDATION_ENV","second",0);
+ assert(std::string(std::getenv("NX_VALIDATION_ENV"))=="first");
+ setenv("NX_VALIDATION_ENV","second",1); assert(std::string(std::getenv("NX_VALIDATION_ENV"))=="second");
+ std::puts("PASS native Windows: repeated settings/controls save, reload, .exe variants and environment precedence");
+}
+'''
+
+
 class WindowsSeriesTest(unittest.TestCase):
     def test_windows_series_is_the_linux_series_then_the_windows_overlays(self):
         linux = acr.read_series(PATCHES / 'series.linux')
         windows = acr.read_series(PATCHES / 'series.windows')
-        self.assertEqual(windows, [*linux, 'windows-native.patch', OVERLAY.name])
+        from test_astral_shader_cache import WINDOWS_ORDER
+        self.assertEqual(windows, list(WINDOWS_ORDER))
+        self.assertEqual(windows[:len(linux)], linux)
+
 
     def test_overlay_is_public_and_limited(self):
         text = OVERLAY.read_text()
@@ -152,7 +197,156 @@ class WindowsSeriesTest(unittest.TestCase):
             self.assertIn('find_package(Opus 1.3 CONFIG REQUIRED)', (source / 'CMakeLists.txt').read_text())
 
 
+class WindowsDesktopTest(unittest.TestCase):
+    def test_composed_xinput_mapping_and_persistence(self):
+        common = Path(subprocess.check_output(['git', 'rev-parse', '--git-common-dir'], cwd=ROOT, text=True).strip())
+        if not common.is_absolute():
+            common = (ROOT / common).resolve()
+        reference = Path(os.environ.get('NVN_REFERENCE', str(common.parent /
+            '.local/orchestrate/2026-10-18/worktrees/PIN-004/.local/references/SuperMarioWonderRecomp')))
+        if not (reference / '.git').exists():
+            self.skipTest('private pinned upstream reference unavailable')
+        from test_astral_perf_hud import sdl_include
+        from test_astral_launcher import sdl_lib
+        inc = sdl_include()
+        lib = sdl_lib(inc) if inc else None
+        if not inc or not lib or sys.platform == 'win32':
+            self.skipTest('portable CPU fixture requires c++ and SDL3; native Windows build checked separately')
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'source'
+            runtime.prepare_source(reference, source, [PATCHES / n for n in acr.read_series(PATCHES / 'series.windows')])
+            host = (source / 'runtime/src/platform_win.cpp').read_text()
+            block = host.split('    input::Frame frame;', 1)[1].split('    bool keys[SDL_SCANCODE_COUNT]', 1)[0]
+            guard_start = host.index('    // Headless test runs')
+            guard_end = host.index('\n', host.index('    if (headless() ||', guard_start)) + 1
+            audio_guard = host[guard_start:guard_end]
+            fixture = r"""
+#include <algorithm>
+#include <cstdarg>
+#include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <nx/runtime.h>
+#include "input_map.cpp"
+namespace nx {
+void log(const char*, ...) {}
+namespace plat {
+std::string data_root() { return "."; }
+FILE* fopen_utf8(const std::string& p, const char* m) { return std::fopen(p.c_str(), m); }
+}}
+using namespace nx;
+using WORD = unsigned short;
+using DWORD = unsigned long;
+constexpr int ERROR_SUCCESS=0, XUSER_MAX_COUNT=4;
+constexpr WORD XINPUT_GAMEPAD_DPAD_UP=1, XINPUT_GAMEPAD_DPAD_DOWN=2,
+ XINPUT_GAMEPAD_DPAD_LEFT=4, XINPUT_GAMEPAD_DPAD_RIGHT=8, XINPUT_GAMEPAD_START=16,
+ XINPUT_GAMEPAD_BACK=32, XINPUT_GAMEPAD_LEFT_THUMB=64, XINPUT_GAMEPAD_RIGHT_THUMB=128,
+ XINPUT_GAMEPAD_LEFT_SHOULDER=256, XINPUT_GAMEPAD_RIGHT_SHOULDER=512,
+ XINPUT_GAMEPAD_A=4096, XINPUT_GAMEPAD_B=8192, XINPUT_GAMEPAD_X=16384, XINPUT_GAMEPAD_Y=32768;
+struct XINPUT_GAMEPAD { WORD wButtons{}; unsigned char bLeftTrigger{},bRightTrigger{};
+ short sThumbLX{},sThumbLY{},sThumbRX{},sThumbRY{}; } pad;
+struct XINPUT_STATE { unsigned packet{}; XINPUT_GAMEPAD Gamepad; };
+int XInputGetState(DWORD slot, XINPUT_STATE* s) {
+ if (slot != 0 && slot != 2) return 1167;
+ s->Gamepad=slot==0 ? XINPUT_GAMEPAD{} : pad; return ERROR_SUCCESS;
+}
+input::Frame sample() { input::Frame frame; @BLOCK@ return frame; }
+bool test_headless=false;
+bool headless() { return test_headless; }
+bool audio_enabled() { @AUDIO_GUARD@ return true; }
+int main() {
+ unsetenv("NX_MUTE"); assert(audio_enabled());
+ setenv("NX_MUTE","0",1); assert(audio_enabled());
+ setenv("NX_MUTE","",1); assert(audio_enabled());
+ setenv("NX_MUTE","1",1); assert(!audio_enabled());
+ unsetenv("NX_MUTE"); test_headless=true; assert(!audio_enabled()); test_headless=false;
+ auto controls=input::default_controls();
+ const WORD masks[]={4096,8192,16384,32768,256,512,16,32,64,128,1,2,4,8};
+ const uint64_t bits[]={plat::kB,plat::kA,plat::kY,plat::kX,plat::kL,plat::kR,
+ plat::kPlus,plat::kMinus,plat::kStickL,plat::kStickR,plat::kUp,plat::kDown,plat::kLeft,plat::kRight};
+ for (unsigned i=0;i<std::size(masks);i++) { pad={}; pad.wButtons=masks[i];
+   auto frame=sample(); assert(frame.has_pad); assert(input::map(controls,frame).buttons==bits[i]); }
+ pad={}; pad.sThumbLY=-32768; pad.sThumbRY=32767; pad.sThumbLX=32767; pad.sThumbRX=-32768;
+ pad.bLeftTrigger=255; pad.bRightTrigger=255;
+ auto p=input::map(controls,sample());
+ assert(p.ly<0 && p.ry>0 && p.lx>0 && p.rx<0); assert(p.buttons & plat::kZL); assert(p.buttons & plat::kZR);
+ controls.pad[input::kActA]={{input::Source::kButton,1,SDL_GAMEPAD_BUTTON_SOUTH}};
+ controls.pad[input::kActB].clear(); pad={}; pad.wButtons=4096;
+ assert(input::map(controls,sample()).buttons==plat::kA);
+ assert(input::save_controls(controls));
+ auto parsed=input::parse_controls(input::write_controls(controls)); assert(parsed==controls);
+ input::Settings settings; assert(input::save_settings(settings)); settings.fullscreen=true;
+ assert(input::save_settings(settings)); assert(input::load_settings().fullscreen);
+ std::puts("PASS: XInput slot 2 with idle slot 0, all buttons, stick polarity/extremes, triggers, remap and repeated settings save");
+}
+""".replace('@BLOCK@', block).replace('@AUDIO_GUARD@', audio_guard)
+            path = Path(d) / 'fixture.cpp'
+            path.write_text(fixture)
+            exe = Path(d) / 'fixture'
+            cmd = [shutil.which('c++'), '-std=c++20', '-DNX_ASTRAL_STRICT=1', '-I'+str(inc),
+                   '-I'+str(source/'runtime/src'), '-I'+str(source/'runtime/include'), str(path), '-L'+str(lib), '-lSDL3', '-o', str(exe)]
+            built = subprocess.run(cmd, text=True, capture_output=True, timeout=120)
+            self.assertEqual(built.returncode, 0, built.stdout+built.stderr)
+            result = subprocess.run([str(exe)], cwd=d, text=True, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+            self.assertIn('PASS: XInput slot 2', result.stdout)
+            text=(PATCHES/'astral-windows-desktop.patch').read_text()
+            self.assertIn('return _putenv_s(name, value)', text)
+            self.assertIn('_wspawnv(_P_NOWAIT', text)
+            self.assertIn('p.extension().string()', text)
+
+
 class WindowsFiberTest(unittest.TestCase):
+    def test_native_windows_settings_and_variant_paths(self):
+        if sys.platform != 'win32':
+            self.skipTest('needs a Windows x64 host')
+        inc = Path(os.environ.get('NX_SDL3_INCLUDE', 'missing'))
+        lib = Path(os.environ.get('NX_SDL3_LIB', 'missing'))
+        cxx = shutil.which('clang-cl')
+        if not cxx or not (inc/'SDL3/SDL.h').is_file() or not (lib/'SDL3.lib').is_file():
+            self.skipTest('needs clang-cl and NX_SDL3_INCLUDE / NX_SDL3_LIB (DLL on PATH)')
+        reference = Path(os.environ.get('NVN_REFERENCE', 'missing'))
+        if not (reference/'.git').exists():
+            self.skipTest('needs the private pinned upstream reference')
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d)/'source'
+            runtime.prepare_source(reference, source, [PATCHES/n for n in acr.read_series(PATCHES/'series.windows')])
+            path = Path(d)/'desktop_fixture.cpp'
+            path.write_text(DESKTOP_FIXTURE)
+            exe = Path(d)/'desktop_fixture.exe'
+            built = subprocess.run([cxx, '/nologo', '/std:c++20', '/EHsc', '/UNDEBUG', '/DNX_ASTRAL_STRICT=1',
+                '/DNOMINMAX', '/D_CRT_SECURE_NO_WARNINGS', '/I'+str(inc), '/I'+str(source/'runtime/src'),
+                '/I'+str(source/'runtime/include'), str(path), '/Fe'+str(exe), '/Fo'+str(Path(d)/'fixture.obj'),
+                '/link', str(lib/'SDL3.lib'), 'shell32.lib'], capture_output=True, text=True, timeout=120)
+            self.assertEqual(built.returncode, 0, built.stdout+built.stderr)
+            result = subprocess.run([str(exe)], cwd=d, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+            self.assertIn('PASS native Windows', result.stdout)
+            child = Path(d)/'exit-minus-one.exe'
+            shutil.copy2(exe, child)
+            # own_args is retained across reexec: the probe child must ignore the parent's arguments.
+            child_cpp = Path(d)/'child.cpp'
+            child_cpp.write_text(r'''#include <string>
+int main(int n,char** a){
+ if(n != 5 || std::string(a[1]) != "--reexec-test" || std::string(a[3]) != "space and quote\"" || std::string(a[4]) != "tail\\") return 23;
+ return -1;
+}
+''')
+            built = subprocess.run([cxx,'/nologo',str(child_cpp),'/Fe'+str(child),'/Fo'+str(Path(d)/'child.obj')],
+                                   capture_output=True,text=True,timeout=60)
+            self.assertEqual(built.returncode,0,built.stdout+built.stderr)
+            # The installation path and arguments must survive UTF-8 -> UTF-16 and CRT quoting.
+            unicode_dir = Path(d)/'player space-\u96ea'
+            unicode_dir.mkdir()
+            unicode_exe = unicode_dir/exe.name
+            shutil.copy2(exe, unicode_exe)
+            result = subprocess.run([str(unicode_exe)], cwd=d, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+            forwarded = subprocess.run([str(unicode_exe),'--reexec-test',str(child),'space and quote"','tail\\'],cwd=d,capture_output=True,text=True,timeout=30)
+            self.assertEqual(forwarded.returncode & 0xffffffff,0xffffffff,forwarded.stdout+forwarded.stderr)
+            self.assertNotIn('fell back',forwarded.stdout)
+
     def test_first_entry_resume_and_preserved_state_on_windows(self):
         if sys.platform != 'win32':
             self.skipTest('needs a Windows x64 host')

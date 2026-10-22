@@ -95,7 +95,8 @@ class LinuxSeriesTest(unittest.TestCase):
         self.assertNotRegex(text, r'/(?:Users|home|work)/')
         files = re.findall(r'^diff --git a/(\S+) ', text, re.M)
         self.assertEqual(files, ['CMakeLists.txt', ASM, FIBER, 'runtime/src/kernel.cpp', 'runtime/src/nvn/nvn_caps.cpp',
-                                 'runtime/src/nvn/nvn_vk.cpp'])
+                                 'runtime/src/nvn/nvn_vk.cpp', 'runtime/src/nvn/nvn_frames.cpp',
+                                 'runtime/src/nvn/nvn_linux_staging.h'])
         # The host-cached upload ring default is Linux-only; other hosts keep NX_RING_CACHED opt-in.
         caps = text.split('+++ b/runtime/src/nvn/nvn_caps.cpp', 1)[1].split('\ndiff --git ', 1)[0]
         self.assertIn('+#if defined(__linux__) && !defined(__ANDROID__)\n', caps)
@@ -121,6 +122,171 @@ class LinuxSeriesTest(unittest.TestCase):
             self.assertIn('(defined(__linux__) && !defined(__ANDROID__))', (source / 'runtime/src/kernel.cpp').read_text())
             self.assertIn('!plat::headless()', (source / 'runtime/src/nvn/nvn_vk.cpp').read_text())
             self.assertEqual((source / ASM).read_text(), added_file(OVERLAY, ASM).rstrip('\n') + '\n')
+            runtime.prepare_source(reference, Path(d) / 'windows',
+                                   [PATCHES / n for n in acr.read_series(PATCHES / 'series.windows')])
+
+
+ALLOCATOR_HARNESS = r'''#include <cassert>
+#include <cstdint>
+#include <cstdlib>
+#include <mutex>
+#include <set>
+#include <tuple>
+#include <vector>
+#include "nvn_linux_staging.h"
+using namespace nx::nvn;
+using VkBuffer = uint64_t; using VkDeviceMemory = uint64_t;
+constexpr uint64_t VK_NULL_HANDLE = 0, VK_WHOLE_SIZE = ~0ull;
+constexpr unsigned VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO = 1, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO = 2;
+constexpr unsigned VK_BUFFER_USAGE_TRANSFER_SRC_BIT = 1;
+constexpr unsigned VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = 1, VK_MEMORY_PROPERTY_HOST_COHERENT_BIT = 2,
+                   VK_MEMORY_PROPERTY_HOST_CACHED_BIT = 4, VK_SUCCESS = 0;
+struct VkBufferCreateInfo { unsigned tag; uint64_t size = 0; unsigned usage = 0; };
+struct VkMemoryRequirements { uint64_t size = 0; unsigned memoryTypeBits = 3; };
+struct VkMemoryAllocateInfo { unsigned tag; uint64_t allocationSize = 0; unsigned memoryTypeIndex = 0; };
+struct VkPhysicalDeviceMemoryProperties { unsigned memoryTypeCount = 2; struct { unsigned propertyFlags; } memoryTypes[2]{{3},{7}}; };
+struct Upload { uint64_t buffer, offset; uint8_t* ptr; };
+std::mutex g_grave_lock;
+uint64_t g_submitted = 4, sequence = 10, requested = 0;
+std::vector<std::tuple<uint64_t,VkBuffer,VkDeviceMemory>> g_staging;
+std::set<uint64_t> buffers, memories;
+std::vector<unsigned> types;
+unsigned fail = 0, allowed_types = 3; bool cached_exists = true, hard_fail = false;
+uint8_t byte;
+unsigned vk_device() { return 1; } unsigned vk_physical() { return 1; }
+unsigned p_vkCreateBuffer(unsigned, const VkBufferCreateInfo* bi, void*, VkBuffer* b) {
+    requested = bi->size; *b = ++sequence; buffers.insert(*b); return 0;
+}
+void p_vkGetBufferMemoryRequirements(unsigned, VkBuffer, VkMemoryRequirements* r) { r->size = requested + 4096; r->memoryTypeBits = allowed_types; }
+void p_vkGetPhysicalDeviceMemoryProperties(unsigned, VkPhysicalDeviceMemoryProperties* p) {
+    *p = {}; if (!cached_exists) p->memoryTypes[1].propertyFlags = 3;
+}
+unsigned memory_type(unsigned, unsigned) { return 0; }
+unsigned p_vkAllocateMemory(unsigned, const VkMemoryAllocateInfo* ai, void*, VkDeviceMemory* m) {
+    types.push_back(ai->memoryTypeIndex);
+    if (hard_fail || (fail == 1 && ai->memoryTypeIndex == 1)) { *m = 999999; return 1; }
+    *m = ++sequence; memories.insert(*m); return 0;
+}
+unsigned p_vkBindBufferMemory(unsigned, VkBuffer, VkDeviceMemory, uint64_t) {
+    return fail == 2 && types.back() == 1;
+}
+unsigned p_vkMapMemory(unsigned, VkDeviceMemory, uint64_t, uint64_t, unsigned, void** ptr) {
+    if (fail == 3 && types.back() == 1) return 1; *ptr = &byte; return 0;
+}
+void p_vkUnmapMemory(unsigned, VkDeviceMemory) {}
+void p_vkDestroyBuffer(unsigned, VkBuffer b, void*) { assert(buffers.erase(b) == 1); }
+void p_vkFreeMemory(unsigned, VkDeviceMemory m, void*) { assert(memories.erase(m) == 1); }
+Upload upload_alloc(uint64_t, uint64_t) { return {999,0,nullptr}; }
+@ALLOCATOR@
+void release_legacy() {
+    for (auto [serial,b,m] : g_staging) { assert(serial == 5); p_vkDestroyBuffer(1,b,nullptr); p_vkFreeMemory(1,m,nullptr); }
+    g_staging.clear(); assert(buffers.empty() && memories.empty());
+}
+int main() {
+    setenv("NX_LINUX_STAGING_CACHED","1",1); setenv("NX_LINUX_STAGING_POOL","0",1);
+    auto a = linux_staging_alloc(64); assert(a.ptr && types.back() == 1); release_legacy();
+    cached_exists = false; types.clear(); a = linux_staging_alloc(64);
+    assert(a.ptr && types == std::vector<unsigned>{0}); release_legacy(); cached_exists = true;
+    allowed_types = 1; types.clear(); a = linux_staging_alloc(64);
+    assert(a.ptr && types == std::vector<unsigned>{0}); release_legacy(); allowed_types = 3;
+    for (fail = 1; fail <= 3; ++fail) {
+        types.clear(); a = linux_staging_alloc(64);
+        assert(a.ptr && types == (std::vector<unsigned>{1,0})); release_legacy();
+    }
+    fail = 0; hard_fail = true; a = linux_staging_alloc(64);
+    assert(a.buffer == 999 && buffers.empty() && memories.empty()); hard_fail = false;
+    setenv("NX_LINUX_STAGING_POOL","1",1);
+    a = linux_staging_alloc(64); auto b = linux_staging_alloc(128);
+    assert(a.buffer != b.buffer && g_linux_staging.pending_count() == 2);
+    g_linux_staging.retire(4,linux_staging_dispose);
+    assert(g_linux_staging.retained_bytes() == 0);
+    g_linux_staging.retire(5,linux_staging_dispose);
+    assert(g_linux_staging.retained_bytes() == 64 + 128 + 8192);
+    auto c = linux_staging_alloc(64); assert(c.buffer == a.buffer);
+    auto e = linux_staging_alloc(65); assert(e.buffer == b.buffer);
+    assert(g_linux_staging.retained_bytes() == 0);
+    return 0;
+}
+'''
+
+
+class LinuxStagingTest(unittest.TestCase):
+    def test_staging_additions_preprocess_to_nothing_on_other_hosts(self):
+        compiler = shutil.which('clang++') or shutil.which('c++')
+        if not compiler:
+            self.skipTest('C++ preprocessor unavailable')
+        part = OVERLAY.read_text().split('+++ b/runtime/src/nvn/nvn_frames.cpp\n', 1)[1].split('\ndiff --git ', 1)[0]
+        additions = '\n'.join(line[1:] for line in part.splitlines() if line.startswith('+'))
+        for definitions in (['-D_WIN32=1', '-D_M_X64=1'], ['-D__APPLE__=1', '-D__aarch64__=1'],
+                            ['-D__linux__=1', '-D__ANDROID__=1']):
+            result = subprocess.run([compiler, '-E', '-P', '-x', 'c++', '-undef', *definitions, '-'],
+                                    input=additions, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), '', definitions)
+
+    def test_allocator_cached_fallback_failure_cleanup_and_retirement(self):
+        cxx = shutil.which('clang++') or shutil.which('c++')
+        if not cxx:
+            self.skipTest('C++ compiler unavailable')
+        body = added_file(OVERLAY, 'runtime/src/nvn/nvn_frames.cpp')
+        start = body.index('struct LinuxStaging {')
+        body = body[start:body.index('\n#endif', start)]
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'nvn_linux_staging.h').write_text(added_file(OVERLAY, 'runtime/src/nvn/nvn_linux_staging.h'))
+            source = root / 'allocator.cpp'
+            source.write_text(ALLOCATOR_HARNESS.replace('@ALLOCATOR@', body))
+            exe = root / 'allocator'
+            result = subprocess.run([cxx, '-std=c++20', '-O2', '-Wall', '-Wextra', str(source), '-o', str(exe)],
+                                    capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_retirement_ownership_best_fit_and_actual_allocation_bounds(self):
+        cxx = shutil.which('clang++') or shutil.which('c++')
+        if not cxx:
+            self.skipTest('C++ compiler unavailable')
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'nvn_linux_staging.h').write_text(added_file(OVERLAY, 'runtime/src/nvn/nvn_linux_staging.h'))
+            source = root / 'pool.cpp'
+            source.write_text(r'''#include <cassert>
+#include <set>
+#include "nvn_linux_staging.h"
+using Pool = nx::nvn::RetiredStaging<unsigned>;
+int main() {
+    Pool p; unsigned a = 0; std::set<unsigned> disposed;
+    auto dispose = [&](unsigned id) { assert(disposed.insert(id).second); };
+    p.submit(4, 64, 4096, 1); p.submit(5, 96, 8192, 2);
+    p.retire(3, dispose); assert(!p.acquire(64, a)); assert(p.pending_count() == 2);
+    p.retire(4, dispose); assert(p.pending_count() == 1); assert(p.retained_bytes() == 4096);
+    // Accounting uses allocation size, but fitting uses buffer size.
+    assert(!p.acquire(65, a)); assert(!p.acquire(16, a));
+    assert(p.acquire(64, a) && a == 1); assert(!p.acquire(64, a));
+    p.submit(7, 64, 4096, 1); p.retire(5, dispose);
+    assert(p.acquire(80, a) && a == 2); p.submit(8, 96, 8192, 2);
+    p.retire(6, dispose); assert(!p.acquire(64, a));
+    p.retire(8, dispose); assert(p.acquire(64, a) && a == 1);
+    assert(p.acquire(64, a) && a == 2); assert(p.retained_bytes() == 0);
+    p.submit(9, Pool::max_bytes + 1, Pool::max_bytes + 1, 3);
+    p.retire(9, dispose); assert(disposed.count(3));
+    for (unsigned i = 0; i < 40; ++i) p.submit(10, 1, 1, 100 + i);
+    p.retire(9, dispose); assert(p.pending_count() == 40);
+    p.retire(10, dispose); assert(p.retained_bytes() == Pool::max_buffers);
+    assert(disposed.size() == 9);
+    Pool large; large.submit(1, 1, Pool::max_bytes, 4); large.submit(1, 1, 1, 5);
+    large.retire(1, dispose); assert(large.retained_bytes() == Pool::max_bytes); assert(disposed.count(5));
+    assert(large.peak_bytes == Pool::max_bytes);
+    return 0;
+}
+''')
+            exe = root / 'pool'
+            result = subprocess.run([cxx, '-std=c++20', '-O2', '-Wall', '-Wextra', str(source), '-o', str(exe)],
+                                    capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class LinuxFiberContextTest(unittest.TestCase):

@@ -77,21 +77,26 @@ class Base(unittest.TestCase):
 
 class SeriesTest(unittest.TestCase):
     def test_series_matches_the_overlay_tests(self):
-        import test_astral_texel_coalesce as last  # the newest overlay test composes every earlier one (ORDER)
+        import test_astral_shader_cache as last  # composes the shared overlays through depth fidelity
         series = acr.read_series(ROOT / 'runtime/patches/series.macos')
         self.assertEqual(last.ORDER[-1], last.OVERLAY)
-        self.assertEqual(series, list(last.ORDER))
+        self.assertEqual(series, list(last.NATIVE_ORDER))
 
     def test_series_covers_every_native_patch(self):
-        series = set(acr.read_series(ROOT / 'runtime/patches/series.macos'))
-        linux = set(acr.read_series(ROOT / 'runtime/patches/series.linux'))  # series.macos + the Linux overlay
+        series = acr.read_series(ROOT / 'runtime/patches/series.macos')
+        linux = acr.read_series(ROOT / 'runtime/patches/series.linux')
+        self.assertEqual(linux, [*series, 'astral-linux.patch'])
         patches = {p.name for p in (ROOT / 'runtime/patches').glob('*.patch')}
-        self.assertLessEqual(series, patches)
-        self.assertLessEqual(linux, patches)
-        self.assertEqual(linux - series, {'astral-linux.patch'})
-        windows = set(acr.read_series(ROOT / 'runtime/patches/series.windows'))  # series.linux + Windows overlays
-        self.assertEqual(windows - linux, {'windows-native.patch', 'astral-windows.patch'})
-        self.assertTrue(all(p.startswith(('ios-', 'windows-')) for p in patches - windows), patches - windows)
+        self.assertLessEqual(set(linux), patches)
+        windows = acr.read_series(ROOT / 'runtime/patches/series.windows')
+        from test_astral_shader_cache import WINDOWS_ORDER
+        self.assertEqual(windows, list(WINDOWS_ORDER))
+        # Memory diagnostics are included, but both lifetime repairs remain opt-in until
+        # the six normal-guard chase/combat routes pass. NVN gaps remains deferred.
+        deferred = {'astral-nvn-gaps.patch'}
+        self.assertTrue(deferred.isdisjoint(windows), 'deferred overlay activated before its gate')
+        uncovered = patches - set(windows) - deferred
+        self.assertTrue(all(p.startswith(('ios-', 'windows-')) for p in uncovered), uncovered)
 
     def test_read_series_rejects_bad_lists(self):
         with tempfile.TemporaryDirectory() as d:
@@ -818,6 +823,210 @@ class StageTest(Base):
             ctx.rmtree(self.tmp / 'in')
         with self.assertRaises(acr.BuildError):
             ctx.rmtree(ctx.out)
+
+
+class WindowsPlayerTest(Base):
+    def reused(self, *extra):
+        src = self.tmp / 'import'
+        for name, data in {'exefs/main': b'NSO0main', 'exefs/sdk': b'NSO0sdk',
+                           'analysis/main.bin': b'main-flat', 'analysis/sdk.bin': b'sdk-flat',
+                           'analysis/main.npdm': b'synthetic-npdm'}.items():
+            p = src / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+        (src / 'extract/romfs').mkdir(parents=True)
+        receipt = self.tmp / 'control.json'
+        receipt.write_text(json.dumps({'schema': 1, 'status': 'produced', 'metadata_produced': True,
+            'linkage_verified': True, 'binding': {'application_id': acr.TITLE, 'program_id': acr.TITLE,
+                'parental_flags': 0, 'ratings': [-1] * 32,
+                'raw': {'0': {'sha256': acr.sha256(src / 'analysis/main.npdm')}}}}))
+        args = acr.parse(['--out', str(self.tmp / 'out'), '--import-dir', str(src),
+                          '--control-receipt', str(receipt), *extra])
+        return acr.Context(args, out=io.StringIO())
+
+    def test_reused_import_never_invokes_or_imports_key_reader(self):
+        ctx = self.reused()
+        ctx.windows = True
+        before = acr.tree_digest(ctx.import_dir)
+        with mock.patch.object(ctx, 'run', side_effect=AssertionError('must not import')):
+            ev = acr.stage_import(ctx)
+            control = acr.stage_control(ctx)
+        self.assertEqual(ev, control)
+        self.assertEqual(before, acr.tree_digest(ctx.import_dir))
+        self.assertEqual((ctx.control / 'receipt.json').read_bytes(), ctx.a.control_receipt.read_bytes())
+        self.assertEqual(len(ev['files']), 5)
+
+    def test_reused_import_rejects_missing_layout_wrong_title_and_npdm(self):
+        ctx = self.reused()
+        original = ctx.a.control_receipt.read_text()
+        for field, value in [('program_id', '0000000000000000'), ('raw', {})]:
+            record = json.loads(original)
+            record['binding'][field] = value
+            ctx.a.control_receipt.write_text(json.dumps(record))
+            with self.assertRaises(acr.BuildError):
+                acr.stage_import(ctx)
+        ctx.a.control_receipt.write_text(original)
+        (ctx.import_dir / 'exefs/sdk').unlink()
+        with self.assertRaisesRegex(acr.BuildError, 'missing regular file'):
+            acr.stage_import(ctx)
+
+    def test_reused_import_invalidates_module_and_control_caches(self):
+        ctx = self.reused()
+        before = acr.stage_inputs(ctx)
+        (ctx.import_dir / 'analysis/main.bin').write_bytes(b'changed-flat')
+        self.assertNotEqual(before['import'], acr.stage_inputs(ctx)['import'])
+        record = json.loads(ctx.a.control_receipt.read_text())
+        record['binding']['parental_flags'] = 1
+        ctx.a.control_receipt.write_text(json.dumps(record))
+        self.assertNotEqual(before['control'], acr.stage_inputs(ctx)['control'])
+
+    def test_windows_accepts_local_dump_and_refuses_mixed_inputs(self):
+        with mock.patch.object(acr.sys, 'platform', 'win32'):
+            args = self.args('--to-stage', 'control')
+        self.assertEqual(args.nsp, self.nsp)
+        self.assertEqual(args.keys, self.keys)
+        self.assertIsNone(args.import_dir)
+        self.assertEqual(args.to_stage, 'control')
+        ctx = self.reused()
+        for option, value in (('--nsp', self.nsp), ('--keys', self.keys),
+                              ('--title-keys', self.keys)):
+            with mock.patch.object(acr.sys, 'platform', 'win32'), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                acr.parse(['--out', str(ctx.out), '--import-dir', str(ctx.import_dir),
+                           '--control-receipt', str(ctx.a.control_receipt), option, str(value)])
+
+    def test_windows_refuses_missing_inputs(self):
+        with mock.patch.object(acr.sys, 'platform', 'win32'), \
+             contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            acr.parse(['--out', str(self.tmp / 'empty')])
+
+    def test_windows_venv_and_runtime_series_are_platform_specific(self):
+        ctx = self.reused('--dry-run')
+        mac_inputs = acr.stage_inputs(ctx)
+        ctx.windows = True
+        self.assertTrue(str(ctx.venv_python()).endswith('Scripts/python.exe'))
+        self.assertNotEqual(mac_inputs['runtime'], acr.stage_inputs(ctx)['runtime'])
+        acr.stage_runtime(ctx)
+        applied = [Path(cmd[-1]).name for cmd in ctx.commands if 'apply' in cmd]
+        self.assertEqual(applied, acr.read_series(ROOT / 'runtime/patches/series.windows'))
+
+    def test_windows_watchdog_reduces_jobs_and_terminates_only_its_tree(self):
+        import windows_native
+        ctx = self.reused()
+        ctx.windows = True
+        first, second = mock.Mock(pid=101), mock.Mock(pid=102, returncode=0)
+        first.wait.side_effect = [subprocess.TimeoutExpired('fixture', 1), 0]
+        second.wait.return_value = 0
+        with mock.patch.object(acr.subprocess, 'Popen', side_effect=[first, second]) as popen, \
+             mock.patch.object(acr.subprocess, 'BELOW_NORMAL_PRIORITY_CLASS', 0x4000, create=True), \
+             mock.patch.object(windows_native, 'terminate_tree') as terminate, \
+             mock.patch.object(acr.os, 'killpg') as killpg:
+            final = acr.watched_build(ctx, lambda n: ['cmake', '--parallel', str(n)], 4,
+                self.tmp / 'watch.log', probe=lambda: ('critical', acr.GIB), interval=.01)
+        self.assertEqual(final, 2)
+        terminate.assert_called_once_with(first)
+        killpg.assert_not_called()
+        self.assertEqual(popen.call_args_list[0].args[0], ['cmake', '--parallel', '4'])
+        self.assertEqual(popen.call_args_list[1].args[0], ['cmake', '--parallel', '2'])
+        self.assertEqual(popen.call_args.kwargs['creationflags'], 0x4000)
+        self.assertFalse(popen.call_args.kwargs['start_new_session'])
+
+    def test_windows_pip_tools_are_found_in_scripts_directory(self):
+        ctx = self.reused()
+        ctx.windows = True
+        exe = ctx.venv / 'Scripts/cmake.exe'
+        exe.parent.mkdir(parents=True)
+        exe.write_bytes(b'fixture')
+        with mock.patch.object(acr.shutil, 'which', return_value=None):
+            self.assertEqual(ctx.tool('cmake'), str(exe))
+            self.assertIsNone(ctx.tool('ninja'))
+
+    def test_windows_build_discovers_vs_even_without_preflight_stage(self):
+        import windows_native
+        ctx = self.reused()
+        ctx.windows = True
+        with mock.patch.object(windows_native, 'developer_environment', side_effect=ValueError('fixture missing VS')) as dev:
+            with self.assertRaisesRegex(acr.BuildError, 'Windows toolchain discovery failed: fixture missing VS'):
+                acr.stage_build(ctx)
+        dev.assert_called_once_with()
+        self.assertEqual(ctx.commands, [])
+
+    def test_native_dual_build_uses_clang_cl_opus_and_two_build_directories(self):
+        ctx = self.reused('--dry-run')
+        ctx.windows = True
+        acr.stage_build(ctx)
+        configures = [cmd for cmd in ctx.commands if '-DNX_GAME=astral' in cmd]
+        self.assertEqual(len(configures), 2)
+        for cmd in configures:
+            self.assertIn('-DCMAKE_C_COMPILER=clang-cl', cmd)
+            self.assertIn('-DCMAKE_CXX_COMPILER=clang-cl', cmd)
+            self.assertIn('-DNX_HWOPUS=ON', cmd)
+            self.assertTrue(any(x.startswith('-DOpus_DIR=') for x in cmd))
+            self.assertTrue(any(x.startswith('-DNX_VULKAN_SDK=') for x in cmd))
+        self.assertNotEqual(configures[0][configures[0].index('-B') + 1],
+                            configures[1][configures[1].index('-B') + 1])
+        opus = next(cmd for cmd in ctx.commands if '-DOPUS_DISABLE_INTRINSICS=ON' in cmd)
+        self.assertIn('-DOPUS_BUILD_SHARED_LIBRARY=OFF', opus)
+        self.assertTrue(any('refs/tags/v1.5.2:refs/tags/v1.5.2' in cmd for cmd in ctx.commands))
+        self.assertTrue(any('v1.5.2^{commit}' in cmd for cmd in ctx.commands))
+        self.assertFalse(any('MoltenVK' in str(cmd) for cmd in ctx.commands))
+
+    def test_reused_spirv_skips_dotnet_and_detects_changed_input(self):
+        ctx = self.reused()
+        spirv = self.tmp / 'spirv'
+        spirv.mkdir()
+        (spirv / 'fixture.spv').write_bytes(b'\x03\x02#\x07fixture')
+        ctx.a.spirv_dir = spirv
+        before = acr.stage_inputs(ctx)['shaders']
+        ev = acr.stage_shaders(ctx)
+        self.assertEqual((ctx.shaders / 'spirv/fixture.spv').read_bytes(), (spirv / 'fixture.spv').read_bytes())
+        self.assertEqual(ctx.commands, [])
+        self.assertIn('tree_sha256', ev)
+        (spirv / 'fixture.spv').write_bytes(b'changed')
+        self.assertNotEqual(before, acr.stage_inputs(ctx)['shaders'])
+        ctx.state = {'stages': {'shaders': {'inputs': before}}}
+        ctx.a.spirv_dir = None
+        self.assertTrue(acr.stage_inputs(ctx)['shaders'].startswith('native:'))
+        native_key = acr.stage_inputs(ctx)['shaders']
+        ctx.a.no_shader_validation = True
+        self.assertNotEqual(native_key, acr.stage_inputs(ctx)['shaders'])
+
+    def test_windows_app_layout_preserves_data_and_copies_both_executables(self):
+        ctx = self.reused()
+        ctx.windows = True
+        ctx.build_dir.mkdir(parents=True)
+        (ctx.build_dir / 'astral.exe').write_bytes(b'base-pe-fixture')
+        variant = ctx.build_dir.parent / 'build-60fps'
+        variant.mkdir()
+        (variant / 'astral.exe').write_bytes(b'variant-pe-fixture')
+        (ctx.gen_variant / 'main').mkdir(parents=True)
+        ctx.state = {'stages': {'lift': {'fps': '30+60'}}}
+        save = ctx.data / 'user/save/slot'
+        save.parent.mkdir(parents=True)
+        save.write_bytes(b'keep save')
+        acr.stage_app(ctx)
+        self.assertEqual((ctx.out / 'astral.exe').read_bytes(), b'base-pe-fixture')
+        self.assertEqual((ctx.out / 'astral-60fps.exe').read_bytes(), b'variant-pe-fixture')
+        self.assertEqual(save.read_bytes(), b'keep save')
+        ps = (ctx.out / 'run-ac-recomp.ps1').read_text()
+        self.assertIn('$PSScriptRoot', ps)
+        self.assertIn('$env:NX_FPS', ps)
+        self.assertIn('settings.ini', ps)
+        self.assertIn('& $binary @args', ps)
+        self.assertTrue((ctx.out / 'assets/launcher/AC-Recomp.png').is_file())
+        ctx.a.fps = '30'
+        acr.stage_app(ctx)
+        self.assertFalse((ctx.out / 'astral-60fps.exe').exists())
+        self.assertEqual(save.read_bytes(), b'keep save')
+
+    def test_prepare_runtime_can_import_without_unix_key_importer(self):
+        code = ("import sys,importlib.abc,pathlib,subprocess;sys.path.insert(0,sys.argv[1]);"
+                "exec(\"class Block(importlib.abc.MetaPathFinder):\\n def find_spec(self,name,*args):\\n"
+                "  if name in ('fcntl','import_owned_dump'): raise AssertionError(name)\");"
+                "sys.meta_path.insert(0,Block());import prepare_runtime;print('portable helpers imported')")
+        result = subprocess.run([sys.executable, '-c', code, str(ROOT / 'tools')], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('portable helpers imported', result.stdout)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,799 @@
+diff --git a/runtime/src/frame_stats.cpp b/runtime/src/frame_stats.cpp
+--- a/runtime/src/frame_stats.cpp
++++ b/runtime/src/frame_stats.cpp
+@@ -233,6 +233,11 @@
+         double ms = double(now - last) / 1e6;
+         bins[ms < 14 ? 0 : ms < 19 ? 1 : ms < 25 ? 2 : ms < 31 ? 3 : ms < 36 ? 4 : ms < 50 ? 5 : 6]++;
+     }
++#if defined(NX_ASTRAL_STRICT) && defined(__APPLE__)
++    if (std::getenv("NX_FRAME_LOG"))
++        log("shader-cache frame index=%llu ts_ns=%llu interval_ms=%.6f", (unsigned long long)n,
++            (unsigned long long)now, last ? double(now - last) / 1e6 : 0.0);
++#endif
+     last = now;
+     if (++n % 600) return;
+     log("present intervals over 600: <14 ms %llu, 14-19 %llu, 19-25 %llu, 25-31 %llu, 31-36 %llu, 36-50 %llu, "
+diff --git a/runtime/src/loader.cpp b/runtime/src/loader.cpp
+--- a/runtime/src/loader.cpp
++++ b/runtime/src/loader.cpp
+@@ -73,16 +73,39 @@
+         std::rename(file.c_str(), (file + ".prev").c_str());
+ #if defined(NX_ASTRAL_STRICT)
+         }
++#if defined(_WIN32)
++        g_log_file = plat::fopen_utf8(file, restarted ? "a" : "w");
++#else
+         g_log_file = std::fopen(file.c_str(), restarted ? "a" : "w");
++#endif
+ #else
+         g_log_file = std::fopen(file.c_str(), "w");
+ #endif
+     }
++#if defined(NX_ASTRAL_STRICT)
++    static const bool mirror = [] {
++        const char* e = std::getenv("NX_CONSOLE_LOG");
++#if defined(_WIN32)
++        // Existing Windows opt-in continues to enable its asynchronous mirror.
++        const char* async = std::getenv("NX_WIN_ASYNC_CONSOLE");
++        if (async && async[0] == '1' && !async[1]) return true;
++#endif
++        return e && e[0] == '1' && !e[1];
++    }();
++    bool file_ok = false;
++    if (g_log_file) {
++        file_ok = std::fprintf(g_log_file, "%s\n", buf) >= 0;
++        file_ok = std::fflush(g_log_file) == 0 && file_ok;
++    }
++    // Keep owner-visible diagnostics when the file cannot be opened or written.
++    if (!file_ok || mirror) plat::log_line(buf);
++#else
+     plat::log_line(buf);
+     if (g_log_file) {
+         std::fprintf(g_log_file, "%s\n", buf);
+         std::fflush(g_log_file);
+     }
++#endif
+ }
+
+ void fatal(const char* fmt, ...) {
+diff --git a/runtime/src/nvn/nvn_pipeline.cpp b/runtime/src/nvn/nvn_pipeline.cpp
+--- a/runtime/src/nvn/nvn_pipeline.cpp
++++ b/runtime/src/nvn/nvn_pipeline.cpp
+@@ -18,6 +18,17 @@
+ #include "nvn_pipeline.h"
+ #include "nvn_ultrawide.h"
+ #include "platform.h"
++#if defined(NX_ASTRAL_STRICT) && defined(__APPLE__)
++#include <cmath>
++#include <memory>
++#include <thread>
++#include "nvn_shader_cache.h"
++#elif defined(NX_ASTRAL_STRICT) && (defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++#include <cmath>
++#include <memory>
++#include <thread>
++#include "nvn_shader_cache.h"
++#endif
+
+ namespace nx::nvn {
+
+@@ -118,7 +129,16 @@
+         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+         ci.codeSize = code.size() * 4;
+         ci.pCode = code.data();
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++        const uint64_t module_start = plat::monotonic_ns();
++#endif
+         if (p_vkCreateShaderModule(vk_device(), &ci, nullptr, &m) != VK_SUCCESS) log("nvn/vk: shader %s rejected", s->hash.c_str());
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++        if (std::getenv("NX_FRAME_LOG")) log("shader-cache compile kind=module start_ns=%llu end_ns=%llu phase=%s",
++            (unsigned long long)module_start, (unsigned long long)plat::monotonic_ns(),
++            shader_compile_phase()
++        );
++#endif
+         static int logged = 0;
+         if (is_patched && logged++ < 20) log("nvn/vk: shader %s: integer vertex inputs", s->hash.c_str());
+     }
+@@ -238,9 +258,225 @@
+
+ }  // namespace
+
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++namespace {
++// Only the GPU owner calls these maps. During the initial barrier the owner waits while
++// the compiler thread borrows them exclusively; no concurrent map/VkPipelineCache access.
++thread_local bool g_prewarming = false;
++std::map<std::string, VkPipeline> g_recorded_pipelines;
++std::set<std::string> g_records;
++bool g_records_dirty = false;
++
++std::string shader_identity(const ShaderInfo* shader) {
++    if (!shader) return {};
++    static std::map<const ShaderInfo*, std::string> identities;
++    auto found = identities.find(shader);
++    if (found != identities.end()) return found->second;
++    std::string id = shader->hash + sha1_hex(shader->spirv.data(), shader->spirv.size() * 4);
++    shader_cache::u32(id, shader->control.shared_size);
++    for (auto n : shader->local_size) shader_cache::u32(id, n);
++    shader_cache::u32(id, uint32_t(shader->stage));
++    return identities[shader] = id;
++}
++
++std::string state_bytes(const PipelineKey& k) {
++    // Explicit member copies zero ABI padding and omit all process pointers.
++    // The executable digest keys this local ABI, including endianness/struct layout.
++    PipelineKey c;
++    std::memset(&c, 0, sizeof c);
++    c.topology = k.topology;
++    for (int i = 0; i < 16; ++i) {
++        c.attribs[i].format = k.attribs[i].format;
++        c.attribs[i].offset = k.attribs[i].offset;
++        c.attribs[i].stream = k.attribs[i].stream;
++        c.streams[i].stride = k.streams[i].stride;
++        c.streams[i].divisor = k.streams[i].divisor;
++    }
++    c.attrib_count = k.attrib_count; c.stream_count = k.stream_count;
++    for (int i = 0; i < 8; ++i) {
++        c.blend[i].target = k.blend[i].target;
++        c.blend[i].src_rgb = k.blend[i].src_rgb; c.blend[i].dst_rgb = k.blend[i].dst_rgb;
++        c.blend[i].src_a = k.blend[i].src_a; c.blend[i].dst_a = k.blend[i].dst_a;
++        c.blend[i].eq_rgb = k.blend[i].eq_rgb; c.blend[i].eq_a = k.blend[i].eq_a;
++        c.color.blend_enable[i] = k.color.blend_enable[i]; c.mask.mask[i] = k.mask.mask[i];
++        c.color_formats[i] = k.color_formats[i];
++    }
++    c.color.alpha_test = k.color.alpha_test; c.color.logic_op = k.color.logic_op;
++    c.depth.depth_test = k.depth.depth_test; c.depth.depth_write = k.depth.depth_write;
++    c.depth.stencil_test = k.depth.stencil_test; c.depth.depth_func = k.depth.depth_func;
++    for (int i = 0; i < 2; ++i) {
++        c.depth.stencil_func[i] = k.depth.stencil_func[i]; c.depth.stencil_fail[i] = k.depth.stencil_fail[i];
++        c.depth.depth_fail[i] = k.depth.depth_fail[i]; c.depth.depth_pass[i] = k.depth.depth_pass[i];
++    }
++    c.polygon.cull = k.polygon.cull; c.polygon.front = k.polygon.front;
++    c.polygon.mode = k.polygon.mode; c.polygon.offset_enables = k.polygon.offset_enables;
++    c.color_count = k.color_count; c.depth_format = k.depth_format; c.depth_clamp = k.depth_clamp;
++    c.ufloat_colors = k.ufloat_colors; c.alpha_to_coverage = k.alpha_to_coverage; c.uw_x = k.uw_x;
++    constexpr size_t offset = offsetof(PipelineKey, topology);
++    return std::string(reinterpret_cast<const char*>(&c) + offset, sizeof c - offset);
++}
++void record_string(std::string& record, const std::string& value) {
++    shader_cache::u32(record, uint32_t(value.size())); record += value;
++}
++bool read_string(const std::string& record, size_t& pos, std::string& value) {
++    uint32_t n = 0;
++    if (!shader_cache::take_u32(record, pos, n) || n > record.size() - pos) return false;
++    value.assign(record, pos, n); pos += n; return true;
++}
++std::string graphics_record(const PipelineKey& key) {
++    std::string record = "G";
++    shader_cache::u32(record, uint32_t(pipeline_depth_mode()));
++    record_string(record, shader_identity(key.vs)); record_string(record, shader_identity(key.fs));
++    record += state_bytes(key);
++    return record;
++}
++std::string compute_record(const ShaderInfo* cs) {
++    std::string record = "C";
++    shader_cache::u32(record, uint32_t(pipeline_depth_mode()));
++    record_string(record, shader_identity(cs));
++    return record;
++}
++void remember_pipeline(const std::string& record, VkPipeline pipeline) {
++    if (!pipeline || !shader_cache_enabled()) return;
++    g_recorded_pipelines[record] = pipeline;
++    if (g_records.size() < 16384 && g_records.insert(record).second) g_records_dirty = true;
++}
++
++bool valid_identity(const std::string& id, ShaderStage expected) {
++    if (id.empty()) return true;
++    if (id.size() != 76) return false;  // hash + SPIR-V SHA1 + shared + local[3] + stage
++    for (size_t i = 0; i < 56; ++i)
++        if (!((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f'))) return false;
++    size_t pos = 56; uint32_t shared = 0, n = 0;
++    if (!shader_cache::take_u32(id, pos, shared) || shared > (64u << 10)) return false;
++    for (int i = 0; i < 3; ++i)
++        if (!shader_cache::take_u32(id, pos, n) || !n || n > 1024) return false;
++    return shader_cache::take_u32(id, pos, n) && n == uint32_t(expected);
++}
++struct WarmRecord {
++    std::string bytes, a, b;
++    uint32_t depth = 0;
++    PipelineKey key{};
++    bool compute = false;
++};
++bool parse_record(const std::string& bytes, WarmRecord& r) {
++    if (bytes.empty() || (bytes[0] != 'C' && bytes[0] != 'G')) return false;
++    size_t pos = 1;
++    r.bytes = bytes; r.compute = bytes[0] == 'C';
++    if (!shader_cache::take_u32(bytes, pos, r.depth) || r.depth > 1 || !read_string(bytes, pos, r.a)) return false;
++    if (r.compute)
++        return pos == bytes.size() && !r.a.empty() && valid_identity(r.a, ShaderStage::Compute);
++    if (!read_string(bytes, pos, r.b) || !valid_identity(r.a, ShaderStage::Vertex) ||
++        !valid_identity(r.b, ShaderStage::Fragment) || (r.a.empty() && r.b.empty())) return false;
++    constexpr size_t offset = offsetof(PipelineKey, topology);
++    if (bytes.size() - pos != sizeof(PipelineKey) - offset) return false;
++    std::memcpy(reinterpret_cast<char*>(&r.key) + offset, bytes.data() + pos, sizeof(PipelineKey) - offset);
++    if (r.key.attrib_count > 16 || r.key.stream_count > 16 || r.key.color_count > 8 ||
++        !std::isfinite(r.key.uw_x) || r.key.polygon.mode > 2) return false;
++    for (const auto& attribute : r.key.attribs) if (attribute.stream >= 16) return false;
++    return true;
++}
++const ShaderInfo* warm_shader(const std::string& id) {
++    if (id.empty()) return nullptr;
++    static std::map<std::string, std::unique_ptr<ShaderInfo>> shaders;
++    auto found = shaders.find(id);
++    if (found != shaders.end()) return found->second.get();
++    std::string bytes;
++    if (!shader_cache::read(plat::data_root() + "/spirv/" + id.substr(0, 16) + ".spv", bytes, 16u << 20) ||
++        bytes.empty() || bytes.size() % 4 || sha1_hex(bytes.data(), bytes.size()) != id.substr(16, 40)) return nullptr;
++    auto shader = std::make_unique<ShaderInfo>();
++    shader->hash = id.substr(0, 16);
++    shader->spirv.resize(bytes.size() / 4);
++    std::memcpy(shader->spirv.data(), bytes.data(), bytes.size());
++    if (!reflect_spirv(shader->spirv.data(), shader->spirv.size(), shader->refl)) return nullptr;
++    size_t pos = 56; uint32_t stage = 0;
++    shader_cache::take_u32(id, pos, shader->control.shared_size);
++    for (auto& n : shader->local_size) shader_cache::take_u32(id, pos, n);
++    shader_cache::take_u32(id, pos, stage);
++    shader->stage = ShaderStage(stage);
++    if (shader->stage != shader->refl.stage) return nullptr;
++    // Constants and NVN resource meanings are not used by pipeline/layout creation.
++    shader->dynamic_uniforms = dynamic_uniform_bindings(shader.get());
++    shader->written_storage = written_storage_bindings(shader.get()); shader->masks_known = true;
++    const ShaderInfo* result = shader.get(); shaders[id] = std::move(shader); return result;
++}
++}  // namespace
++
++const char* shader_compile_phase() { return g_prewarming ? "prewarm" : "runtime"; }
++
++void shader_prewarm() {
++    if (g_prewarming) return;
++    static bool done = false;
++    if (done) return;  // the layout hot path never scans the environment after boot
++    done = true;
++    if (!shader_cache_enabled()) return;
++    const char* e = std::getenv("NX_SHADER_PREWARM");
++#if (defined(__linux__) && !defined(__ANDROID__))
++    // PC-SHADER-027: the Linux warm-frame gate did not pass; keep compilation opt-in.
++    if (!e || e[0] != '1') return;
++#else
++    if (e && e[0] == '0') return;
++#endif
++    // Called under GPU ownership before the first layout lookup. Join before touching any
++    // compiler maps again. Other guest threads can continue loading/recording in parallel.
++    uint32_t depth = uint32_t(pipeline_depth_mode());
++    std::thread compiler([depth] {
++        g_prewarming = true;
++        std::string payload;
++        if (!shader_cache::load(plat::data_root() + "/pipeline_records_v1_" + shader_cache_key() + ".bin",
++                                shader_cache_key() + ":records", payload)) {
++            log("shader-cache: no valid recorded pipelines; cold boot");
++            g_prewarming = false; return;
++        }
++        size_t pos = 0; uint32_t count = 0;
++        std::vector<WarmRecord> records;
++        bool valid = shader_cache::take_u32(payload, pos, count) && count <= 16384;
++        for (uint32_t i = 0; valid && i < count; ++i) {
++            std::string bytes; WarmRecord r;
++            valid = read_string(payload, pos, bytes) && parse_record(bytes, r);
++            if (valid) records.push_back(std::move(r));
++        }
++        if (!valid || pos != payload.size()) {
++            log("shader-cache: corrupt pipeline records ignored");
++            g_prewarming = false; return;
++        }
++        uint64_t start = plat::monotonic_ns(); size_t warmed = 0, skipped = 0;
++        for (auto& r : records) {
++            if (r.depth != depth) { ++skipped; continue; }
++            const ShaderInfo* a = warm_shader(r.a); const ShaderInfo* b = warm_shader(r.b);
++            if ((!r.a.empty() && !a) || (!r.b.empty() && !b)) { ++skipped; continue; }
++            std::vector<const ShaderInfo*> stages;
++            if (a) stages.push_back(a); if (b) stages.push_back(b);
++            const auto& layout = program_layout(stages);
++            VkPipeline pipeline;
++            if (r.compute) pipeline = compute_pipeline(a, layout);
++            else { r.key.vs = a; r.key.fs = b; pipeline = graphics_pipeline(r.key, layout); }
++            if (pipeline) ++warmed; else ++skipped;
++        }
++        log("shader-cache: prewarm warmed=%zu skipped=%zu elapsed_ms=%.3f", warmed, skipped,
++            double(plat::monotonic_ns() - start) / 1e6);
++        g_prewarming = false;
++    });
++    compiler.join();
++}
++void shader_records_save() {
++    if (!shader_cache_enabled() || !g_records_dirty) return;
++    std::string payload; shader_cache::u32(payload, uint32_t(g_records.size()));
++    for (const auto& r : g_records) record_string(payload, r);
++    if (shader_cache::save(plat::data_root() + "/pipeline_records_v1_" + shader_cache_key() + ".bin",
++                           shader_cache_key() + ":records", payload)) {
++        g_records_dirty = false;
++        log("shader-cache: saved recorded pipelines count=%zu", g_records.size());
++    }
++}
++#endif
++
+ // ---- layouts ----------------------------------------------------------------------------------------------------------
+
+ const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages) {
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++    shader_prewarm();
++#endif
+     static std::map<std::vector<const ShaderInfo*>, ProgramLayout> cache;
+     static const std::pair<const std::vector<const ShaderInfo*>, ProgramLayout>* last = nullptr;  // entries stay
+     if (last && last->first == stages) return last->second;  // runs of draws use one program
+@@ -304,6 +540,14 @@
+     Key k;
+     std::memcpy(k.b, &key, sizeof key);
+     if (auto it = cache.find(k); it != cache.end()) return (last = &*it)->second;
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++    shader_prewarm();
++    std::string record = shader_cache_enabled() ? graphics_record(key) : "";
++    if (!record.empty()) {
++        auto warm = g_recorded_pipelines.find(record);
++        if (warm != g_recorded_pipelines.end()) return (last = &*cache.emplace(k, warm->second).first)->second;
++    }
++#endif
+ #if defined(NX_ASTRAL_STRICT)
+     const bool clip_control = depth_clip_control(pipeline_depth_mode());  // freezes the mode before any module
+ #endif
+@@ -498,10 +742,19 @@
+     const uint64_t t0 = plat::monotonic_ns();
+     VkResult made = p_vkCreateGraphicsPipelines(vk_device(), pipeline_cache(), 1, &ci, nullptr, &p);
+     note_pipeline_created(plat::monotonic_ns() - t0);
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++    if (std::getenv("NX_FRAME_LOG")) log("shader-cache compile kind=graphics start_ns=%llu end_ns=%llu phase=%s",
++        (unsigned long long)t0, (unsigned long long)plat::monotonic_ns(),
++            shader_compile_phase()
++        );
++#endif
+     if (made != VK_SUCCESS)
+         log("nvn/vk: pipeline for %s + %s failed", key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
+     else if (g_trace)
+         log("nvn/vk: pipeline %zu: %s + %s", cache.size() + 1, key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++    if (made == VK_SUCCESS && !record.empty()) remember_pipeline(record, p);
++#endif
+     return (last = &*cache.emplace(k, p).first)->second;
+ }
+
+@@ -671,6 +924,15 @@
+ VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgramLayout& layout) {
+     static std::map<std::pair<const ShaderInfo*, VkPipelineLayout>, VkPipeline> cache;
+     auto& p = cache[{cs, layout.layout}];
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++    if (p) return p;
++    shader_prewarm();
++    std::string record = shader_cache_enabled() ? compute_record(cs) : "";
++    if (!record.empty()) {
++        auto warm = g_recorded_pipelines.find(record);
++        if (warm != g_recorded_pipelines.end()) return p = warm->second;
++    }
++#endif
+     if (!p) {
+ #if defined(NX_ASTRAL_STRICT)
+         pipeline_depth_mode();  // any pipeline freezes the depth mode
+@@ -684,11 +946,24 @@
+         sg.requiredSubgroupSize = 32;
+         if (gpu_require_subgroup32()) ci.stage.pNext = &sg;
+         ci.layout = layout.layout;
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++        const uint64_t compute_start = plat::monotonic_ns();
++#endif
+         if (p_vkCreateComputePipelines(vk_device(), pipeline_cache(), 1, &ci, nullptr, &p) != VK_SUCCESS) {
+             log("nvn/vk: compute pipeline for %s failed", cs->hash.c_str());
+             p = VK_NULL_HANDLE;
+         }
+-    }
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++        note_pipeline_created(plat::monotonic_ns() - compute_start);
++        if (std::getenv("NX_FRAME_LOG")) log("shader-cache compile kind=compute start_ns=%llu end_ns=%llu phase=%s",
++            (unsigned long long)compute_start, (unsigned long long)plat::monotonic_ns(),
++            shader_compile_phase()
++        );
++#endif
++    }
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++    if (!record.empty()) remember_pipeline(record, p);
++#endif
+     return p;
+ }
+
+diff --git a/runtime/src/nvn/nvn_pipeline_cache.cpp b/runtime/src/nvn/nvn_pipeline_cache.cpp
+--- a/runtime/src/nvn/nvn_pipeline_cache.cpp
++++ b/runtime/src/nvn/nvn_pipeline_cache.cpp
+@@ -9,6 +9,17 @@
+
+ #include "nvn_vk.h"
+ #include "platform.h"
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++#if defined(__APPLE__)
++#include <mach-o/dyld.h>
++#include <crt_externs.h>
++#endif
++#include <set>
++#if !defined(_WIN32)
++#include <sys/utsname.h>
++#endif
++#include "nvn_shader_cache.h"
++#endif
+
+ namespace nx::nvn {
+
+@@ -17,12 +28,103 @@
+ namespace {
+
+ VkPipelineCache g_cache = VK_NULL_HANDLE;
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++bool g_cache_dirty = false;
++#endif
+ bool g_tried = false;
+ size_t g_saved_size = 0;
+ std::string g_path;
+ uint64_t g_pipelines = 0, g_pipeline_ns = 0, g_astc = 0, g_astc_ns = 0;
+
+ }  // namespace
++
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++const std::string& shader_cache_key() {
++    static const std::string key = [] {
++        VkPhysicalDeviceProperties p{};
++        p_vkGetPhysicalDeviceProperties(vk_physical(), &p);
++#if defined(__APPLE__)
++        uint32_t size = 0;
++        _NSGetExecutablePath(nullptr, &size);
++        std::vector<char> name(size);
++        std::string executable;
++        if (_NSGetExecutablePath(name.data(), &size) ||
++            !shader_cache::read(name.data(), executable, 256u << 20)) return std::string{};
++#else
++        // Native executable identity; never depend on the launch working directory.
++        std::string executable;
++#if defined(_WIN32)
++        std::wstring name(32768, L'\0');
++        DWORD size = GetModuleFileNameW(nullptr, name.data(), DWORD(name.size()));
++        if (!size || size >= name.size()) return std::string{};
++        name.resize(size);
++        FILE* file = _wfopen(name.c_str(), L"rb");
++#else
++        FILE* file = plat::fopen_utf8("/proc/self/exe", "rb");
++#endif
++        if (!file) return std::string{};
++        bool ok = plat::fseek64(file, 0, SEEK_END) == 0;
++        int64_t bytes = ok ? plat::ftell64(file) : -1;
++        ok = ok && bytes > 0 && bytes <= (512ll << 20) && plat::fseek64(file, 0, SEEK_SET) == 0;
++        if (ok) {
++            executable.resize(size_t(bytes));
++            ok = std::fread(executable.data(), 1, executable.size(), file) == executable.size();
++        }
++        std::fclose(file);
++        if (!ok) return std::string{};
++#endif
++        std::string identity = "astral-cache-v1:" + sha1_hex(executable.data(), executable.size());
++        identity.append(reinterpret_cast<const char*>(&p.vendorID), sizeof p.vendorID);
++        identity.append(reinterpret_cast<const char*>(&p.deviceID), sizeof p.deviceID);
++        identity.append(reinterpret_cast<const char*>(&p.driverVersion), sizeof p.driverVersion);
++        identity.append(reinterpret_cast<const char*>(&p.apiVersion), sizeof p.apiVersion);
++        identity.append(reinterpret_cast<const char*>(p.pipelineCacheUUID), VK_UUID_SIZE);
++#if defined(_WIN32)
++        // Vulkan driver/API/UUID above invalidate driver changes; include the native OS version too.
++        using VersionFn = LONG (WINAPI*)(OSVERSIONINFOW*);
++        auto version = reinterpret_cast<VersionFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
++        OSVERSIONINFOW os{}; os.dwOSVersionInfoSize = sizeof os;
++        if (!version || version(&os) != 0) return std::string{};
++        identity += std::to_string(os.dwMajorVersion) + ":" + std::to_string(os.dwMinorVersion) + ":" + std::to_string(os.dwBuildNumber);
++#else
++        utsname os{};
++        if (uname(&os) != 0) return std::string{};
++        identity += std::string(os.release) + ":" + os.version;
++#endif
++        // Shader transformation/layout options and MoltenVK compiler configuration.
++        for (const char* setting : {"NX_INT_ATTRIBS", "NX_CLIP_Z_PATCH", "NX_ZERO_VS_OUTPUTS", "NX_INVARIANT",
++             "NX_FLOAT_CONTROLS", "NX_DYNAMIC_UBO", "NX_NO_ALPHA_TO_COVERAGE", "NX_EQUAL_ALWAYS", "NX_NO_STENCIL",
++             "NX_R11G11B10_RAW", "NX_EQUAL_SLACK", "NX_RENDER_PASS_OBJECTS", "NX_ULTRAWIDE",
++#if defined(_WIN32)
++             "NX_EXACT_EQUAL", "NX_FRAG_OUTPUT_MASK", "NX_HALF_BITS", "NX_VERTEX_PRECISE",
++             "NX_REPLAY_DYNAMIC", "NX_REPLAY_KEYS",
++#endif
++#if defined(__APPLE__)
++             "MVK_CONFIG_FAST_MATH_ENABLED", "MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS",
++             "MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y", "MVK_CONFIG_SHADER_CONVERSION_FAST_MATH_ENABLED"
++#endif
++             }) {
++            identity += "|"; identity += setting; identity += "=";
++            const char* value = std::getenv(setting);
++            identity += value ? std::string("set:") + value : "unset";
++        }
++#if defined(__APPLE__)
++        std::set<std::string> moltenvk;
++        for (char** env = *_NSGetEnviron(); env && *env; ++env)
++            if (std::strncmp(*env, "MVK_CONFIG_", 11) == 0) moltenvk.insert(*env);
++        for (const auto& setting : moltenvk) { identity += "|"; identity += setting; }
++#endif
++        return sha1_hex(identity.data(), identity.size());
++    }();
++    return key;
++}
++bool shader_cache_enabled() {
++    const char* e = std::getenv("NX_SHADER_CACHE");
++    // Diagnostic external tools can change shader code without changing this executable.
++    return (!e || e[0] != '0') && !std::getenv("NX_SPIRV_OPT") && !std::getenv("NX_SPIRV_TOOL") &&
++           !shader_cache_key().empty();
++}
++#endif
+
+ VkPipelineCache pipeline_cache() {
+     if (g_tried) return g_cache;
+@@ -33,7 +135,25 @@
+     char name[64];
+     std::snprintf(name, sizeof name, "/pipelines_%04x_%04x.bin", p.vendorID, p.deviceID);
+     g_path = plat::data_root() + name;
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++    const bool versioned = shader_cache_enabled();
++    if (versioned) g_path = plat::data_root() + "/pipelines_v1_" + shader_cache_key() + ".bin";
++#endif
+     std::vector<uint8_t> data;
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++    if (versioned) {
++        std::string payload;
++        if (shader_cache::load(g_path, shader_cache_key() + ":vulkan", payload))
++            data.assign(payload.begin(), payload.end());
++        else log("shader-cache: empty or rejected versioned Vulkan cache");
++        // Validate the Vulkan header before passing opaque data to MoltenVK.
++        uint32_t header[4]{};
++        if (data.size() >= 32) std::memcpy(header, data.data(), sizeof header);
++        if (data.size() < 32 || header[0] != 32 || header[1] != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
++            header[2] != p.vendorID || header[3] != p.deviceID ||
++            std::memcmp(data.data() + 16, p.pipelineCacheUUID, VK_UUID_SIZE)) data.clear();
++    } else
++#endif
+     if (FILE* f = plat::fopen_utf8(g_path, "rb")) {
+         plat::fseek64(f, 0, SEEK_END);
+         int64_t n = plat::ftell64(f);
+@@ -47,6 +167,9 @@
+     if (p_vkCreatePipelineCache(vk_device(), &ci, nullptr, &g_cache) != VK_SUCCESS) {
+         ci.initialDataSize = 0, ci.pInitialData = nullptr;  // a cache the driver refuses: start empty
+         p_vkCreatePipelineCache(vk_device(), &ci, nullptr, &g_cache);
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++        if (versioned) data.clear();
++#endif
+     }
+     g_saved_size = data.size();
+     log("nvn/vk: pipeline cache %s (%zu bytes loaded)", g_path.c_str(), data.size());
+@@ -55,10 +178,33 @@
+
+ void pipeline_cache_save() {
+     if (!g_cache) return;
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++    if (shader_cache_enabled() && !g_cache_dirty) return;
++#endif
+     size_t n = 0;
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++    if (p_vkGetPipelineCacheData(vk_device(), g_cache, &n, nullptr) != VK_SUCCESS) return;
++    if (shader_cache_enabled()) {
++        if (n == 0 || n > shader_cache::max_payload) return;
++    } else if (n <= g_saved_size) return;
++#else
+     if (p_vkGetPipelineCacheData(vk_device(), g_cache, &n, nullptr) != VK_SUCCESS || n <= g_saved_size) return;
++#endif
+     std::vector<uint8_t> data(n);
+     if (p_vkGetPipelineCacheData(vk_device(), g_cache, &n, data.data()) != VK_SUCCESS) return;
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++    if (shader_cache_enabled()) {
++        std::string payload(reinterpret_cast<const char*>(data.data()), n);
++        static std::string saved_digest;
++        std::string digest = sha1_hex(payload.data(), payload.size());
++        if (digest != saved_digest && shader_cache::save(g_path, shader_cache_key() + ":vulkan", payload)) {
++            saved_digest = digest;
++            log("shader-cache: saved Vulkan cache bytes=%zu", n);
++        }
++        if (saved_digest == digest) g_cache_dirty = false;
++        return;
++    }
++#endif
+     std::string tmp = g_path + ".tmp";
+     if (FILE* f = plat::fopen_utf8(tmp, "wb")) {
+         bool ok = std::fwrite(data.data(), 1, n, f) == n;
+@@ -68,7 +214,11 @@
+     }
+ }
+
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++void note_pipeline_created(uint64_t ns) { g_pipelines++, g_pipeline_ns += ns; g_cache_dirty = true; }
++#else
+ void note_pipeline_created(uint64_t ns) { g_pipelines++, g_pipeline_ns += ns; }
++#endif
+ void note_astc_decoded(uint64_t ns) { g_astc++, g_astc_ns += ns; }
+
+ // One line per timing window (nvn_vk.cpp log_timing): what the replay created, and the time it took.
+@@ -79,6 +229,12 @@
+             (unsigned long long)g_astc, double(g_astc_ns) / 1e6);
+     g_pipelines = g_pipeline_ns = g_astc = g_astc_ns = 0;
+     static uint64_t windows = 0;
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++    if (shader_cache_enabled()) {
++        shader_records_save();
++        pipeline_cache_save();
++    } else
++#endif
+     if (++windows % 10 == 0) pipeline_cache_save();
+ }
+
+diff --git a/runtime/src/nvn/nvn_shader_cache.h b/runtime/src/nvn/nvn_shader_cache.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/nvn/nvn_shader_cache.h
+@@ -0,0 +1,112 @@
++// Private cache data only. No game bytes are shipped with this format.
++#pragma once
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++#include "nvn_shaders.h"
++#if defined(_WIN32)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include "platform.h"
++#endif
++
++namespace nx::nvn::shader_cache {
++constexpr size_t max_payload = 64u << 20;
++inline void u32(std::string& out, uint32_t value) {
++    for (unsigned n = 0; n < 4; ++n) out.push_back(char(value >> (8 * n)));
++}
++inline bool take_u32(const std::string& in, size_t& pos, uint32_t& value) {
++    if (pos > in.size() || in.size() - pos < 4) return false;
++    value = 0;
++    for (unsigned n = 0; n < 4; ++n) value |= uint32_t(uint8_t(in[pos++])) << (8 * n);
++    return true;
++}
++inline std::string encode(const std::string& key, const std::string& payload) {
++    if (key.empty() || key.size() > 4096 || payload.size() > max_payload) return {};
++    std::string out = "ACSC0001";
++    u32(out, uint32_t(key.size())); u32(out, uint32_t(payload.size()));
++    // Detect accidental corruption before any opaque bytes reach the driver.
++    std::string checked = key + payload;
++    out += sha1_hex(checked.data(), checked.size());
++    return out + key + payload;
++}
++inline bool decode(const std::string& bytes, const std::string& key, std::string& payload) {
++    payload.clear();
++    if (bytes.size() < 56 || bytes.compare(0, 8, "ACSC0001") != 0) return false;
++    size_t pos = 8; uint32_t k = 0, n = 0;
++    if (!take_u32(bytes, pos, k) || !take_u32(bytes, pos, n) || !k || k > 4096 || n > max_payload ||
++        bytes.size() != 56ull + k + n || bytes.compare(56, k, key) != 0) return false;
++    if (bytes.compare(16, 40, sha1_hex(bytes.data() + 56, size_t(k) + n)) != 0) return false;
++    payload.assign(bytes, 56 + k, n);
++    return true;
++}
++inline bool read(const std::string& path, std::string& bytes, size_t limit = max_payload + 4152) {
++    bytes.clear();
++#if defined(_WIN32)
++    FILE* f = plat::fopen_utf8(path, "rb");
++#else
++    FILE* f = std::fopen(path.c_str(), "rb");
++#endif
++    if (!f) return false;
++    bool ok = std::fseek(f, 0, SEEK_END) == 0;
++    long n = ok ? std::ftell(f) : -1;
++    ok = ok && n >= 0 && uint64_t(n) <= limit && std::fseek(f, 0, SEEK_SET) == 0;
++    if (ok) {
++        bytes.resize(size_t(n));
++        ok = std::fread(bytes.data(), 1, bytes.size(), f) == bytes.size();
++    }
++    std::fclose(f);
++    if (!ok) bytes.clear();
++    return ok;
++}
++inline bool load(const std::string& path, const std::string& key, std::string& payload) {
++    payload.clear();
++    std::string bytes;
++    return read(path, bytes) && decode(bytes, key, payload);
++}
++// A failed write/rename leaves the previous file intact. Callers serialize writers.
++inline bool save(const std::string& path, const std::string& key, const std::string& payload) {
++    std::string bytes = encode(key, payload);
++    if (bytes.empty()) return false;
++    std::string tmp = path + ".tmp";
++#if defined(_WIN32)
++    auto wide = [](const std::string& utf8) {
++        int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.c_str(), -1, nullptr, 0);
++        if (!n) return std::wstring{};
++        std::wstring result(size_t(n), L'\0');
++        if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.c_str(), -1, result.data(), n)) return std::wstring{};
++        return result;
++    };
++    const auto destination = wide(path), temporary = wide(tmp);
++    if (destination.empty() || temporary.empty()) return false;
++    FILE* f = plat::fopen_utf8(tmp, "wb");
++#else
++    FILE* f = std::fopen(tmp.c_str(), "wb");
++#endif
++    if (!f) return false;
++    bool ok = std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
++    ok = std::fclose(f) == 0 && ok;
++#if defined(_WIN32)
++    if (ok && MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
++    DeleteFileW(temporary.c_str());
++#else
++    if (ok && std::rename(tmp.c_str(), path.c_str()) == 0) return true;
++    std::remove(tmp.c_str());
++#endif
++    return false;
++}
++}  // namespace nx::nvn::shader_cache
++
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++namespace nx::nvn {
++bool shader_cache_enabled();
++const std::string& shader_cache_key();
++void shader_prewarm();  // boot barrier; compiler thread never accesses guest memory
++void shader_records_save();  // caller holds the GPU lock
++const char* shader_compile_phase();
++}
++#endif
+diff --git a/runtime/src/nvn/nvn_vk.cpp b/runtime/src/nvn/nvn_vk.cpp
+--- a/runtime/src/nvn/nvn_vk.cpp
++++ b/runtime/src/nvn/nvn_vk.cpp
+@@ -1,3 +1,6 @@
++#if defined(NX_ASTRAL_STRICT) && (defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++#include "nvn_shader_cache.h"
++#endif
+ // NVN's GPU side on Vulkan (docs/NVN.md, N3): the host device, a VkImage per NVN texture the GPU touches, the
+ // replay of recorded command lists, and presenting a window texture on the host swapchain.
+ //
+@@ -21,6 +24,9 @@
+
+ #include "nvn_vk.h"
+ #include "platform.h"
++#if defined(NX_ASTRAL_STRICT) && defined(__APPLE__)
++#include "nvn_shader_cache.h"
++#endif
+ #if defined(NX_ASTRAL_STRICT)
+ #include "perf_hud.h"
+ #endif
+@@ -276,6 +282,13 @@
+         VK_API_VERSION_MINOR(props.apiVersion), g_family);
+     g_failed = false;
+     g_ready = true;
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
++    // The guest set its device depth mode before the first submit. Warm before any
++    // loading frame is presented, rather than hitching the first layout request.
++    shader_prewarm();
++    shader_records_save();
++    pipeline_cache_save();
++#endif
+     return true;
+ }
+
+@@ -610,6 +623,10 @@
+ // Headless: the presented texture is only counted, logged and dumped (no swapchain). Nothing is submitted unless a
+ // frame dump is due: the empty submit was a Metal command buffer and a fence wait per frame.
+ void present_headless(uint64_t texture) {
++#if defined(NX_ASTRAL_STRICT) && defined(__APPLE__)
++    // Headless has no vkQueuePresentKHR path, but measurements still need every interval.
++    if (std::getenv("NX_FRAME_LOG")) plat::frame_presented();
++#endif
+     GpuImage* src = image_of(texture);  // made here if new, as before (the targets rendered into it share it, #44)
+     static uint64_t presents = 0;
+     presents++;
+@@ -652,6 +669,17 @@
+     PresentTimer timer;
+     drain_objects();  // under the GPU lock, as in gpu_submit
+     if (!init()) return;
++#if defined(NX_ASTRAL_STRICT) && (defined(__linux__) && !defined(__ANDROID__))
++    // Linux headless has no swapchain presentation hook. Keep the same monotonic
++    // frame/compile clock for diagnostic ROI attribution without per-frame defaults.
++    if (plat::headless() && std::getenv("NX_FRAME_LOG")) {
++        static uint64_t last = 0, index = 0;
++        const uint64_t now = plat::monotonic_ns();
++        log("shader-cache frame index=%llu ts_ns=%llu interval_ms=%.6f", (unsigned long long)index++,
++            (unsigned long long)now, last ? double(now - last) / 1e6 : 0.0);
++        last = now;
++    }
++#endif
+     if (!async_gpu() || pipelined()) free_retired_images(async_gpu() ? frame_completed() : UINT64_MAX);
+     if (plat::headless()) return present_headless(texture);
+     if (plat::window_minimized()) return;

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
@@ -100,9 +101,93 @@ class PackageTest(unittest.TestCase):
             pr.package('v0.1.0', self.tmp / 'dist', self.repo)
         self.assertIn('forbidden file type .spv', str(e.exception))
 
+    def test_patch_series_cannot_escape_the_committed_patch_directory(self):
+        self.commit({'runtime/patches/series.macos': '../private.patch\n'})
+        with self.assertRaises(pr.PackageError) as caught:
+            pr.package('v0.1.0', self.tmp / 'dist', self.repo)
+        self.assertIn('unsafe patch series member', str(caught.exception))
+
     def test_bad_version(self):
         with self.assertRaises(pr.PackageError):
             pr.package('latest', self.tmp / 'dist', self.repo)
+
+    def test_windows_package_has_setup_and_windows_patch_closure(self):
+        files = {name: '// original source\n' for name in pr.WINDOWS_FILES}
+        files['runtime/patches/series.windows'] = 'a.patch\nwindows.patch\n'
+        files['runtime/patches/windows.patch'] = 'diff\n'
+        self.commit(files)
+        target, staged = pr.package('v0.1.0-preview', self.tmp / 'dist', self.repo, windows=True)
+        self.assertEqual(target.name, 'AC-Recomp-v0.1.0-preview-windows.zip')
+        self.assertTrue(set(pr.WINDOWS_FILES) <= set(staged))
+        self.assertIn('runtime/patches/windows.patch', staged)
+        self.assertIn('AC-Recomp Setup.cmd', staged)
+        with zipfile.ZipFile(target) as z:
+            entry = z.read('AC-Recomp-v0.1.0-preview/AC-Recomp Setup.cmd')
+            self.assertIn(b'call "%~dp0ports\\windows\\Setup.cmd"', entry)
+            self.assertFalse(any(n.endswith(('.exe', '.dll', '.ico', '.keys', '.spv')) for n in z.namelist()))
+        original = target.read_bytes()
+        pr.package('v0.1.0-preview', self.tmp / 'dist', self.repo, windows=True)
+        self.assertEqual(target.read_bytes(), original)
+        with self.assertRaises(pr.PackageError):
+            pr.package('v0.1.0', self.tmp / 'dist', self.repo, windows=True, dmg=True)
+
+    def test_windows_source_exception_does_not_allow_other_csharp(self):
+        stage = self.tmp / 'stage'
+        (stage / 'ports/windows').mkdir(parents=True)
+        for name in ('Launcher.cs', 'game.cs'):
+            (stage / 'ports/windows' / name).write_text('// text')
+        pr.check(stage, ['ports/windows/Launcher.cs'])
+        with self.assertRaises(pr.PackageError):
+            pr.check(stage, ['ports/windows/game.cs'])
+        (stage / 'ports/windows/Launcher.cs').write_bytes(b'\0binary')
+        with self.assertRaises(pr.PackageError):
+            pr.check(stage, ['ports/windows/Launcher.cs'])
+
+    @unittest.skipUnless((ROOT / 'scripts/export_public.py').is_file(), 'private exporter not present')
+    def test_export_audits_shipped_files_and_reads_committed_public_text(self):
+        import export_public
+        self.commit({'scripts/export_public.py': '# exporter presence marker\n',
+                     'public/README.md': 'Committed public instructions\n',
+                     'docs/UNSHIPPED.md': '/Users/private-person/research\n'})
+        (self.repo / 'public/README.md').write_text('/Users/private-person/uncommitted\n')
+
+        def replace_public(repo, out):
+            # Synthetic trees do not contain the historical docs targeted by transform's literal edits.
+            shutil.copyfile(repo / 'public/README.md', out / 'README.md')
+
+        with patch.object(export_public, 'REPLACE', {'public/README.md': 'README.md'}), \
+                patch.object(export_public, 'transform', replace_public):
+            target, names = pr.package('v0.1.0', self.tmp / 'dist', self.repo)
+            self.assertNotIn('docs/UNSHIPPED.md', names)
+            with zipfile.ZipFile(target) as z:
+                self.assertEqual(z.read('AC-Recomp-v0.1.0/README.md'), b'Committed public instructions\n')
+            self.commit({'docs/BUILDING.md': '/Users/private-person/included\n'})
+            with self.assertRaises(pr.PackageError) as caught:
+                pr.package('v0.1.0', self.tmp / 'dist', self.repo)
+            self.assertIn('docs/BUILDING.md', str(caught.exception))
+            self.commit({'docs/BUILDING.md': 'safe build instructions\n',
+                         'public/README.md': 'safe public instructions\n',
+                         'ports/macos-setup/SetupApp.swift': '// /Users/private-person/embedded\n'})
+            with self.assertRaises(pr.PackageError) as caught:
+                pr.package('v0.1.0', self.tmp / 'dist', self.repo)
+            self.assertIn('ports/macos-setup/SetupApp.swift', str(caught.exception))
+
+    @unittest.skipUnless((ROOT / 'scripts/export_public.py').is_file(), 'private exporter not present')
+    def test_license_credit_exception_is_limited_to_the_exact_notice_line(self):
+        stage = self.tmp / 'license-scan'
+        stage.mkdir()
+        attribution = ('credits **theboy181** for the original Static 60 FPS patch that located the timer and '
+                       'display-cap code.\n')
+        notice = stage / 'THIRD_PARTY_NOTICES.md'
+        notice.write_text(attribution)
+        self.assertEqual(pr.release_scan(stage), [])
+        (stage / 'README.md').write_text(attribution)
+        self.assertEqual(pr.release_scan(stage)[0][0], 'README.md')
+        (stage / 'README.md').write_text('safe\n')
+        notice.write_text(attribution + '/Users/private-person/secret\n')
+        self.assertTrue(any(f[2] == 'home path' for f in pr.release_scan(stage)))
+        notice.write_text('theboy181\n')
+        self.assertTrue(any(f[2] == 'denied reference' for f in pr.release_scan(stage)))
 
     @unittest.skipUnless((ROOT / 'scripts/export_public.py').is_file(), 'private exporter not present')
     def test_this_repository_head(self):

@@ -1,5 +1,15 @@
 # Astral Chain 60 fps mode (experimental)
 
+For the opt-in 1.0.0 port of the community variable-step timer, input-window and camera fixes, see
+[ASTRAL_HIGH_FPS.md](ASTRAL_HIGH_FPS.md). Its modes are separate from the existing 30/60 launcher choices.
+The five-site patch below is retained as the comparison baseline; it already measures real elapsed time but
+keeps a 0.5-step floor. It is unsafe to unlock that binary above 60 fps. Battle windows and cutscene A/V sync
+require their own measured acceptance; the expectations below are not proof of them.
+
+FPS-007 reproduced one defect in native runs: a nominal 15-tick ZL input buffer lasted 243.55/249.91 ms with this
+five-site patch, versus 499.38/500.27 ms at 30 fps. Dynamic mode restored the authored duration within one 30 Hz
+tick. This is a raw buffer measurement; successful Legion moves and full battle timing remain unverified.
+
 Astral Chain runs at 30 fps: the game opens its NVN window with present interval 2 (`nvn: window ...: 3 textures
 (3 active), present interval 2`). In every runtime log so far it never changes that interval
 (`600 of the last 600 presents at interval >= 2`).
@@ -113,25 +123,28 @@ included.
 
 - `nvnWindowSetPresentInterval` (runtime `nvn_queue.cpp`) records the interval and logs
   `nvn: window present interval 2 -> 1`. `pace_present` returns each present no earlier than
-  `interval × display_period_ns()` after the previous one. That period is 16.67 ms unless `NX_DISPLAY_HZ` is set,
+  its next deadline, incremented by `interval × display_period_ns()`. The deadline can catch up after a late frame.
+  The display period is 16.67 ms unless `NX_DISPLAY_HZ` is set,
   so interval 1 paces at 60 fps whatever the host display's refresh rate. Do not combine 60 fps with
   `NX_DISPLAY_HZ` > 60: the 0.5 minimum would run the game fast.
 - The Wonder-specific governor (`frame_time_probe`, `NX_FPS_CAP`, `NX_MAX_INTERVAL`) only acts at Wonder's call
   site and does nothing for Astral Chain. The perf HUD (`NX_PERF_HUD`) computes game speed as FPS × interval / 60,
-  so it reads correctly at interval 1.
+  so its "Speed" is FPS-derived. It does not measure world speed under a frame-rate drop or with the new dynamic
+  timer. Compare accumulated actual steps with wall time instead.
 
 ## Risks and what to check
 
 - **Frame-counted logic.** Anything that counts frames instead of reading the scaled time (UI timers, some effects,
-  input repeat, hit-stop, physics substeps) would run up to 2× fast. The community patches touch nothing else, and
-  their users report working gameplay. That is evidence, not proof.
-- **Cutscenes.** With the `nop`, cutscenes follow real time and should stay in step with streamed audio and
-  movies. A hitch makes a cutscene skip ahead (a step of up to 2.0) instead of slowing down. The alternative is the
-  fixed 0.5 step (`main+0x3df76c` `fmov s8, #1.0` → `#0.5`, word `0x1e2e1008` → `0x1e2c1008`)
-  and keeping the cutscene `cbz`. That is exact at a steady 60, but it slows cutscenes and desyncs audio whenever
-  60 is missed.
+  input repeat, hit-stop, physics substeps) can run up to 2× fast. This five-site variant leaves those counters
+  unchanged. The native buffer result above confirms a shortened window; the newer Dynamic FPS port adds
+  whole-30-Hz counter hooks and normalized camera smoothing.
+- **Cutscenes.** The `nop` supplies measured time, but the original scene-boundary code discards fractional
+  progress. Streamed audio alignment therefore needs measurement. A hitch can also exceed the 2-tick maximum
+  and lose world time. The optional fractional-carry repair and measured headless A/V results are documented in
+  `ASTRAL_HIGH_FPS.md`; real-device acceptance remains open. Forcing a constant 0.5 cutscene step is unsuitable
+  when 60 fps is missed and is not the chosen repair.
 - **Performance.** The host has to finish a frame (CPU lift and GPU replay) in 16.7 ms. Otherwise the game runs at
-  a variable 40-60 fps at correct speed. Prefer `NX_PERF_HUD=1` to measure it.
+  a variable 40-60 fps at correct speed. `NX_PERF_HUD=1` measures the frame rate; verify world time separately.
 - **Audio.** Audio runs on its own clock (audout and the audio renderer), so it is independent of the frame rate.
   Watch for crackle if the main thread starves the audio threads.
 
@@ -146,4 +159,5 @@ included.
    - a timed walk between two landmarks;
    - the in-game clock or a cutscene's length against its audio (stopwatch or a screen capture);
    - a battle (Legion chain, hit-stop, timers).
-4. A cutscene check: lip sync and music cues stay aligned. If not, try the alternative above.
+4. A cutscene check: measure scene cuts against packet-timestamped audio and frame dumps, then verify physical
+   lip sync and music cues. Keep headless timer results separate from real-device acceptance.

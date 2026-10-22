@@ -21,8 +21,11 @@ Game-derived: the patched file belongs in the private build directory, never in 
 """
 import argparse
 import hashlib
+import os
+from pathlib import Path
 import struct
 import sys
+import tempfile
 
 # Astral Chain 1.0.0 (title 01007300020FA000), main: the first 16 bytes of the NSO build id.
 BUILD_ID = bytes.fromhex('ed2026b20685971f8b332095a7ff80ff')
@@ -146,6 +149,11 @@ def patch(raw, sites=SITES, build_id=BUILD_ID):
     text_off, text = segs[0]
     for addr, _, new, _ in sites:
         struct.pack_into('<I', text, addr - text_off, new)
+    return write_segments(raw, segs)
+
+
+def write_segments(raw, segs):
+    """Repack private NSO segments, preserving its metadata and updating sizes and hashes."""
     first = min(struct.unpack_from('<I', raw, 0x10 + k * 0x10)[0] for k in range(3))
     head = bytearray(raw[:max(first, HEADER_SIZE)])  # header plus the module name that follows it
     struct.pack_into('<I', head, 0x0C, struct.unpack_from('<I', head, 0x0C)[0] & ~0x7)  # segments uncompressed
@@ -159,6 +167,22 @@ def patch(raw, sites=SITES, build_id=BUILD_ID):
     return bytes(head + body)
 
 
+def write_copy(src, dst, data):
+    """Atomic output, refusing symlink/hardlink aliases of the read-only source."""
+    src, dst = Path(src), Path(dst)
+    if src.resolve() == dst.resolve() or (dst.exists() and os.path.samefile(src, dst)):
+        raise PatchError('output must be a separate private copy; refusing to overwrite the input')
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=dst.parent, prefix=dst.name + '.', delete=False) as stream:
+            tmp = Path(stream.name)
+            stream.write(data)
+        os.replace(tmp, dst)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--check', action='store_true', help='verify only; write nothing')
@@ -167,18 +191,17 @@ def main(argv=None):
     a = p.parse_args(argv)
     if not a.check and not a.out:
         p.error('give an output path or --check')
-    raw = open(a.main, 'rb').read()
     try:
+        raw = Path(a.main).read_bytes()
         if a.check:
             check(raw)
             print(f'ok: {len(SITES)} sites match Astral Chain 1.0.0')
             return 0
         data = patch(raw)
-    except PatchError as e:
+        write_copy(a.main, a.out, data)
+    except (OSError, PatchError) as e:
         print('error: ' + str(e), file=sys.stderr)
         return 1
-    with open(a.out, 'wb') as f:
-        f.write(data)
     for addr, orig, new, what in SITES:
         print(f'main+{addr:#08x}: {orig:#010x} -> {new:#010x}  {what}')
     return 0

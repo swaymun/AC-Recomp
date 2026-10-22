@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Build AC-Recomp from your own Astral Chain dump, on your own Mac.
+"""Build AC-Recomp from your own Astral Chain dump, on macOS or Windows x64.
 
     python3 tools/acr_build.py --nsp "Astral Chain.nsp" --keys prod.keys [--title-keys title.keys] \
         [--fonts <dir>] --out <dir>
 
 The release holds none of the game's code or data. This script imports your dump, lifts the game's code to C++
 with the pinned recompiler, translates the game's shaders to SPIR-V, prepares the pinned runtime with every
-patch in runtime/patches/series.macos, builds it, lays out a data root and writes AC-Recomp.app.
+patch in the host runtime series, builds it and lays out a data root. macOS writes AC-Recomp.app; Windows
+imports your dump and keys locally (or continues from --import-dir plus --control-receipt) and writes native EXEs and run scripts.
 Everything it produces is game-derived and stays in --out on your machine; never share it.
 
 Stages run in order and are resumable: a finished stage is recorded in <out>/acr-state.json and skipped on the
@@ -211,10 +212,12 @@ class Context:
     def __init__(self, args, root=ROOT, out=sys.stdout):
         self.a, self.root, self.stream = args, Path(root), out
         self.dry = args.dry_run
+        self.windows = sys.platform == 'win32'
+        self.native_env = None
         o = Path(os.path.abspath(args.out))
         self.out = o
         self.private = o / '.local/game-private'
-        self.import_dir = self.private / 'astral'
+        self.import_dir = (Path(args.import_dir).resolve() if args.import_dir else self.private / 'astral')
         self.work = o / 'work'
         self.logs = o / 'logs'
         self.upstream = self.work / 'upstream/SuperMarioWonderRecomp'
@@ -247,24 +250,27 @@ class Context:
     # Commands ---------------------------------------------------------------------------------------------------
     def run(self, argv, cwd=None, env=None, log=None, timeout=None, check=True, capture=False):
         argv = [str(x) for x in argv]
+        if self.windows and argv[0] == 'git':
+            argv[1:1] = ['-c', 'core.autocrlf=false', '-c', 'core.longpaths=true']
         self.commands.append(argv)
         shown = ' '.join(shlex.quote(x) for x in argv)
         self.say(('    would run: ' if self.dry else '    $ ') + shown + (f'   (in {cwd})' if cwd else ''))
         if self.dry:
             return ''
-        full_env = None if env is None else {**os.environ, **env}
+        full_env = ({**os.environ, **(self.native_env or {}), **(env or {})}
+                    if self.native_env or env is not None else None)
         if log:
             log = Path(log)
             log.parent.mkdir(parents=True, exist_ok=True)
-            with log.open('w') as f:
+            with log.open('w', encoding='utf-8') as f:
                 f.write('$ ' + shown + '\n')
                 f.flush()
                 p = subprocess.run(argv, cwd=cwd, env=full_env, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
                                    timeout=timeout)
             if check and p.returncode:
-                tail = ''.join(log.read_text(errors='replace').splitlines(True)[-25:])
+                tail = ''.join(log.read_text(encoding='utf-8', errors='replace').splitlines(True)[-25:])
                 raise BuildError(f'command failed (exit {p.returncode}): {shown}\n--- last lines of {log} ---\n{tail}')
-            return log.read_text(errors='replace')
+            return log.read_text(encoding='utf-8', errors='replace')
         p = subprocess.run(argv, cwd=cwd, env=full_env, timeout=timeout, text=True, stdin=subprocess.DEVNULL,
                            stdout=subprocess.PIPE if capture else None,
                            stderr=subprocess.STDOUT if capture else None)
@@ -285,6 +291,12 @@ class Context:
         require(path.is_relative_to(self.out) and path != self.out, f'refusing to delete outside --out: {path}')
         user = self.data / 'user'  # the player's saves: never deleted, nor anything that holds them
         require(not (user.is_relative_to(path) or path.is_relative_to(user)), f'refusing to delete saves: {path}')
+        if self.windows:
+            import windows_native
+            if windows_native.is_junction(path):
+                if not self.dry:
+                    path.rmdir()
+                return
         if path.is_symlink() or path.exists():
             if self.dry:
                 self.say(f'    would remove {path}')
@@ -317,6 +329,15 @@ class Context:
             self.say(f'    would link {link} -> {target}')
             return
         link = Path(link)
+        if self.windows:
+            target = Path(target).resolve()
+            import windows_native
+            if windows_native.is_junction(link):
+                link.rmdir()
+            require(not link.exists(), f'{link} exists and is not a junction; move it away')
+            require(target.is_dir(), f'junction target is not a directory: {target}')
+            self.run(['cmd.exe', '/d', '/c', 'mklink', '/J', link, target], capture=True)
+            return
         if link.is_symlink():
             link.unlink()
         require(not link.exists(), f'{link} exists and is not a link; move it away')
@@ -340,16 +361,19 @@ class Context:
 
     # Tools ------------------------------------------------------------------------------------------------------
     def venv_python(self):
-        return self.venv / 'bin/python'
+        return self.venv / ('Scripts/python.exe' if self.windows else 'bin/python')
 
     def tool(self, name):
         """A host tool from --<name>, PATH, Homebrew, or the build venv (cmake/ninja)."""
         explicit = getattr(self.a, name.replace('-', '_'), None)
         if explicit:
             return str(explicit)
-        found = shutil.which(name)
+        found = shutil.which(name, path=self.native_env.get('PATH') if self.native_env else None)
         if found:
             return found
+        if self.windows:
+            candidate = self.venv / 'Scripts' / (name + '.exe')
+            return str(candidate) if candidate.is_file() else None
         for d in (self.venv / 'bin', Path('/opt/homebrew/bin'), Path('/usr/local/bin')):
             if (d / name).is_file() and os.access(d / name, os.X_OK):
                 return str(d / name)
@@ -429,6 +453,9 @@ def parse_meminfo(text):
 def available_memory():
     """Memory available to new processes (macOS: free+inactive+purgeable+speculative pages; Linux: MemAvailable)."""
     try:
+        if sys.platform == 'win32':
+            import windows_native
+            return windows_native.available_memory()
         if sys.platform == 'darwin':
             return parse_vm_stat(subprocess.check_output(['vm_stat'], text=True, timeout=10))
         return parse_meminfo(Path('/proc/meminfo').read_text())
@@ -478,11 +505,12 @@ def watched_build(ctx, make_argv, jobs, log, env=None, probe=None, interval=WATC
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open('a') as f:
         while True:
-            argv = [str(x) for x in low_priority(make_argv(jobs))]
+            argv = [str(x) for x in (make_argv(jobs) if ctx.windows else low_priority(make_argv(jobs)))]
             f.write('$ ' + ' '.join(shlex.quote(x) for x in argv) + '\n')
             f.flush()
             p = subprocess.Popen(argv, env=full_env, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
-                                 start_new_session=True)
+                                 start_new_session=not ctx.windows,
+                                 **({'creationflags': subprocess.BELOW_NORMAL_PRIORITY_CLASS} if ctx.windows else {}))
             backed_off = False
             try:
                 while True:
@@ -499,23 +527,34 @@ def watched_build(ctx, make_argv, jobs, log, env=None, probe=None, interval=WATC
                         ctx.step(note)
                         f.write('acr_build: ' + note + '\n')
                         f.flush()
-                        os.killpg(p.pid, signal.SIGTERM)
+                        if ctx.windows:
+                            import windows_native
+                            windows_native.terminate_tree(p)
+                        else:
+                            os.killpg(p.pid, signal.SIGTERM)
                         try:
                             p.wait(timeout=30)
                         except subprocess.TimeoutExpired:
-                            os.killpg(p.pid, signal.SIGKILL)
-                            p.wait()
+                            if ctx.windows:
+                                windows_native.terminate_tree(p)
+                            else:
+                                os.killpg(p.pid, signal.SIGKILL)
+                                p.wait()
                         jobs, backed_off = jobs // 2, True
                         break
             except BaseException:
                 if p.poll() is None:
-                    os.killpg(p.pid, signal.SIGKILL)
-                    p.wait()
+                    if ctx.windows:
+                        import windows_native
+                        windows_native.terminate_tree(p)
+                    else:
+                        os.killpg(p.pid, signal.SIGKILL)
+                        p.wait()
                 raise
             if backed_off:
                 continue
             if p.returncode:
-                tail = ''.join(log.read_text(errors='replace').splitlines(True)[-25:])
+                tail = ''.join(log.read_text(encoding='utf-8', errors='replace').splitlines(True)[-25:])
                 raise BuildError(f'the build failed (exit {p.returncode}); last lines of {log}:\n{tail}')
             return jobs
 
@@ -526,7 +565,201 @@ def git_head(path):
     return p.stdout.strip() if p.returncode == 0 else None
 
 
+def reused_import(ctx):
+    """Reuse explicit private inputs, binding control metadata to this import's NPDM.
+
+    The key-dependent provenance audit remains with the original import. Record hashes
+    of every module/flat image and the receipt so changing them invalidates caches.
+    """
+    root, receipt = ctx.import_dir, ctx.a.control_receipt
+    if ctx.dry and not root.is_dir():
+        return {'import_dir': str(root), 'control_sha256': 'dry-run'}
+    required = ('exefs/main', 'exefs/sdk', 'analysis/main.bin', 'analysis/sdk.bin', 'analysis/main.npdm')
+    require(root.is_dir() and (root / 'extract/romfs').is_dir(), '--import-dir needs exefs, analysis and extract/romfs')
+    hashes = {}
+    for name in required:
+        path = root / name
+        require(path.is_file() and not path.is_symlink(), f'--import-dir missing regular file: {name}')
+        hashes[name] = sha256(path)
+    require(receipt and Path(receipt).is_file(), '--control-receipt must be the original import receipt.json')
+    raw = Path(receipt).read_bytes()
+    try:
+        record = json.loads(raw)
+        binding = record['binding']
+        require(record['schema'] == 1 and record['status'] == 'produced' and
+                record['metadata_produced'] is True and record['linkage_verified'] is True,
+                'control receipt is not produced/verified')
+        require(binding['application_id'] == TITLE and binding['program_id'] == TITLE,
+                'control receipt is not Astral Chain')
+        require(any(r['sha256'] == hashes['analysis/main.npdm'] for r in binding['raw'].values()),
+                'control receipt does not match the imported NPDM')
+        import prepare_runtime as prep
+        prep.control_header(binding, hashlib.sha256(raw).hexdigest())
+    except (KeyError, ValueError, TypeError) as e:
+        raise BuildError(f'invalid --control-receipt: {e}') from e
+    for name in ('main', 'sdk'):
+        with (root / 'exefs' / name).open('rb') as f:
+            require(f.read(4) == b'NSO0', f'--import-dir exefs/{name} is not an NSO')
+    return {'import_dir': str(root), 'files': hashes, 'control_sha256': hashlib.sha256(raw).hexdigest()}
+
+
+def preflight_windows(ctx):
+    import windows_native as win
+    require(sys.version_info >= (3, 11), 'Python 3.11 or newer is required')
+    require(platform.machine().lower() in ('amd64', 'x86_64'), 'Windows x64 is required')
+    if ctx.a.import_dir:
+        reused_import(ctx)
+    else:
+        for path, option in ((ctx.a.nsp, '--nsp'), (ctx.a.keys, '--keys'),
+                             (ctx.a.title_keys, '--title-keys')):
+            if path is not None:
+                require(Path(path).is_file(), f'{option}: input file is missing')
+        if ctx.a.nsp:
+            require(Path(ctx.a.nsp).suffix.lower() == '.nsp', '--nsp: only NSP dumps are supported')
+    if not ctx.dry:
+        try:
+            ctx.native_env = win.developer_environment()
+        except (ValueError, OSError, subprocess.SubprocessError) as e:
+            raise BuildError(f'Windows toolchain discovery failed: {e}') from e
+    for name in ('git', 'clang-cl', 'clang++'):
+        require(ctx.dry or ctx.tool(name), f'{name} missing; install Git and VS C++ Clang Build Tools')
+    if not ctx.a.skip_shaders and not ctx.a.spirv_dir:
+        dotnet = ctx.dotnet()
+        sdks = ctx.run([dotnet, '--list-sdks'], capture=True) if dotnet else ''
+        require(ctx.dry or re.search(r'^10\.', sdks, re.M), '.NET 10 SDK needed, or use --spirv-dir')
+        require(ctx.dry or ctx.a.no_shader_validation or ctx.tool('spirv-val'), 'spirv-val missing')
+        import ctypes.util
+        require(ctx.dry or ctypes.util.find_library('zstd'), 'zstd.dll missing from PATH for shader extraction')
+    if ctx.a.fonts:
+        require(Path(ctx.a.fonts).is_dir(), '--fonts is not a directory')
+    if not ctx.a.import_dir and not ctx.done('import'):
+        parent = ctx.out
+        while not parent.exists():
+            parent = parent.parent
+        need = (Path(ctx.a.nsp).stat().st_size if ctx.a.nsp and Path(ctx.a.nsp).is_file() else 10 << 30) + (12 << 30)
+        require(ctx.dry or shutil.disk_usage(parent).free >= need,
+                'Not enough free disk space: allow the NSP size plus 12 GiB for import and compilation')
+    return {'python': platform.python_version(), 'machine': platform.machine(), 'platform': 'windows'}
+
+
+def build_windows(ctx):
+    import windows_native as win
+    if not ctx.dry and ctx.native_env is None:  # --only build also works from an ordinary prompt.
+        try:
+            ctx.native_env = win.developer_environment()
+        except (ValueError, OSError, subprocess.SubprocessError) as e:
+            raise BuildError(f'Windows toolchain discovery failed: {e}') from e
+    cmake, ninja = ctx.tool('cmake') or 'cmake', ctx.tool('ninja') or 'ninja'
+    # All dependency outputs are owned by this build, never shared mutable prefixes.
+    vk = ctx.vulkan_include()
+    if not (vk / 'vulkan/vulkan.h').is_file():
+        dest = ctx.deps / 'Vulkan-Headers'
+        ctx.rmtree(dest)
+        ctx.mkdir(dest)
+        ctx.run(['git', '-C', dest, 'init', '-q'])
+        ctx.run(['git', '-C', dest, 'fetch', '-q', '--depth', '1', VULKAN_HEADERS_URL, VULKAN_HEADERS_PIN])
+        ctx.run(['git', '-C', dest, 'checkout', '-q', '--detach', 'FETCH_HEAD'])
+        vk = dest / 'include'
+    opus = ctx.deps / 'opus'
+    if not opus.exists() or git_head(opus) != win.OPUS_PIN:
+        ctx.rmtree(opus)
+        ctx.mkdir(opus)
+        ctx.run(['git', '-C', opus, 'init', '-q'])
+        ctx.run(['git', '-C', opus, 'fetch', '-q', '--depth', '1', win.OPUS_URL, win.OPUS_PIN])
+        ctx.run(['git', '-C', opus, 'checkout', '-q', '--detach', 'FETCH_HEAD'])
+    # Opus derives its CMake package version from git describe, not the commit.
+    # A commit-only shallow fetch reports version 0 and fails find_package(Opus 1.3).
+    ctx.run(['git', '-C', opus, 'fetch', '-q', '--depth', '1', win.OPUS_URL,
+             'refs/tags/v1.5.2:refs/tags/v1.5.2'])
+    tagged = ctx.run(['git', '-C', opus, 'rev-parse', 'v1.5.2^{commit}'], capture=True).strip()
+    require(ctx.dry or tagged == win.OPUS_PIN, 'opus v1.5.2 tag does not match the pinned commit')
+    prefix, obuild = ctx.deps / 'opus-install', ctx.deps / 'opus-build'
+    ctx.run([cmake, '-S', opus, '-B', obuild, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
+             '-DCMAKE_C_COMPILER=clang-cl', f'-DCMAKE_MAKE_PROGRAM={ninja}',
+             f'-DCMAKE_INSTALL_PREFIX={prefix}', '-DOPUS_BUILD_SHARED_LIBRARY=OFF',
+             '-DOPUS_DISABLE_INTRINSICS=ON', '-DOPUS_BUILD_TESTING=OFF'], log=ctx.logs / 'opus-configure.log')
+    ctx.run([cmake, '--build', obuild, '--parallel', str(ctx.jobs())], log=ctx.logs / 'opus-build.log')
+    ctx.run([cmake, '--install', obuild], log=ctx.logs / 'opus-install.log')
+    variants = [(ctx.gen, ctx.build_dir, 'astral.exe')]
+    if variant_built(ctx):
+        # series.windows currently excludes the shared-object SDL3 variant block.
+        # Build a second native target rather than editing the reviewed patch series.
+        ctx.symlink(ctx.gen / 'sdk', ctx.gen_variant / 'sdk')
+        variants.append((ctx.gen_variant, ctx.build_dir.parent / 'build-60fps', 'astral-60fps.exe'))
+    evidence = {}
+    for gen, build, output in variants:
+        started = time.monotonic()
+        cmd = [cmake, '-S', ctx.runtime_src, '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
+               '-DCMAKE_C_COMPILER=clang-cl', '-DCMAKE_CXX_COMPILER=clang-cl',
+               f'-DCMAKE_MAKE_PROGRAM={ninja}', '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON', '-DNX_GAME=astral',
+               f'-DNX_GEN_DIR={gen.as_posix()}', '-DNX_HWOPUS=ON',
+               f'-DOpus_DIR={prefix.as_posix()}/lib/cmake/Opus', f'-DNX_VULKAN_SDK={vk.parent.as_posix()}']
+        ctx.run(cmd, log=ctx.logs / f'configure-{output}.log')
+        if not ctx.dry:
+            commands = json.loads((build / 'compile_commands.json').read_text())
+            require(any(Path(c['file']).resolve().is_relative_to((gen / 'main').resolve()) for c in commands),
+                    'Windows build does not include lifted main')
+            require(all('NX_ASTRAL_STRICT=1' in c['command'] and 'ffp-contract=off' in c['command']
+                        for c in commands), 'Windows strict compiler flags missing')
+        def make(n):
+            return [cmake, '--build', build, '--parallel', n, '--target', 'astral']
+        if ctx.dry:
+            ctx.run(make(ctx.jobs()))
+            continue
+        final = watched_build(ctx, make, ctx.jobs(), ctx.logs / f'build-{output}.log', env=ctx.native_env)
+        exe = build / 'astral.exe'
+        require(exe.is_file(), f'no {exe} produced')
+        win.pe_identity(exe)
+        evidence[output] = {'sha256': sha256(exe), 'seconds': round(time.monotonic() - started, 1),
+                            'final_jobs': final}
+    return evidence
+
+
+def app_windows(ctx):
+    outputs = [(ctx.build_dir / 'astral.exe', 'astral.exe')]
+    if variant_built(ctx):
+        outputs.append((ctx.build_dir.parent / 'build-60fps/astral.exe', 'astral-60fps.exe'))
+    else:
+        ctx.rmtree(ctx.out / 'astral-60fps.exe')
+    for src, name in outputs:
+        require(ctx.dry or src.is_file(), f'no {src}; rerun --from-stage build')
+        ctx.copy(src, ctx.out / name)
+    assets = ctx.root / 'assets/launcher'
+    for f in sorted(assets.iterdir()) if assets.is_dir() else ():
+        if f.is_file():
+            ctx.copy(f, ctx.out / 'assets/launcher' / f.name)
+    # PowerShell handles paths containing spaces and preserves caller overrides.
+    script = r'''# Written by tools/acr_build.py. Private game files stay under this build.
+$ErrorActionPreference = 'Stop'
+if (-not $env:NX_DATA_ROOT) { $env:NX_DATA_ROOT = Join-Path $PSScriptRoot 'data' }
+if (-not $env:NX_NVN_FORMAT_PROFILE) { $env:NX_NVN_FORMAT_PROFILE = Join-Path $env:NX_DATA_ROOT 'astral.profile' }
+if (-not $env:NX_SHARED_FONT_DIR) { $env:NX_SHARED_FONT_DIR = Join-Path $env:NX_DATA_ROOT 'shared-fonts' }
+if (-not $env:NX_NVN_REAL) { $env:NX_NVN_REAL = '1' }
+$fps = $env:NX_FPS
+$settings = Join-Path $env:NX_DATA_ROOT 'settings.ini'
+if (-not $fps -and (Test-Path -LiteralPath $settings)) {
+    foreach ($line in Get-Content -LiteralPath $settings) {
+        if ($line -match '^\s*fps\s*=\s*(30|60)\s*(?:#.*)?$') { $fps = $Matches[1] }
+    }
+}
+$binary = Join-Path $PSScriptRoot 'astral.exe'
+if ($fps -eq '60' -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'astral-60fps.exe'))) {
+    $binary = Join-Path $PSScriptRoot 'astral-60fps.exe'
+}
+& $binary @args
+exit $LASTEXITCODE
+'''
+    if ctx.a.render_res:
+        script = "if (-not $env:NX_NATIVE_RES) { $env:NX_NATIVE_RES = '" + ctx.a.render_res + "' }\n" + script
+    ctx.write(ctx.out / 'run-ac-recomp.ps1', script)
+    ctx.write(ctx.out / 'run-ac-recomp.cmd', '@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-ac-recomp.ps1" %*\r\n')
+    ctx.step(f'done: run {ctx.out / "run-ac-recomp.cmd"}')
+    return {'executables': [name for _, name in outputs]}
+
+
 def stage_preflight(ctx):
+    if ctx.windows:
+        return preflight_windows(ctx)
     a, problems, notes = ctx.a, [], []
     if sys.version_info < (3, 11):
         problems.append(f'Python 3.11 or newer is required (this is {platform.python_version()}): '
@@ -656,6 +889,8 @@ IMPORT_ERRORS = {
 
 
 def stage_import(ctx):
+    if ctx.a.import_dir:
+        return reused_import(ctx)
     a = ctx.a
     cmd = [sys.executable, ctx.root / 'tools/import_owned_dump.py', '--repo', ctx.out, '--reference', ctx.upstream,
            '--dump', Path(a.nsp).resolve(), '--prod-keys', Path(a.keys).resolve(), '--out', ctx.import_dir,
@@ -680,6 +915,10 @@ def stage_import(ctx):
 
 
 def stage_control(ctx):
+    if ctx.a.import_dir:
+        evidence = reused_import(ctx)
+        ctx.copy(ctx.a.control_receipt, ctx.control / 'receipt.json')
+        return evidence
     a = ctx.a
     src = ctx.control / 'src'
     run_dir = ctx.control / 'out'
@@ -690,9 +929,17 @@ def stage_control(ctx):
         ctx.copy(ctx.upstream / IMPORTER_DIR / name, importer / name)
     ctx.run(['git', 'init', '-q', src])
     ctx.run(['git', '-C', src, 'apply', ctx.root / 'runtime/patches/astral-control-import.patch'])
-    tool = ctx.control / 'nxcontrol'
-    ctx.run(['clang++', '-std=c++17', '-O2', importer / 'nximport.cpp', importer / 'nxcrypto.cpp',
-             importer / 'nximport_cli.cpp', '-o', tool], log=ctx.logs / 'control-build.log')
+    tool = ctx.control / ('nxcontrol.exe' if ctx.windows else 'nxcontrol')
+    if ctx.dry:
+        command = ['clang++', '-std=c++17', '-O2', importer / 'nximport.cpp', importer / 'nxcrypto.cpp',
+                   importer / 'nximport_cli.cpp', '-o', tool]
+    else:
+        import import_owned_dump as owned
+        try:
+            command = owned.native_compile_command(src, tool, control=True)
+        except owned.ImportFailure as e:
+            raise BuildError(f'native importer preparation failed ({e})') from None
+    ctx.run(command, log=ctx.logs / 'control-build.log')
     ctx.mkdir(run_dir)
     keys = [Path(a.keys).resolve()] + ([Path(a.title_keys).resolve()] if a.title_keys else [])
     # Only the native reader opens the keys; its output is discarded (it may name key slots).
@@ -833,7 +1080,7 @@ def stage_lift(ctx):
                          ctx.logs / f'lift-main-{VARIANT}.log')
         if ev:
             evidence[f'main_{VARIANT}'] = ev
-    if not ctx.dry:
+    if not ctx.dry and not ctx.a.import_dir:
         import prepare_runtime as prep
         manifest, _ = prep.validate_inputs(ctx.import_dir)
         prep.generated_evidence(ctx.gen, manifest)  # bases and module extents agree with the import
@@ -883,6 +1130,14 @@ def render_res_input(ctx, src, work_dir='render-res'):
 
 
 def stage_shaders(ctx):
+    if ctx.a.spirv_dir:
+        src = Path(ctx.a.spirv_dir).resolve()
+        require(ctx.dry or any(src.glob('*.spv')), '--spirv-dir has no .spv files')
+        ctx.rmtree(ctx.shaders)
+        ctx.mkdir(ctx.shaders)
+        if not ctx.dry:
+            shutil.copytree(src, ctx.shaders / 'spirv')
+        return {'reused_spirv': str(src), 'tree_sha256': tree_digest(src)}
     if ctx.a.skip_shaders:
         ctx.step('skipped (--skip-shaders); the game will not render without translated shaders')
         return {'skipped': True}
@@ -915,8 +1170,12 @@ def stage_shaders(ctx):
     ctx.mkdir(hsrc)
     for name in HARNESS_FILES:
         ctx.copy(wonder / 'tools/maxwell/spirv_harness' / name, hsrc / name)
-    ctx.run(['patch', '-p1', '--forward', '-d', hsrc, '-i',
-             ctx.root / 'tools/astral_spirv_harness/astral-headerless-compute.patch'])
+    harness_patch = ctx.root / 'tools/astral_spirv_harness/astral-headerless-compute.patch'
+    if ctx.windows:
+        ctx.run(['git', 'init', '-q', hsrc])
+        ctx.run(['git', '-C', hsrc, 'apply', harness_patch])
+    else:
+        ctx.run(['patch', '-p1', '--forward', '-d', hsrc, '-i', harness_patch])
     ctx.run([dotnet, 'build', ctx.root / 'tools/astral_spirv_harness/AstralSpirvHarness.csproj', *DOTNET_BUILD_FLAGS,
              f'-p:HarnessSourceDir={hsrc}', f'-p:TranslatorDir={translator}',
              f'-p:BaseIntermediateOutputPath={hbuild}/obj/', f'-p:BaseOutputPath={hbuild}/bin/'],
@@ -925,12 +1184,13 @@ def stage_shaders(ctx):
     # 3. Extract every shader wrapper from the RomFS.
     extract = ctx.shaders / 'extract'
     ctx.rmtree(ctx.shaders)
-    zenv = {'DYLD_FALLBACK_LIBRARY_PATH': f'{ctx.brew_prefix()}/lib:/usr/local/lib:/usr/lib'}
+    zenv = {} if ctx.windows else {'DYLD_FALLBACK_LIBRARY_PATH': f'{ctx.brew_prefix()}/lib:/usr/local/lib:/usr/lib'}
     jobs = str(min(8, ctx.jobs() * 2))
     ctx.step('extracting shaders from the RomFS')
-    ctx.run([sys.executable, '-I', ctx.root / 'tools/astral_shader_full_inventory.py', 'extract',
-             '--input', ctx.import_dir / 'extract/romfs', '--out', extract, '--jobs', jobs],
-            env=zenv, log=ctx.logs / 'shader-extract.log')
+    extractor = ([ctx.root / 'tools/windows_native.py', 'extract-shaders'] if ctx.windows else
+                 [ctx.root / 'tools/astral_shader_full_inventory.py', 'extract'])
+    ctx.run([sys.executable, '-I', *extractor, '--input', ctx.import_dir / 'extract/romfs',
+             '--out', extract, '--jobs', jobs], env=zenv, log=ctx.logs / 'shader-extract.log')
     # 4. Translate the batch and every control variant.
     val = [] if ctx.a.no_shader_validation else ['--spirv-val', ctx.tool('spirv-val') or 'spirv-val']
     if ctx.a.no_shader_validation:
@@ -989,7 +1249,8 @@ def assemble_spirv(ctx, outs, final):
 
 def stage_runtime(ctx):
     import prepare_runtime as prep
-    series = read_series(ctx.root / 'runtime/patches/series.macos')
+    series_name = 'series.windows' if ctx.windows else 'series.macos'
+    series = read_series(ctx.root / 'runtime/patches' / series_name)
     patches = [ctx.root / 'runtime/patches' / n for n in series]
     for p in patches:
         require(p.is_file(), f'missing runtime patch {p}')
@@ -1000,7 +1261,7 @@ def stage_runtime(ctx):
         for p in patches:
             ctx.run(['git', '-C', ctx.runtime_src, 'apply', p])
         return {}
-    ctx.step(f'applying {len(patches)} patches from runtime/patches/series.macos')
+    ctx.step(f'applying {len(patches)} patches from runtime/patches/{series_name}')
     try:
         prep.prepare_source(ctx.upstream, ctx.runtime_src, patches, pin=PIN)
     except subprocess.CalledProcessError as e:
@@ -1017,6 +1278,8 @@ def stage_runtime(ctx):
 
 
 def stage_build(ctx):
+    if ctx.windows:
+        return build_windows(ctx)
     cmake, ninja = ctx.tool('cmake'), ctx.tool('ninja')
     require(ctx.dry or (cmake and ninja), f'cmake/ninja missing; {BREW_HINT} or rerun --from-stage toolchain')
     cmake, ninja = cmake or 'cmake', ninja or 'ninja'
@@ -1144,7 +1407,11 @@ def stage_fonts(ctx):
 def stage_data(ctx):
     ctx.mkdir(ctx.data)
     for name in ('analysis', 'exefs', 'extract', '.wrapper', '.import'):
-        ctx.symlink(Path('..') / ctx.import_dir.relative_to(ctx.out) / name, ctx.data / name)
+        if ctx.a.import_dir:
+            if (ctx.import_dir / name).is_dir():
+                ctx.symlink(ctx.import_dir / name, ctx.data / name)
+        else:
+            ctx.symlink(Path('..') / ctx.import_dir.relative_to(ctx.out) / name, ctx.data / name)
     spirv = ctx.shaders / 'spirv'
     if ctx.dry or spirv.is_dir():
         ctx.rmtree(ctx.data / 'spirv')
@@ -1257,6 +1524,8 @@ def app_icon(ctx, contents):
 
 
 def stage_app(ctx):
+    if ctx.windows:
+        return app_windows(ctx)
     exe = ctx.build_dir / 'astral'
     mvk = ctx.moltenvk()
     require(ctx.dry or exe.is_file(), 'no astral executable; rerun --from-stage build')
@@ -1326,7 +1595,7 @@ def stage_inputs(ctx):
         for p in paths:
             h.update(p.name.encode() + b'\0' + (sha256(p).encode() if p.is_file() else b'missing') + b'\n')
         return h.hexdigest()
-    series = patches / 'series.macos'
+    series = patches / ('series.windows' if ctx.windows else 'series.macos')
     names = read_series(series) if series.is_file() else []
     lift = PIN + ':' + digest([patches / 'astral-sqshl.patch'])
     if fps60(ctx.a):  # switching the frame rate relifts main and rebuilds everything after it
@@ -1336,9 +1605,31 @@ def stage_inputs(ctx):
     if getattr(ctx.a, 'render_res', None):  # a stock build keeps its recorded inputs
         lift += f':render-res={ctx.a.render_res}:mem={ctx.a.graphics_memory_mib or "auto"}:' + \
             sha256(ctx.root / 'tools/astral_render_res.py')
-    return {'upstream': PIN, 'lift': lift,
+    result = {'upstream': PIN, 'lift': lift,
             'control': digest([patches / 'astral-control-import.patch']),
             'runtime': PIN + ':' + digest([series] + [patches / n for n in names])}
+    if ctx.a.import_dir:
+        identity = reused_import(ctx)
+        result['import'] = json.dumps(identity, sort_keys=True)
+        result['control'] += ':' + identity['control_sha256']
+    if ctx.a.spirv_dir:
+        result['shaders'] = str(ctx.a.spirv_dir.resolve()) + ':' + tree_digest(ctx.a.spirv_dir)
+    elif ctx.windows or ctx.state.get('stages', {}).get('shaders', {}).get('inputs'):
+        result['shaders'] = ('skip' if ctx.a.skip_shaders else 'native:' + RYUBING_PIN +
+            ':validation=' + ('off' if ctx.a.no_shader_validation else 'on') + ':' + digest([
+                ctx.root / 'tools/astral_shader_full_inventory.py',
+                ctx.root / 'tools/inventory_astral_pkz.py',
+                ctx.root / 'tools/windows_native.py',
+                ctx.root / 'tools/astral_spirv_harness/AstralSpirvHarness.csproj',
+                ctx.root / 'tools/astral_spirv_harness/astral-headerless-compute.patch']))
+    if ctx.windows:
+        adapter = digest([ctx.root / 'tools/import_owned_dump.py'])
+        if not ctx.a.import_dir:
+            result['import'] = PIN + ':' + adapter
+            result['control'] += ':' + adapter
+        import windows_native
+        result['build'] = windows_native.OPUS_PIN + ':' + VULKAN_HEADERS_PIN
+    return result
 
 
 def check_out_dir(ctx):
@@ -1366,7 +1657,15 @@ def run_pipeline(ctx):
         if name not in forced and name not in ALWAYS and ctx.done(name):
             ctx.say(f'[{i}/{len(wanted)}] {name}: already done ({ctx.state["stages"][name]["done_utc"]}), skipped')
             continue
-        ctx.say(f'[{i}/{len(wanted)}] {name}: {dict(STAGES)[name]}')
+        description = dict(STAGES)[name]
+        if ctx.windows:
+            description = {
+                'import': 'reuse the private import' if ctx.a.import_dir else 'import your NSP locally on Windows',
+                'control': 'install the original control receipt' if ctx.a.import_dir else 'extract and verify control metadata locally',
+                'runtime': 'prepare the pinned runtime and apply runtime/patches/series.windows',
+                'app': 'write astral.exe, the 60 fps variant, launcher assets and Windows run scripts',
+            }.get(name, description)
+        ctx.say(f'[{i}/{len(wanted)}] {name}: {description}')
         ctx.forget(name)
         started = time.monotonic()
         evidence = STAGE_FUNCS[name](ctx) or {}
@@ -1381,6 +1680,9 @@ def run_pipeline(ctx):
 
 def parse(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--import-dir', type=Path, help='reuse imported exefs/analysis/extract; no dump or keys')
+    p.add_argument('--control-receipt', type=Path, help='build work/control/receipt.json for --import-dir')
+    p.add_argument('--spirv-dir', type=Path, help='reuse already translated private SPIR-V shaders')
     p.add_argument('--nsp', type=Path, help='your Astral Chain dump (.nsp)')
     p.add_argument('--keys', type=Path, help="your console's prod.keys (passed by path only)")
     p.add_argument('--title-keys', type=Path, help='title.keys, if your dump needs it')
@@ -1427,6 +1729,11 @@ def parse(argv=None):
         a.render_res = f'{w}x{h}'
     elif a.graphics_memory_mib is not None:
         p.error('--graphics-memory-mib needs --render-res')
+    if a.import_dir:
+        if a.nsp or a.keys or a.title_keys:
+            p.error('--import-dir cannot be combined with dump/key options')
+        if not a.control_receipt:
+            p.error('--import-dir requires --control-receipt from the original import')
     if not a.list_stages:
         missing = [f'--{n}' for n in ('out',) if getattr(a, n) is None]
         needs_inputs = set()
@@ -1435,7 +1742,7 @@ def parse(argv=None):
             state = Path(a.out) / 'acr-state.json'
             done = set(json.loads(state.read_text()).get('stages', {})) if state.is_file() else set()
             needs_inputs = {s for s in ('import', 'control') if s in wanted and (s in forced or s not in done)}
-        missing += [f'--{n.replace("_", "-")}' for n in ('nsp', 'keys') if needs_inputs and getattr(a, n) is None]
+        missing += [f'--{n.replace("_", "-")}' for n in ('nsp', 'keys') if needs_inputs and not a.import_dir and getattr(a, n) is None]
         if missing:
             p.error('missing ' + ', '.join(missing))
     return a

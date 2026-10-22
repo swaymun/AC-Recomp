@@ -1,0 +1,1361 @@
+# Opt-in Windows changed-block materialization and bounded conservative submit overlap.
+# Original compute shader; see docs/ASTRAL_WINDOWS_PERF.md for open gates and measured limits.
+diff --git a/runtime/src/nvn/nvn_writeback.h b/runtime/src/nvn/nvn_writeback.h
+new file mode 100644
+index 0000000..11c06c8
+--- /dev/null
++++ b/runtime/src/nvn/nvn_writeback.h
+@@ -0,0 +1,153 @@
++// Original game-independent changed-block and bounded-flight policy. Windows overlay only.
++#pragma once
++#include <algorithm>
++#include <cstdint>
++#include <cstdlib>
++#include <limits>
++namespace nx::nvn {
++inline bool narrow_writeback_on() {
++    static const bool on = [] { const char* e=std::getenv("NX_NARROW_WRITEBACK"); return e && std::atoi(e)>0; }();
++    return on;
++}
++inline bool resident_flights_on() {
++    // This mode keeps eager CPU visibility for EVERY compute write-back. No raw guest read is trapped.
++    static const bool on = [] {
++        const char* e=std::getenv("NX_FRAMES_IN_FLIGHT"), *r=std::getenv("NX_RESIDENT");
++        return e && std::atoi(e)>0 && r && std::atoi(r)>0;
++    }();
++    return on;
++}
++constexpr uint64_t kWritebackBlock = 4096;
++template<class Merge> void changed_blocks(uint64_t size, const uint32_t* flags, Merge merge) {
++    if (!flags) { merge(0,size); return; }
++    for (uint64_t at=0; at<size; at+=kWritebackBlock) {
++        const uint64_t bytes=(std::min)(kWritebackBlock,size-at);
++        // The GPU compares complete words only. Always scan a partial final word on the CPU.
++        if (flags[at/kWritebackBlock] || (bytes%4)) merge(at,bytes);
++    }
++}
++// New flags must never make the current submit wrap over its own live upload data.
++// Older slots may be retired normally by upload_alloc; current-slot exhaustion stays eager.
++inline bool writeback_flags_fit(uint64_t head,uint64_t begin,uint64_t capacity,uint64_t bytes,
++                                uint64_t align,bool wrap) {
++    if (!capacity || !align || (align&(align-1)) || bytes>capacity || head<begin ||
++        head>(std::numeric_limits<uint64_t>::max)()-(align-1)) return false;
++    uint64_t at=(head+align-1)&~(align-1);
++    if (wrap && at%capacity>capacity-bytes) {
++        const uint64_t pad=capacity-at%capacity;
++        if (at>(std::numeric_limits<uint64_t>::max)()-pad) return false;
++        at+=pad;
++    }
++    return at>=begin && at-begin<=capacity-bytes;
++}
++struct FlightPolicy {
++    static constexpr uint32_t limit=2;
++    static bool eager(bool writebacks, bool cpu_observer) { return writebacks || cpu_observer; }
++    static bool later_storage_may_write(uint64_t mask,uint32_t binding) { return binding>=64 || mask!=0; }
++    static bool early(bool first,bool last,bool observer,bool same,uint64_t before,uint64_t after) {
++        return first && last && !observer && same && before==after;
++    }
++    template<class Writes> static bool same_ranges(const Writes& a,const Writes& b) {
++        if (a.size()!=b.size()) return false;
++        for (size_t i=0;i<a.size();++i)
++            if (a[i].from!=b[i].from || a[i].to!=b[i].to || a[i].size!=b[i].size || a[i].before!=b[i].before) return false;
++        return true;
++    }
++    static bool throttle(uint32_t in_flight) { return in_flight>limit; }
++    template<class Merge,class Publish> static void retire(uint64_t serial,Merge merge,Publish publish) {
++        merge(); publish(serial);  // NVN completion never precedes required guest-memory materialization.
++    }
++};
++// Rebuild with glslangValidator -V -Os compare.comp; spirv-val --target-env vulkan1.0.
++// The complete original GLSL source is retained below for review and reproducibility.
++inline constexpr char kWritebackCompareGLSL[] = R"GLSL(
++#version 450
++// Original, game-independent changed-block detector. One workgroup per 4096 bytes.
++layout(local_size_x=64) in;
++layout(set=0,binding=0,std430) readonly buffer Current { uint now[]; };
++layout(set=0,binding=1,std430) readonly buffer Snapshot { uint before[]; };
++layout(set=0,binding=2,std430) writeonly buffer Changes { uint flags[]; };
++layout(push_constant) uniform Params { uint words; } pc;
++shared uint changed;
++void main() {
++    uint lane=gl_LocalInvocationID.x, page=gl_WorkGroupID.x;
++    if (lane==0) changed=0;
++    barrier();
++    for (uint k=page*1024+lane; k<min((page+1)*1024,pc.words); k+=64) {
++        if (now[k]!=before[k]) { atomicOr(changed,1); break; }
++    }
++    barrier();
++    if (lane==0) flags[page]=changed;
++}
++)GLSL";
++inline constexpr uint32_t kWritebackCompareSPV[] = {
++    0x07230203u,0x00010000u,0x0008000bu,0x0000005du,0x00000000u,0x00020011u,0x00000001u,0x0006000bu,
++    0x00000001u,0x4c534c47u,0x6474732eu,0x3035342eu,0x00000000u,0x0003000eu,0x00000000u,0x00000001u,
++    0x0007000fu,0x00000005u,0x00000004u,0x6e69616du,0x00000000u,0x0000000bu,0x00000011u,0x00060010u,
++    0x00000004u,0x00000011u,0x00000040u,0x00000001u,0x00000001u,0x00030003u,0x00000002u,0x000001c2u,
++    0x00040005u,0x00000004u,0x6e69616du,0x00000000u,0x00080005u,0x0000000bu,0x4c5f6c67u,0x6c61636fu,
++    0x6f766e49u,0x69746163u,0x44496e6fu,0x00000000u,0x00060005u,0x00000011u,0x575f6c67u,0x476b726fu,
++    0x70756f72u,0x00004449u,0x00040005u,0x0000001au,0x6e616863u,0x00646567u,0x00040005u,0x0000002du,
++    0x61726150u,0x0000736du,0x00050006u,0x0000002du,0x00000000u,0x64726f77u,0x00000073u,0x00030005u,
++    0x0000002fu,0x00006370u,0x00040005u,0x00000038u,0x72727543u,0x00746e65u,0x00040006u,0x00000038u,
++    0x00000000u,0x00776f6eu,0x00030005u,0x0000003au,0x00000000u,0x00050005u,0x00000040u,0x70616e53u,
++    0x746f6873u,0x00000000u,0x00050006u,0x00000040u,0x00000000u,0x6f666562u,0x00006572u,0x00030005u,
++    0x00000042u,0x00000000u,0x00040005u,0x00000053u,0x6e616843u,0x00736567u,0x00050006u,0x00000053u,
++    0x00000000u,0x67616c66u,0x00000073u,0x00030005u,0x00000055u,0x00000000u,0x00040047u,0x0000000bu,
++    0x0000000bu,0x0000001bu,0x00040047u,0x00000011u,0x0000000bu,0x0000001au,0x00030047u,0x0000002du,
++    0x00000002u,0x00050048u,0x0000002du,0x00000000u,0x00000023u,0x00000000u,0x00040047u,0x00000037u,
++    0x00000006u,0x00000004u,0x00030047u,0x00000038u,0x00000003u,0x00040048u,0x00000038u,0x00000000u,
++    0x00000018u,0x00050048u,0x00000038u,0x00000000u,0x00000023u,0x00000000u,0x00030047u,0x0000003au,
++    0x00000018u,0x00040047u,0x0000003au,0x00000021u,0x00000000u,0x00040047u,0x0000003au,0x00000022u,
++    0x00000000u,0x00040047u,0x0000003fu,0x00000006u,0x00000004u,0x00030047u,0x00000040u,0x00000003u,
++    0x00040048u,0x00000040u,0x00000000u,0x00000018u,0x00050048u,0x00000040u,0x00000000u,0x00000023u,
++    0x00000000u,0x00030047u,0x00000042u,0x00000018u,0x00040047u,0x00000042u,0x00000021u,0x00000001u,
++    0x00040047u,0x00000042u,0x00000022u,0x00000000u,0x00040047u,0x00000052u,0x00000006u,0x00000004u,
++    0x00030047u,0x00000053u,0x00000003u,0x00040048u,0x00000053u,0x00000000u,0x00000019u,0x00050048u,
++    0x00000053u,0x00000000u,0x00000023u,0x00000000u,0x00030047u,0x00000055u,0x00000019u,0x00040047u,
++    0x00000055u,0x00000021u,0x00000002u,0x00040047u,0x00000055u,0x00000022u,0x00000000u,0x00040047u,
++    0x00000059u,0x0000000bu,0x00000019u,0x00020013u,0x00000002u,0x00030021u,0x00000003u,0x00000002u,
++    0x00040015u,0x00000006u,0x00000020u,0x00000000u,0x00040017u,0x00000009u,0x00000006u,0x00000003u,
++    0x00040020u,0x0000000au,0x00000001u,0x00000009u,0x0004003bu,0x0000000au,0x0000000bu,0x00000001u,
++    0x0004002bu,0x00000006u,0x0000000cu,0x00000000u,0x00040020u,0x0000000du,0x00000001u,0x00000006u,
++    0x0004003bu,0x0000000au,0x00000011u,0x00000001u,0x00020014u,0x00000015u,0x00040020u,0x00000019u,
++    0x00000004u,0x00000006u,0x0004003bu,0x00000019u,0x0000001au,0x00000004u,0x0004002bu,0x00000006u,
++    0x0000001bu,0x00000002u,0x0004002bu,0x00000006u,0x0000001cu,0x00000108u,0x0004002bu,0x00000006u,
++    0x0000001fu,0x00000400u,0x0004002bu,0x00000006u,0x0000002au,0x00000001u,0x0003001eu,0x0000002du,
++    0x00000006u,0x00040020u,0x0000002eu,0x00000009u,0x0000002du,0x0004003bu,0x0000002eu,0x0000002fu,
++    0x00000009u,0x00040015u,0x00000030u,0x00000020u,0x00000001u,0x0004002bu,0x00000030u,0x00000031u,
++    0x00000000u,0x00040020u,0x00000032u,0x00000009u,0x00000006u,0x0003001du,0x00000037u,0x00000006u,
++    0x0003001eu,0x00000038u,0x00000037u,0x00040020u,0x00000039u,0x00000002u,0x00000038u,0x0004003bu,
++    0x00000039u,0x0000003au,0x00000002u,0x00040020u,0x0000003cu,0x00000002u,0x00000006u,0x0003001du,
++    0x0000003fu,0x00000006u,0x0003001eu,0x00000040u,0x0000003fu,0x00040020u,0x00000041u,0x00000002u,
++    0x00000040u,0x0004003bu,0x00000041u,0x00000042u,0x00000002u,0x0004002bu,0x00000006u,0x0000004bu,
++    0x00000040u,0x0003001du,0x00000052u,0x00000006u,0x0003001eu,0x00000053u,0x00000052u,0x00040020u,
++    0x00000054u,0x00000002u,0x00000053u,0x0004003bu,0x00000054u,0x00000055u,0x00000002u,0x0006002cu,
++    0x00000009u,0x00000059u,0x0000004bu,0x0000002au,0x0000002au,0x00050036u,0x00000002u,0x00000004u,
++    0x00000000u,0x00000003u,0x000200f8u,0x00000005u,0x00050041u,0x0000000du,0x0000000eu,0x0000000bu,
++    0x0000000cu,0x0004003du,0x00000006u,0x0000000fu,0x0000000eu,0x00050041u,0x0000000du,0x00000012u,
++    0x00000011u,0x0000000cu,0x0004003du,0x00000006u,0x00000013u,0x00000012u,0x000500aau,0x00000015u,
++    0x00000016u,0x0000000fu,0x0000000cu,0x000300f7u,0x00000018u,0x00000000u,0x000400fau,0x00000016u,
++    0x00000017u,0x00000018u,0x000200f8u,0x00000017u,0x0003003eu,0x0000001au,0x0000000cu,0x000200f9u,
++    0x00000018u,0x000200f8u,0x00000018u,0x000400e0u,0x0000001bu,0x0000001bu,0x0000001cu,0x00050084u,
++    0x00000006u,0x00000020u,0x00000013u,0x0000001fu,0x00050080u,0x00000006u,0x00000022u,0x00000020u,
++    0x0000000fu,0x000200f9u,0x00000023u,0x000200f8u,0x00000023u,0x000700f5u,0x00000006u,0x0000005cu,
++    0x00000022u,0x00000018u,0x0000004du,0x00000026u,0x00050080u,0x00000006u,0x0000002bu,0x00000013u,
++    0x0000002au,0x00050084u,0x00000006u,0x0000002cu,0x0000002bu,0x0000001fu,0x00050041u,0x00000032u,
++    0x00000033u,0x0000002fu,0x00000031u,0x0004003du,0x00000006u,0x00000034u,0x00000033u,0x0007000cu,
++    0x00000006u,0x00000035u,0x00000001u,0x00000026u,0x0000002cu,0x00000034u,0x000500b0u,0x00000015u,
++    0x00000036u,0x0000005cu,0x00000035u,0x000400f6u,0x00000025u,0x00000026u,0x00000000u,0x000400fau,
++    0x00000036u,0x00000024u,0x00000025u,0x000200f8u,0x00000024u,0x00060041u,0x0000003cu,0x0000003du,
++    0x0000003au,0x00000031u,0x0000005cu,0x0004003du,0x00000006u,0x0000003eu,0x0000003du,0x00060041u,
++    0x0000003cu,0x00000044u,0x00000042u,0x00000031u,0x0000005cu,0x0004003du,0x00000006u,0x00000045u,
++    0x00000044u,0x000500abu,0x00000015u,0x00000046u,0x0000003eu,0x00000045u,0x000300f7u,0x00000048u,
++    0x00000000u,0x000400fau,0x00000046u,0x00000047u,0x00000048u,0x000200f8u,0x00000047u,0x000700f1u,
++    0x00000006u,0x00000049u,0x0000001au,0x0000002au,0x0000000cu,0x0000002au,0x000200f9u,0x00000025u,
++    0x000200f8u,0x00000048u,0x000200f9u,0x00000026u,0x000200f8u,0x00000026u,0x00050080u,0x00000006u,
++    0x0000004du,0x0000005cu,0x0000004bu,0x000200f9u,0x00000023u,0x000200f8u,0x00000025u,0x000400e0u,
++    0x0000001bu,0x0000001bu,0x0000001cu,0x000300f7u,0x00000051u,0x00000000u,0x000400fau,0x00000016u,
++    0x00000050u,0x00000051u,0x000200f8u,0x00000050u,0x0004003du,0x00000006u,0x00000057u,0x0000001au,
++    0x00060041u,0x0000003cu,0x00000058u,0x00000055u,0x00000031u,0x00000013u,0x0003003eu,0x00000058u,
++    0x00000057u,0x000200f9u,0x00000051u,0x000200f8u,0x00000051u,0x000100fdu,0x00010038u,
++};
++} // namespace nx::nvn
+diff --git a/runtime/src/nvn/nvn_vk.h b/runtime/src/nvn/nvn_vk.h
+index f4e6529..bcd8444 100644
+--- a/runtime/src/nvn/nvn_vk.h
++++ b/runtime/src/nvn/nvn_vk.h
+@@ -101,25 +101,31 @@ VkDescriptorPool make_descriptor_pool();
+
+ // A lost device or a submit running past 2 s: the process ends at once (docs/nvn/DEBUG.md #22).
+ [[noreturn]] void gpu_hung(const char* why);
+
+ // A compute shader's storage buffer, copied back to guest memory once the submit completed: (upload copy, guest
+ // address, size).
+ struct WriteBack {
+     uint8_t* from;
+     uint8_t* to;
+     uint64_t size;
+     // The guest bytes as they were when the copy was made: only what the GPU changed goes back (nvn_written.cpp).
+     std::shared_ptr<std::vector<uint8_t>> before;
++    uint64_t before_offset = 0;
++    Upload result{}, snapshot{};  // eligible resident descriptors, immutable through completion
++    const uint32_t* changed = nullptr;  // GPU-written block flags, valid until retirement
+ };
++Upload writeback_flags_alloc(uint64_t size);
++bool frame_writeback_flags_fit(uint64_t size);
++void prepare_write_backs(VkCommandBuffer cb, std::vector<WriteBack>& writes);
+ void apply_write_back(const WriteBack& w);  // nvn_written.cpp
+ std::vector<WriteBack> draw_take_write_backs();  // nvn_draw.cpp: this submit's, for an asynchronous submit
+ void debug_dump_textures(uint64_t frame);  // nvn_debug.cpp: NX_DUMP_TEXTURES and the requested ones
+ void debug_dump_requested(uint64_t n);      // nvn_debug.cpp: NX_DUMP_ON_TARGET / NX_DUMP_ON_FS
+ void debug_dump_add(uint64_t texture);  // nvn_debug.cpp: read back at the end of this submit
+
+ // nvn_frames.cpp: submits that are not waited for (NX_PIPELINED, NX_ASYNC_GPU). Slots of command buffers, fences,
+ // descriptor pool and ring stretch; retired (fences waited, write-backs copied if not yet) on reuse, when the ring is
+ // full, or when something waits for them.
+ bool async_gpu();  // the slots are in use (either mode)
+ bool pipelined();  // NX_PIPELINED: fences not waited for, write-backs copied before gpu_submit returns
+ // The extensions and memory types that the Android performance plan depends on, logged once (nvn_caps.cpp).
+diff --git a/runtime/src/nvn/nvn_resident.h b/runtime/src/nvn/nvn_resident.h
+--- a/runtime/src/nvn/nvn_resident.h
++++ b/runtime/src/nvn/nvn_resident.h
+@@ -1,149 +1,174 @@
+ // Bounded synchronous resident bindings. Original implementation; persistent dirty-page binding ideas
+ // from Puddz/AstralChain-PC (MIT), nvn_hle.h:241-350 and las/nvn/vulkan/exec.c:2619-2861.
+ // No Puddz code or whole-range GPU->CPU memcpy is used. Eager changed-word merge remains authoritative.
+ #pragma once
+ #include <map>
+ #include <tuple>
+ #include "nvn_vk.h"
++#include "nvn_writeback.h"
+ #include "platform.h"
+ #include "win_page_generations.h"
+ #include "win_write_watch.h"
+ namespace nx::nvn::replay {
+ using namespace nx::vk;
+ struct ResidentCounters {
+     uint64_t copied = 0, snapshot = 0, dirty = 0, hits = 0, misses = 0, bypass = 0;
+     uint64_t wb_scanned = 0, wb_changed = 0, query_ns = 0, fence_ns = 0;
++    uint64_t wb_considered = 0, wb_gpu_bytes = 0, wb_flags = 0, wb_narrow = 0, wb_fallback = 0;
++    uint64_t gpu_snapshot = 0, flight_deferred = 0, flight_eager = 0, flight_reuse_ns = 0;
+ };
+ inline ResidentCounters g_resident_stats;
+ inline ResidentCounters& resident_stats() { return g_resident_stats; }
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+ // Installed at device initialization only when NX_MEM_TRACE=1. Keeping optional observers
+ // here lets the cache remain self-contained for its portable Vulkan-call fixtures.
+ struct ResidentMemoryTrace {
+     inline static uint32_t (*begin)() = nullptr;
+     inline static void (*end)(uint32_t) = nullptr;
+     inline static std::shared_ptr<std::vector<uint8_t>> (*snapshot)(uint64_t) = nullptr;
+     uint32_t previous = begin ? begin() : 0;
+     ~ResidentMemoryTrace() { if (end) end(previous); }
+ };
+ #endif
+ struct ResidentEntry {
+     Upload up;
++    Upload snapshot{};
+     plat::PageConsumer consumer;
+     std::shared_ptr<std::vector<uint8_t>> before;
+     uint64_t used = 0;
+ };
+ inline std::map<std::tuple<uint64_t,uint64_t,uint64_t,bool>, ResidentEntry> g_resident;
+ inline VkBuffer g_resident_buffer = VK_NULL_HANDLE;
+ inline VkDeviceMemory g_resident_memory = VK_NULL_HANDLE;
+ inline uint8_t* g_resident_ptr = nullptr;
+ inline uint64_t g_resident_capacity = 256ull << 20, g_resident_head = 0, g_resident_submit = 0;
+ inline bool g_resident_full = false, g_resident_failed = false;
+ inline bool g_resident_graphics_writer = false;
+ inline void resident_note_graphics_writes() {
+     // Baseline only merges compute storage. A graphics SSBO may therefore mutate a read
+     // allocation without touching guest pages. Preserve within-submit aliases, but never
+     // reuse read allocations across submits after seeing such a shader (including an
+     // untraceable pointer, whose conservative written mask is all ones). No arena is freed
+     // here: recorded descriptors may still reference it; compute snapshots remain valid.
+     if (!g_resident_graphics_writer) log("resident: graphics storage writer; read persistence disabled");
+     g_resident_graphics_writer = true;
+ }
+ inline bool resident_on() {
+     const char* r = std::getenv("NX_RESIDENT");
+     // No cache refresh while any earlier GPU submission can use these allocations.
+-    return r && std::atoi(r) != 0 && !async_gpu() && !g_resident_failed;
++    return r && std::atoi(r) != 0 && (!async_gpu() || resident_flights_on()) && !g_resident_failed;
+ }
+ inline bool resident_init() {
+     if (g_resident_ptr) return true;
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+     ResidentMemoryTrace memory_scope;
+ #endif
+     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = g_resident_capacity; bi.usage = kUploadUsage;
+     VkDevice d = vk_device();
+     if (p_vkCreateBuffer(d,&bi,nullptr,&g_resident_buffer) != VK_SUCCESS) return false;
+     VkMemoryRequirements req{}; p_vkGetBufferMemoryRequirements(d,g_resident_buffer,&req);
+     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = req.size;
+     ai.memoryTypeIndex = upload_memory_type(req.memoryTypeBits);
+     void* mapped = nullptr;
+     if (p_vkAllocateMemory(d,&ai,nullptr,&g_resident_memory) == VK_SUCCESS &&
+         p_vkBindBufferMemory(d,g_resident_buffer,g_resident_memory,0) == VK_SUCCESS &&
+         p_vkMapMemory(d,g_resident_memory,0,VK_WHOLE_SIZE,0,&mapped) == VK_SUCCESS) {
+         g_resident_ptr = static_cast<uint8_t*>(mapped); return true;
+     }
+     p_vkDestroyBuffer(d,g_resident_buffer,nullptr); g_resident_buffer = VK_NULL_HANDLE;
+     if (g_resident_memory) p_vkFreeMemory(d,g_resident_memory,nullptr);
+     g_resident_memory = VK_NULL_HANDLE; return false;
+ }
+ inline void resident_begin() {
+     if (!resident_on()) return;
++    // Previous presents/submits may still read this arena or its snapshots. Drain before any
++    // refresh, replacement or recycle; this deliberately bounds overlap to guest recording.
++    if (resident_flights_on()) {
++        const auto t=plat::monotonic_ns(); frame_wait_all();
++        resident_stats().flight_reuse_ns += plat::monotonic_ns()-t;
++    }
+     ++g_resident_submit;
+     // draw_begin_submit follows completion AND eager writeback of the prior synchronous submit.
+     // Never recycle during recording: earlier commands may still reference a replaced entry.
+     if (g_resident_full || g_resident_submit == 0) {
+         g_resident.clear(); g_resident_head = 0; g_resident_full = false; g_resident_submit = 1;
+     }
+ }
+ inline bool resident_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align,
+-                            bool storage, Upload& out, std::shared_ptr<std::vector<uint8_t>>* before = nullptr) {
++                            bool storage, Upload& out, std::shared_ptr<std::vector<uint8_t>>* before = nullptr,
++                            Upload* snapshot = nullptr) {
+     auto& stats = resident_stats();
+     // Querying a tiny constant block costs more than copying it (WIN-RESIDENT-022 A/B).
+     // Keep large meshes/ranges resident; the original dedup path handles small read-only inputs.
+     static const uint64_t min_read = [] {
+         const char* v = std::getenv("NX_RESIDENT_MIN_READ");
+         return v ? uint64_t(std::strtoull(v,nullptr,10)) : uint64_t(4096);
+     }();
+     const char* part = std::getenv(storage ? "NX_RESIDENT_STORAGE" : "NX_RESIDENT_READ");
+     if ((!storage && (size < min_read || g_resident_graphics_writer)) || (part && std::atoi(part) == 0) || !resident_on() || !p || !size || padded < size || size > (64ull<<20) || align > 256 || !align) {
+         ++stats.bypass; return false;
+     }
+     uint64_t epoch = 0; std::vector<uint64_t> pages;
+     const uint64_t q0 = plat::monotonic_ns();
+     const bool watched = plat::write_watch_pages(p,size,pages,epoch,stats.dirty);
+     stats.query_ns += plat::monotonic_ns()-q0;
+     if (!watched) { ++stats.bypass; return false; }
+     if (!resident_init()) { g_resident_failed = true; ++stats.bypass; return false; }
+     const auto key = std::make_tuple(reinterpret_cast<uint64_t>(p),size,padded,storage);
+     auto it = g_resident.find(key);
+     // Same-submit invalidation/copy-on-write: never mutate memory already referenced by recorded work.
+     // Per-submit dedup / written regions serve repeated reads without reaching this path.
+     if (it != g_resident.end() && it->second.used == g_resident_submit) it = g_resident.end();
+     if (it == g_resident.end()) {
+         const uint64_t at = (g_resident_head+255)&~255ull;
+-        if (padded > g_resident_capacity-at) { g_resident_full = true; ++stats.bypass; return false; }
++        const bool narrow = storage && narrow_writeback_on();
++        const uint64_t snapshot_at = (at+padded+255)&~255ull;
++        const uint64_t end = narrow ? snapshot_at+padded : at+padded;
++        if (end > g_resident_capacity) { g_resident_full = true; ++stats.bypass; return false; }
+         ResidentEntry e; e.up = {g_resident_buffer,at,g_resident_ptr+at};
+         if (padded>size) std::memset(e.up.ptr+size,0,padded-size);
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+         if (storage) e.before = ResidentMemoryTrace::snapshot ? ResidentMemoryTrace::snapshot(size)
+                                                             : std::make_shared<std::vector<uint8_t>>(size);
+ #else
+         if (storage) e.before = std::make_shared<std::vector<uint8_t>>(size);
+ #endif
+-        g_resident_head = at+padded;
++        if (narrow) e.snapshot = {g_resident_buffer,snapshot_at,g_resident_ptr+snapshot_at};
++        g_resident_head = end;
+         it = g_resident.insert_or_assign(key,std::move(e)).first; ++stats.misses;
+     } else ++stats.hits;
+     auto& entry = it->second;
+     stats.copied += entry.consumer.refresh(reinterpret_cast<uint64_t>(p),size,epoch,pages,[&](uint64_t off,uint64_t n) {
+         std::memcpy(entry.up.ptr+off,p+off,n);
+         if (storage) { std::memcpy(entry.before->data()+off,entry.up.ptr+off,n); stats.snapshot += n; }
++        if (entry.snapshot.ptr) {
++            std::memcpy(entry.snapshot.ptr+off,entry.up.ptr+off,n); stats.gpu_snapshot += n;
++        }
+     });
+     // Storage descriptors expose the padded tail too. A previous dispatch may have written it;
+     // the original path zeroed it on every new binding, so a retained allocation must do so too.
+     if (storage && padded > size) std::memset(entry.up.ptr+size,0,padded-size);
+     entry.used = g_resident_submit; out = entry.up;
+     if (before) *before = entry.before;
++    if (snapshot) *snapshot = entry.snapshot;
+     return true;
+ }
+ inline void resident_present() {
+     static const bool counters = std::getenv("NX_RESIDENT_LOG") != nullptr;
+     if (!counters) return;
+     const auto& s = resident_stats();
+     log("resident frame ts_ns=%llu copied=%llu snapshot=%llu dirty_pages=%llu hits=%llu misses=%llu bypass=%llu "
+         "wb_scanned=%llu wb_changed=%llu query_ns=%llu arena=%llu fence_ns=%llu",
+         (unsigned long long)plat::monotonic_ns(),(unsigned long long)s.copied,(unsigned long long)s.snapshot,
+         (unsigned long long)s.dirty,(unsigned long long)s.hits,(unsigned long long)s.misses,
+         (unsigned long long)s.bypass,(unsigned long long)s.wb_scanned,(unsigned long long)s.wb_changed,
+         (unsigned long long)s.query_ns,(unsigned long long)g_resident_head,(unsigned long long)s.fence_ns);
++    log("writeback frame considered=%llu gpu_compared=%llu flag_bytes=%llu narrow=%llu fallback=%llu "
++        "gpu_snapshot=%llu deferred=%llu eager=%llu reuse_ns=%llu",
++        (unsigned long long)s.wb_considered,(unsigned long long)s.wb_gpu_bytes,
++        (unsigned long long)s.wb_flags,(unsigned long long)s.wb_narrow,(unsigned long long)s.wb_fallback,
++        (unsigned long long)s.gpu_snapshot,(unsigned long long)s.flight_deferred,
++        (unsigned long long)s.flight_eager,(unsigned long long)s.flight_reuse_ns);
+     resident_stats() = {};
+ }
+ }  // namespace nx::nvn::replay
+diff --git a/runtime/src/nvn/nvn_written.cpp b/runtime/src/nvn/nvn_written.cpp
+--- a/runtime/src/nvn/nvn_written.cpp
++++ b/runtime/src/nvn/nvn_written.cpp
+@@ -7,64 +7,65 @@
+ // one buffer overwrote each other at write-back, and indirect dispatch arguments were read before the GPU wrote them.
+ // Here the submit keeps one copy per written guest range (the ranges are disjoint, keyed by host address). Writers and
+ // readers of a range bind that copy; ranges that meet are merged into a new copy on the GPU (vkCmdCopyBuffer, so in
+ // command order); each range is written back once. NX_COMPUTE_SEPARATE=1: the previous behaviour.
+ #include <algorithm>
+ #include <cstdlib>
+ #include <cstring>
+ #include <iterator>
+ #include <map>
+ #include <string>
+ #include <vector>
+
+ #if defined(NX_ASTRAL_STRICT) && defined(_WIN32) && defined(_M_X64)
+ #include <immintrin.h>
+ #endif
+
+ #include "nvn_draw_state.h"
+ #include "nvn_resident.h"
+
+ namespace nx::nvn::replay {
+
+ using namespace nx::vk;
+
+ namespace {
+
+ constexpr uint64_t kAlign = 256;          // the largest buffer offset alignment Vulkan allows (all descriptor kinds)
+ constexpr uint64_t kTail = 0x10000 + 16;  // zeros after a range: storage bindings are padded to 64 KB (nvn_draw.cpp)
+
+ struct Region {
+     uint64_t size = 0;  // guest bytes from the key
+     uint64_t cap = 0;   // bytes of the copy from up.offset (size, then zeros)
+     Upload up;          // the copy of the key's first byte
++    Upload snapshot{};   // original resident input for GPU block comparison
+     std::shared_ptr<std::vector<uint8_t>> before;  // the guest bytes copied in (what the GPU did not change)
+ };
+ using Regions = std::map<const uint8_t*, Region>;
+ using It = Regions::iterator;
+ Regions g_regions;
+ bool g_read = false;  // a copy was bound for reading since the last write_after_read
+ uint64_t g_binds = 0;  // written_bind calls, ever (nvn_frames.cpp: did a dispatch write storage after the split)
+ uint64_t g_shared = 0, g_merged = 0, g_composed = 0, g_indirect = 0;  // for written_log
+
+ // The regions overlapping [p, p + size), in address order.
+ std::vector<It> overlapping(const uint8_t* p, uint64_t size) {
+     std::vector<It> v;
+     It it = g_regions.upper_bound(p);
+     if (it != g_regions.begin() && std::prev(it)->first + std::prev(it)->second.size > p) v.push_back(std::prev(it));
+     for (; it != g_regions.end() && it->first < p + size; ++it) v.push_back(it);
+     return v;
+ }
+
+ // `bytes` of upload memory whose byte `anchor` is kAlign aligned (so it can start a binding).
+ Upload alloc_anchored(uint64_t bytes, uint64_t anchor) {
+     Upload u = upload_alloc(bytes + kAlign, kAlign);
+     uint64_t shift = (kAlign - anchor % kAlign) % kAlign;
+     u.offset += shift, u.ptr += shift;
+     return u;
+ }
+
+ // The parts of `regions` inside [p, p + size) copied on the GPU into `to` (whose first byte is p's), then made
+ // visible to everything after. What the dispatches recorded so far wrote is there when the copy runs: dispatch()
+ // ends each one with a barrier to all later commands. Outside render passes.
+ void copy_regions(VkCommandBuffer cb, const std::vector<It>& regions, const uint8_t* p, uint64_t size, const Upload& to) {
+     for (It it : regions) {
+         const uint8_t* lo = std::max(it->first, p);
+@@ -111,65 +112,65 @@
+     uint64_t off = uint64_t(p - it->first);
+     if (p < it->first || off + size > it->second.size || off + padded > it->second.cap) return g_regions.end();
+     if ((it->second.up.offset + off) % std::clamp<uint64_t>(align, 1, bind_align())) return g_regions.end();
+     return it;
+ }
+
+ }  // namespace
+
+ bool written_separate() {
+     static const bool on = std::getenv("NX_COMPUTE_SEPARATE") != nullptr;
+     return on;
+ }
+
+ uint64_t written_bind_count() { return g_binds; }
+ void written_count_bind() { g_binds++; }
+
+ Upload written_bind(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_t padded) {
+     g_binds++;
+     std::vector<It> old = overlapping(p, size);
+     if (It it = containing(p, size, padded, bind_align(), old); it != g_regions.end()) {
+         write_after_read(cb);
+         g_shared++;
+         return at(it, uint64_t(p - it->first));
+     }
+     // A new range, or one meeting others (or misaligned in its copy): one copy covering all of them, anchored at p.
+     const uint8_t* lo = p;
+     const uint8_t* hi = p + size;
+     for (It it : old) lo = std::min(lo, it->first), hi = std::max(hi, it->first + it->second.size);
+     uint64_t n = uint64_t(hi - lo), off = uint64_t(p - lo);
+     Region r;
+     r.size = n;
+     r.cap = std::max(n + kTail, off + padded);
+-    if (!old.empty() || !resident_upload(lo,n,r.cap,256,true,r.up,&r.before)) {
++    if (!old.empty() || !resident_upload(lo,n,r.cap,256,true,r.up,&r.before,&r.snapshot)) {
+         r.up = alloc_anchored(r.cap, off);
+         std::memcpy(r.up.ptr, lo, n);
+         std::memset(r.up.ptr + n, 0, r.cap - n);
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+         r.before = detail::snapshot_copy(r.up.ptr, size_t(n), detail::memory_trace() ? &detail::compute_snapshots : nullptr);
+ #else
+         r.before = std::make_shared<std::vector<uint8_t>>(r.up.ptr, r.up.ptr + n);
+ #endif
+         resident_stats().copied += n; resident_stats().snapshot += n;
+     }
+     for (It it : old)  // their parts: as they were before their own GPU writes
+         if (it->second.before)
+             std::memcpy(r.before->data() + (it->first - lo), it->second.before->data(), it->second.before->size());
+     if (!old.empty()) {
+         copy_regions(cb, old, lo, n, r.up);  // dispatch(): no render pass is open
+         for (It it : old) g_regions.erase(it);
+         g_merged++;
+     }
+     dedup_invalidate(lo, n);  // copies of these bytes made earlier in the submit are not what later work reads
+     It it = g_regions.emplace(lo, r).first;
+     return at(it, off);
+ }
+
+ bool written_read(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align, Upload& out) {
+     if (!p || !size || g_regions.empty() || written_separate()) return false;
+     std::vector<It> regions = overlapping(p, size);
+     if (regions.empty()) return false;
+     if (It it = containing(p, size, padded, align, regions); it != g_regions.end()) {
+         g_shared++, g_read = true;
+         out = at(it, uint64_t(p - it->first));
+         return true;
+     }
+@@ -267,95 +268,221 @@
+         if (io.location >= g_state.attribs.size()) continue;
+         const VertexAttrib& va = g_state.attribs[io.location];
+         if (va.stream >= 15 || va.stream >= g_state.streams.size() || !(in.used >> va.stream & 1)) continue;
+         const VertexStream& st = g_state.streams[va.stream];
+         const Range& r = g_state.vertex_buffers[va.stream];
+         uint64_t last = st.divisor ? inst_hi / st.divisor : hi;
+         uint64_t end = last * st.stride + va.offset + vk_block_bytes(vk_vertex_format(va.format));
+         uint64_t copied = r.address && guest_bytes(r.address) ? std::min<uint64_t>(r.size, 64ull << 20) : 0;
+         if (end <= copied) continue;
+         found++;
+         static std::map<std::string, uint64_t> seen;
+         std::string key = vs->hash + (fs ? fs->hash : std::string("-")) + char('a' + va.stream);
+         uint64_t n = ++seen[key];
+         if (n <= 3 || (n & (n - 1)) == 0)
+             log("nvn: vertex fetch past the bound range (%llu so far; #%llu of vs %s fs %s): stream %u loc %u fmt %#x off %u "
+                 "stride %u div %u, vertices %llu..%llu instances ..%llu, needs %llu bytes, bound %llu at %llx (copied %llu)",
+                 (unsigned long long)found, (unsigned long long)n, vs->hash.c_str(), fs ? fs->hash.c_str() : "-", va.stream,
+                 io.location, va.format, va.offset, st.stride, st.divisor, (unsigned long long)lo, (unsigned long long)hi,
+                 (unsigned long long)inst_hi, (unsigned long long)end, (unsigned long long)r.size,
+                 (unsigned long long)r.address, (unsigned long long)copied);
+         break;
+     }
+ }
+
+ void written_cpu_write(const uint8_t* p, uint64_t size) {
+     // UpdateUniformBuffer / ReportCounter into a range a dispatch of this submit writes: the copy misses the bytes
+     // (they reach guest memory at replay time) and the write-back replaces them. Not handled: logged.
+     static int logs = 0;
+     if (written_overlaps(p, size) && logs++ < 16)
+         log("nvn: guest write into a compute-written range (%llu bytes): lost at write-back", (unsigned long long)size);
+ }
+
+-std::vector<WriteBack> written_take() {
++std::vector<WriteBack> written_peek() {
+     std::vector<WriteBack> v;
+     v.reserve(g_regions.size());
+-    for (auto& [p, r] : g_regions) v.push_back({r.up.ptr, const_cast<uint8_t*>(p), r.size, r.before});
+-    g_regions.clear();
++    for (auto& [p, r] : g_regions) {
++        WriteBack w{r.up.ptr,const_cast<uint8_t*>(p),r.size,r.before};
++        w.result=r.up; w.snapshot=r.snapshot; v.push_back(std::move(w));
++    }
+     return v;
++}
++
++std::vector<WriteBack> written_take() {
++    auto v=written_peek(); g_regions.clear(); return v;
+ }
+
+ void written_reset() { g_regions.clear(), g_read = false; resident_begin(); }
+
+ void written_log() {
+     if (g_shared + g_merged + g_composed + g_indirect)
+         log("nvn: compute ranges: %llu bindings of written copies, %llu merged, %llu reads composed on the GPU, %llu indirect",
+             (unsigned long long)g_shared, (unsigned long long)g_merged, (unsigned long long)g_composed,
+             (unsigned long long)g_indirect);
+     g_shared = g_merged = g_composed = g_indirect = 0;
+ }
+
+ }  // namespace nx::nvn::replay
+
+ namespace nx::nvn {
+
++namespace {
++VkPipeline g_compare_pipeline=VK_NULL_HANDLE;
++VkPipelineLayout g_compare_layout=VK_NULL_HANDLE;
++VkDescriptorSetLayout g_compare_set=VK_NULL_HANDLE;
++bool g_compare_failed=false;
++bool compare_init() {
++    if (g_compare_pipeline) return true;
++    if (g_compare_failed) return false;
++    g_compare_failed=true;  // Any unsupported/allocation failure retains eager CPU scanning.
++    using namespace nx::vk;
++    const auto d=vk_device();
++    VkDescriptorSetLayoutBinding bindings[3]{};
++    for (uint32_t k=0;k<3;++k) bindings[k]={k,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr};
++    VkDescriptorSetLayoutCreateInfo si{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
++    si.bindingCount=3; si.pBindings=bindings;
++    if (p_vkCreateDescriptorSetLayout(d,&si,nullptr,&g_compare_set)!=VK_SUCCESS) return false;
++    VkPushConstantRange pc{VK_SHADER_STAGE_COMPUTE_BIT,0,4};
++    VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++    li.setLayoutCount=1; li.pSetLayouts=&g_compare_set; li.pushConstantRangeCount=1; li.pPushConstantRanges=&pc;
++    VkShaderModule module=VK_NULL_HANDLE;
++    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++    mi.codeSize=sizeof(kWritebackCompareSPV); mi.pCode=kWritebackCompareSPV;
++    bool ok=p_vkCreatePipelineLayout(d,&li,nullptr,&g_compare_layout)==VK_SUCCESS &&
++            p_vkCreateShaderModule(d,&mi,nullptr,&module)==VK_SUCCESS;
++    if (ok) {
++        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
++        ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
++        ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT; ci.stage.module=module; ci.stage.pName="main";
++        ci.layout=g_compare_layout;
++        ok=p_vkCreateComputePipelines(d,VK_NULL_HANDLE,1,&ci,nullptr,&g_compare_pipeline)==VK_SUCCESS;
++    }
++    if (module) p_vkDestroyShaderModule(d,module,nullptr);
++    if (!ok) {
++        if (g_compare_pipeline) p_vkDestroyPipeline(d,g_compare_pipeline,nullptr);
++        if (g_compare_layout) p_vkDestroyPipelineLayout(d,g_compare_layout,nullptr);
++        p_vkDestroyDescriptorSetLayout(d,g_compare_set,nullptr);
++        g_compare_pipeline=VK_NULL_HANDLE; g_compare_layout=VK_NULL_HANDLE; g_compare_set=VK_NULL_HANDLE;
++        log("writeback: GPU comparison unavailable; using eager scan"); return false;
++    }
++    g_compare_failed=false;
++    log("writeback: GPU block comparison enabled (4096 bytes, changed-word CPU merge)"); return true;
++}
++} // namespace
++
++void prepare_write_backs(VkCommandBuffer cb,std::vector<WriteBack>& writes) {
++    if (!narrow_writeback_on() || writes.empty()) return;
++    using namespace nx::vk;
++    bool begun=false;
++    for (auto& w:writes) {
++        auto& stats=replay::resident_stats();
++        // Only immutable resident snapshots can be compared without recopying broad bindings.
++        // Merged/overlapping, separate, unaligned and incomplete snapshots retain the eager oracle.
++        if (!w.snapshot.buffer || !w.result.buffer || w.size<kWritebackBlock ||
++            !w.before || w.before->size()<w.size || w.before_offset || !compare_init()) {
++            ++stats.wb_fallback; continue;
++        }
++        VkDescriptorSet set=descriptor_set(g_compare_set);
++        if (!set) { ++stats.wb_fallback; continue; }
++        const uint64_t blocks=(w.size+kWritebackBlock-1)/kWritebackBlock;
++        Upload flags=writeback_flags_alloc((std::max<uint64_t>)(blocks*4,16));
++        if (!flags.ptr) { ++stats.wb_fallback; continue; }
++        // Pessimistic initialization also preserves eager behavior if diagnostic inspection occurs
++        // before execution. Every dispatched block overwrites its flag on successful completion.
++        std::memset(flags.ptr,1,size_t(blocks*4));
++        const uint64_t words=w.size/4;
++        VkDescriptorBufferInfo infos[3]={{w.result.buffer,w.result.offset,words*4},
++                                        {w.snapshot.buffer,w.snapshot.offset,words*4},
++                                        {flags.buffer,flags.offset,blocks*4}};
++        VkWriteDescriptorSet desc[3]{};
++        for (uint32_t k=0;k<3;++k) {
++            desc[k]={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; desc[k].dstSet=set; desc[k].dstBinding=k;
++            desc[k].descriptorCount=1; desc[k].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++            desc[k].pBufferInfo=&infos[k];
++        }
++        p_vkUpdateDescriptorSets(vk_device(),3,desc,0,nullptr);
++        if (!begun) {
++            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++            mb.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
++            p_vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                  0,1,&mb,0,nullptr,0,nullptr);
++            p_vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,g_compare_pipeline); begun=true;
++        }
++        p_vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,g_compare_layout,0,1,&set,0,nullptr);
++        const uint32_t count=uint32_t(words);
++        p_vkCmdPushConstants(cb,g_compare_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&count);
++        p_vkCmdDispatch(cb,uint32_t(blocks),1,1);
++        w.changed=reinterpret_cast<const uint32_t*>(flags.ptr);
++        stats.wb_gpu_bytes+=words*4; stats.wb_flags+=blocks*4; ++stats.wb_narrow;
++    }
++    if (begun) {
++        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++        mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
++        p_vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,
++                              0,1,&mb,0,nullptr,0,nullptr);
++    }
++}
++
+ // A bound storage range is often larger than what the shader writes, and the game's recording thread writes the
+ // rest of those buffers while the submit is replayed. Copying the whole range back put stale bytes over them: meshes
+ // exploded into beams and a band of stretched triangles at the horizon, for the rest of the run (DEBUG.md #56). Only
+ // the words the GPU changed go back. NX_WRITE_BACK_WHOLE=1: the old whole-range copy.
+-void apply_write_back(const WriteBack& w) {
++void apply_write_back_full(const WriteBack& w) {
+     auto& metrics = replay::resident_stats(); metrics.wb_scanned += w.size;
+     static const bool whole = std::getenv("NX_WRITE_BACK_WHOLE") != nullptr;
+-    if (whole || !w.before || w.before->size() < w.size) {
++    if (whole || !w.before || w.before_offset > w.before->size() || w.before->size()-w.before_offset < w.size) {
+         metrics.wb_changed += w.size; std::memcpy(w.to, w.from, w.size);
+         return;
+     }
+-    const uint8_t* was = w.before->data();
++    const uint8_t* was = w.before->data()+w.before_offset;
+     uint64_t k = 0;
+ #if defined(NX_ASTRAL_STRICT) && defined(_WIN32) && defined(_M_X64)
+     // Windows already requires AVX2. Compare eight words at once, then store only changed lanes: copying an
+     // unchanged word would overwrite concurrent guest writes (DEBUG.md #56). Unaligned buffers are valid here.
+     // Keep the scalar path for same-binary A/B profiling and driver/CPU regression diagnosis.
+     static const bool scalar = std::getenv("NX_WIN_SCALAR_WRITEBACK") != nullptr;
+     if (!scalar) {
+         for (; k + 32 <= w.size; k += 32) {
+             const __m256i now = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w.from + k));
+             const __m256i before = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(was + k));
+             const __m256i equal = _mm256_cmpeq_epi32(now, before);
+             if (unsigned(_mm256_movemask_epi8(equal)) == 0xffffffffu) continue;
+             unsigned mask = unsigned(_mm256_movemask_ps(_mm256_castsi256_ps(equal)));
+             for (unsigned lane = 0; lane < 8; ++lane) if (!(mask >> lane & 1)) metrics.wb_changed += 4;
+             _mm256_maskstore_epi32(reinterpret_cast<int*>(w.to + k),
+                                   _mm256_xor_si256(equal, _mm256_set1_epi32(-1)), now);
+         }
+     }
+ #endif
+     for (; k + 8 <= w.size; k += 8) {
+         if (std::memcmp(w.from + k, was + k, 8) == 0) continue;
+         for (uint64_t b = k; b < k + 8; b += 4)
+             if (std::memcmp(w.from + b, was + b, 4) != 0) { metrics.wb_changed += 4; std::memcpy(w.to + b, w.from + b, 4); }
+     }
+     for (; k < w.size; k++)
+         if (w.from[k] != was[k]) { ++metrics.wb_changed; w.to[k] = w.from[k]; }
+ }
+
++void apply_write_back(const WriteBack& w) {
++    auto& stats=replay::resident_stats(); stats.wb_considered+=w.size;
++    const bool valid=w.before && w.before_offset<=w.before->size() && w.size<=w.before->size()-w.before_offset;
++    static const bool whole=std::getenv("NX_WRITE_BACK_WHOLE")!=nullptr;
++    const uint32_t* flags=valid && !whole ? w.changed : nullptr;
++    static const bool oracle=std::getenv("NX_NARROW_WRITEBACK_ORACLE")!=nullptr;
++    if (flags && oracle) {
++        // Diagnostic only: independently check every byte, including partial words, before skipping.
++        for (uint64_t at=0;at<w.size;at+=kWritebackBlock) {
++            const uint64_t checked=(std::min)(kWritebackBlock,w.size-at)&~3ull;
++            if (!flags[at/kWritebackBlock] && checked &&
++                std::memcmp(w.from+at,w.before->data()+w.before_offset+at,checked)) {
++                log("writeback ORACLE_MISMATCH at=%llu size=%llu",(unsigned long long)at,(unsigned long long)w.size);
++                flags=nullptr; break;  // safe eager recovery on any missed complete word
++            }
++        }
++    }
++    changed_blocks(w.size,flags,[&](uint64_t at,uint64_t bytes) {
++        WriteBack part=w; part.from+=at; part.to+=at; part.size=bytes;
++        part.before_offset+=at; part.changed=nullptr; apply_write_back_full(part);
++    });
++}
++
+ }  // namespace nx::nvn
+diff --git a/runtime/src/nvn/nvn_vk.cpp b/runtime/src/nvn/nvn_vk.cpp
+index 10ef7d4..4f956ad 100644
+--- a/runtime/src/nvn/nvn_vk.cpp
++++ b/runtime/src/nvn/nvn_vk.cpp
+@@ -32,24 +32,25 @@
+ #include <nx/game.h>
+
+ namespace nx::nvn {
+
+ using namespace nx::vk;
+
+
+ namespace {
+
+ std::recursive_mutex g_gpu;  // the whole GPU side: one submitting thread at a time
+ bool g_ready = false, g_failed = false;
+ VkInstance g_instance = VK_NULL_HANDLE;
++VkDebugUtilsMessengerEXT g_validation_messenger = VK_NULL_HANDLE;
+ VkPhysicalDevice g_physical = VK_NULL_HANDLE;
+ VkDevice g_device = VK_NULL_HANDLE;
+ VkQueue g_queue = VK_NULL_HANDLE;
+ uint32_t g_family = 0;
+ VkPhysicalDeviceMemoryProperties g_memory{};
+ VkCommandPool g_pool = VK_NULL_HANDLE;
+ VkCommandBuffer g_cb = VK_NULL_HANDLE;
+ VkFence g_fence = VK_NULL_HANDLE;
+
+ VkSurfaceKHR g_surface = VK_NULL_HANDLE;
+ VkSwapchainKHR g_swapchain = VK_NULL_HANDLE;
+ std::vector<VkImage> g_sc_images;
+@@ -123,29 +124,52 @@ bool init() {
+     std::vector<VkExtensionProperties> iext(n);
+     p_enum_instance_ext(nullptr, &n, iext.data());
+     std::vector<const char*> exts = {VK_KHR_SURFACE_EXTENSION_NAME, plat::vulkan_surface_extension()};
+     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+     if (has_extension(iext, "VK_KHR_portability_enumeration")) {
+         exts.push_back("VK_KHR_portability_enumeration");
+         ici.flags |= 0x00000001;  // VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
+     }
+     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+     app.pApplicationName = nx::game::kInfo.title;
+     app.apiVersion = VK_API_VERSION_1_3;
+     ici.pApplicationInfo = &app;
++    const char* validation_env=std::getenv("NX_VK_VALIDATION");
++    const bool validation=validation_env && std::atoi(validation_env)>0;
++    const char* validation_layer="VK_LAYER_KHRONOS_validation";
++    VkDebugUtilsMessengerCreateInfoEXT debug{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
++    if (validation) {
++        exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
++        ici.enabledLayerCount=1; ici.ppEnabledLayerNames=&validation_layer;
++        debug.messageSeverity=VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
++        debug.messageType=VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
++                          VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
++        debug.pfnUserCallback=[](VkDebugUtilsMessageSeverityFlagBitsEXT severity,VkDebugUtilsMessageTypeFlagsEXT,
++                                 const VkDebugUtilsMessengerCallbackDataEXT* message,void*) -> VkBool32 {
++            log("validation %s: %s",severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "error" : "warning",message->pMessage);
++            return VK_FALSE;
++        };
++        ici.pNext=&debug;
++    }
+     ici.enabledExtensionCount = uint32_t(exts.size());
+     ici.ppEnabledExtensionNames = exts.data();
+     if (!check(p_create_instance(&ici, nullptr, &g_instance), "vkCreateInstance")) return false;
+     for (size_t k = 0; k < g_entry_count; k++)
+         if (auto p = gipa(g_instance, g_entries[k].name)) *g_entries[k].pfn = p;
++    if (validation) {
++        auto create_debug=reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(gipa(g_instance,"vkCreateDebugUtilsMessengerEXT"));
++        if (create_debug && create_debug(g_instance,&debug,nullptr,&g_validation_messenger)==VK_SUCCESS)
++            log("validation active: VK_LAYER_KHRONOS_validation with persistent debug messenger");
++        else log("validation messenger unavailable; diagnostics gate remains open");
++    }
+     p_enum_physical = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(gipa(g_instance, "vkEnumeratePhysicalDevices"));
+     p_create_device = reinterpret_cast<PFN_vkCreateDevice>(gipa(g_instance, "vkCreateDevice"));
+
+     n = 0;
+     p_enum_physical(g_instance, &n, nullptr);
+     std::vector<VkPhysicalDevice> gpus(n);
+     p_enum_physical(g_instance, &n, gpus.data());
+     gpus.resize(n);
+     g_physical = pick_physical_device(gpus);  // NX_GPU, default: the first discrete GPU (nvn_gpu_pick.cpp)
+     if (!g_physical) {
+         log("nvn/vk: no GPU");
+         return false;
+@@ -439,24 +463,31 @@ Upload upload_alloc(uint64_t size, uint64_t align) {
+         replay::dedup_reset();  // shared copies may be among them
+     }
+     g_upload_used = at + size;
+     return {g_upload, at, g_upload_ptr + at};
+ }
+
+ Upload upload(const void* data, uint64_t size, uint64_t align) {
+     Upload u = upload_alloc(size, align);
+     if (data && size) std::memcpy(u.ptr, data, size);
+     return u;
+ }
+
++Upload writeback_flags_alloc(uint64_t size) {
++    if (async_gpu()) {
++        if (!frame_writeback_flags_fit(size)) return {};
++    } else if (!writeback_flags_fit(g_upload_used,0,g_upload_size,size,256,false)) return {};
++    return upload_alloc(size,256);
++}
++
+ VkDescriptorSet descriptor_set(VkDescriptorSetLayout layout) {
+     if (async_gpu()) return frame_descriptor_set(layout);
+     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+     ai.descriptorPool = g_descriptors;
+     ai.descriptorSetCount = 1;
+     ai.pSetLayouts = &layout;
+     VkDescriptorSet set = VK_NULL_HANDLE;
+     if (p_vkAllocateDescriptorSets(g_device, &ai, &set) != VK_SUCCESS) log("nvn/vk: descriptor pool exhausted");
+     return set;
+ }
+
+ VkDescriptorPool make_descriptor_pool() {
+@@ -607,25 +638,32 @@ void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_
+         // After the last list with a dispatch, unless nothing follows it (replay_list may have split inside a list).
+         g_cb = k == split_after && k + 1 < lists.size() ? frame_split(g_cb) : frame_cb(g_cb);
+     }
+     draw_end_rendering(g_cb);
+     const FrameTimes f1 = frame_times();  // the first part's submit and ring waits are not replay time
+     g_timing.submits++;
+     g_timing.replay_ns += plat::monotonic_ns() - t0 - (f1.encode_ns - f0.encode_ns) - (f1.fence_ns - f0.fence_ns);
+     g_timing.upload_bytes += async ? frame_upload_used() : g_upload_used;
+     gpu_profile_mark(g_cb, "end");
+     if (async)  // the profile, zero-draw queries and snapshots read this submit's results right below: waited for
+         frame_submit(VK_NULL_HANDLE, VK_NULL_HANDLE, draw_take_write_backs(),
+                      gpu_profile_on() || zero_draws_on() || debug_snapshots_pending());
+-    else
++    else if (narrow_writeback_on()) {
++        auto writes=draw_take_write_backs();
++        prepare_write_backs(g_cb,writes);
++        end_and_wait(VK_NULL_HANDLE,VK_NULL_HANDLE);
++        for (const auto& w:writes) {
++            replay::trace_nan_write_back(w.from,w.to,w.size); apply_write_back(w);
++        }
++    } else
+         end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
+     draw_end_submit();  // not waited for: snapshots only (the write-backs went with the submit)
+     gpu_profile_collect(), zero_draws_collect();
+     debug_dump_requested(draw_take_dump_request());  // reads back in a submit of its own, which it waits for
+     const FrameTimes f2 = frame_times();
+     g_timing.encode_ns += f2.encode_ns - f_in.encode_ns, g_timing.fence_ns += f2.fence_ns - f_in.fence_ns;
+     g_timing.submit_ns += plat::monotonic_ns() - t_in;
+ }
+
+ // Headless: the presented texture is only counted, logged and dumped (no swapchain). Nothing is submitted unless a
+ // frame dump is due: the empty submit was a Metal command buffer and a fence wait per frame.
+ void present_headless(uint64_t texture) {
+diff --git a/runtime/src/nvn/nvn_frames.cpp b/runtime/src/nvn/nvn_frames.cpp
+index 45a9859..70ce0ff 100644
+--- a/runtime/src/nvn/nvn_frames.cpp
++++ b/runtime/src/nvn/nvn_frames.cpp
+@@ -31,56 +31,60 @@
+ // every mode.
+ #include <algorithm>
+ #include <atomic>
+ #include <cstdlib>
+ #include <cstring>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+ #include <tuple>
+ #include <vector>
+
+ #include "nvn_vk.h"
++#include "nvn_resident.h"
+ #include "platform.h"
+
+ namespace nx::nvn {
+
+ using namespace nx::vk;
+
+ VkQueue vk_queue();                // nvn_vk.cpp
+ std::recursive_mutex& gpu_lock();  // nvn_vk.cpp
++namespace replay { std::vector<WriteBack> written_peek(); }
+
+ namespace {
+
+ constexpr uint32_t kMaxSlots = 8;
+ constexpr uint32_t kMaxParts = 8;  // command buffers per submit: chunks, the split, the last part
+ constexpr uint64_t kFenceTimeout = 2'000'000'000ull;  // a frame's work takes milliseconds; longer is a hung shader
+
+ struct Slot {
+     VkCommandPool pool = VK_NULL_HANDLE;  // its own (the parts reset together), unless NX_CB_RESET=1
+     bool pool_used = false;               // parts were begun since the pool's last reset
+     VkCommandBuffer cbs[kMaxParts] = {};  // the parts, queued in order
+     VkFence fences[kMaxParts] = {};
+     uint32_t part = 0;                    // the part being recorded
+     uint32_t queued = 0;                  // bit k: part k was queued (its fence will signal)
+     uint32_t waited = 0;                  // parts below this were waited for (the ring may reuse their data)
+     int split_part = -1;                  // pipelined: the part that ends with the last dispatch
+     bool ok = true;                       // the current part is recording (a failed begin leaves nothing to queue)
+     VkSemaphore acquired = VK_NULL_HANDLE;          // a present's swapchain image
+     VkDescriptorPool descriptors = VK_NULL_HANDLE;  // made on first use (presents need none)
+     bool descriptors_used = false;
+     std::atomic<bool> reset_done{true};  // the janitor reset its pools (nvn_janitor.cpp); frame_begin waits for it
+     uint64_t serial = 0;    // in flight until retired; 0: free
+     uint64_t ring_end = 0;  // the ring position after this submit's data
+     std::vector<WriteBack> write_backs;
++    std::vector<WriteBack> early_write_backs;
++    bool early_prepared=false;
+     bool replay = false;  // a submit's replay (not a present)
+     uint64_t binds_at_split = 0;  // replay::written_bind_count() at the split
+     uint64_t begin_ns = 0;
+ };
+
+ Slot g_slots[kMaxSlots];
+ uint32_t g_slot_count = 0, g_next = 0;
+ Slot* g_current = nullptr;               // the slot being recorded
+ VkSemaphore g_rendered[kMaxSlots] = {};  // per swapchain image: signaled for its present
+ std::atomic<uint64_t> g_submitted{0}, g_completed{0};
+ std::atomic<uint64_t> g_barrier{0};  // NX_ASYNC_GPU: the last submit with write-backs, retired before the next replay
+ FrameTimes g_times;
+@@ -132,25 +136,26 @@ ReuseKey reuse_key(const Texture& t) {
+     return {t.memory, t.format, t.width, t.height, t.depth, t.levels, t.target, t.samples, swizzle};
+ }
+ std::map<ReuseKey, std::pair<uint64_t, std::shared_ptr<GpuImage>>> g_reusable;  // key -> (kept at, image)
+ uint64_t g_reuse_clock = 0, g_reused = 0;
+
+ void wait_fences(const VkFence* fences, uint32_t n) {
+     if (!n) return;
+     uint64_t t0 = plat::monotonic_ns();
+     VkResult r = p_vkWaitForFences(vk_device(), n, fences, VK_TRUE, kFenceTimeout);
+     if (r == VK_TIMEOUT) gpu_hung("a submit did not finish in 2 s");
+     if (r == VK_ERROR_DEVICE_LOST) gpu_hung("vkWaitForFences");
+     if (r != VK_SUCCESS) log("nvn/vk: vkWaitForFences failed (%d)", int(r));
+-    g_times.fence_ns += plat::monotonic_ns() - t0;
++    const auto elapsed=plat::monotonic_ns()-t0;
++    g_times.fence_ns+=elapsed; replay::resident_stats().fence_ns+=elapsed;
+ }
+
+ // Compute results to guest memory: after the fence of the part that holds the submit's dispatches.
+ void apply_write_backs(Slot& s) {
+     for (const WriteBack& w : s.write_backs) {
+         replay::trace_nan_write_back(w.from, w.to, w.size);
+         apply_write_back(w);
+     }
+     s.write_backs.clear();
+ }
+
+ // Waits for the oldest submit in flight and finishes it: compute results to guest memory (if not there yet), its
+@@ -163,41 +168,40 @@ uint32_t queued_fences(const Slot& s, uint32_t upto, VkFence* out) {
+         if (s.queued >> k & 1) out[n++] = s.fences[k];
+     return n;
+ }
+
+ bool retire_oldest() {
+     Slot* s = nullptr;
+     for (uint32_t k = 0; k < g_slot_count; k++)
+         if (g_slots[k].serial && (!s || g_slots[k].serial < s->serial)) s = &g_slots[k];
+     if (!s) return false;
+     VkFence fences[kMaxParts];
+     wait_fences(fences, queued_fences(*s, kMaxParts, fences));
+     gpu_busy_retired(uint32_t(s - g_slots), s->queued);  // NX_GPU_PROFILE=3
+-    apply_write_backs(*s);
+     // Its command and descriptor pools: reset on the janitor thread (PHASE4.md C2b), or here (NX_JANITOR=0).
+     if (janitor_on()) {
+         s->reset_done.store(false, std::memory_order_relaxed);
+         janitor_run([s] {
+             if (g_slot_pools && s->pool_used) p_vkResetCommandPool(vk_device(), s->pool, 0);
+             if (s->descriptors_used) p_vkResetDescriptorPool(vk_device(), s->descriptors, 0);
+             s->pool_used = s->descriptors_used = false;
+             s->reset_done.store(true, std::memory_order_release);
+         });
+     } else {
+         if (s->descriptors_used) p_vkResetDescriptorPool(vk_device(), s->descriptors, 0);
+         s->descriptors_used = false;
+     }
+-    g_tail = std::max(g_tail, s->ring_end);
+-    g_completed = s->serial;
+-    s->serial = 0;
++    FlightPolicy::retire(s->serial,[&] { apply_write_backs(*s); },[&](uint64_t serial) {
++        g_tail = std::max(g_tail,s->ring_end); g_completed=serial; s->serial=0;
++    });
+     // Pipelined: gpu_submit and gpu_present free the images, where the synchronous path does (the reuse clock ticks
+     // there, so a destroyed target's image is kept for the same number of submits and presents).
+     if (!pipelined()) free_retired_images(g_completed);
+     return true;
+ }
+
+ void retire_through(uint64_t serial) {
+     while (g_completed < serial && retire_oldest()) {
+     }
+ }
+
+ uint32_t replays_in_flight() {
+@@ -292,52 +296,54 @@ VkCommandBuffer next_part(Slot& s) {
+     if (!s.ok) log("nvn/vk: a part of a submit could not begin: it is lost");
+     g_chunk_from = UINT64_MAX;
+     return s.cbs[s.part];
+ }
+
+ }  // namespace
+
+ // On by default on macOS only (course 1-1 headless: ~50 -> ~59 fps there; DEBUG.md #61): MoltenVK encodes Metal inside
+ // vkQueueSubmit, which is what the overlap hides. With native drivers (Windows, NVIDIA) the synchronous path played
+ // at 58 fps against 40 and had none of the exploded meshes the pipelined one shows in course 1-1 (DEBUG-2 #76).
+ // NX_PIPELINED=0: synchronous; 1..4: pipelined, that many submits in flight (2 at least). NX_ASYNC_GPU wins.
+ bool pipelined() {
++    if (resident_flights_on()) return false;
+     static const bool on = [] {
+         if (env_int("NX_ASYNC_GPU") > 0) return false;
+         const char* e = std::getenv("NX_PIPELINED");
+ #if defined(__APPLE__)
+         return !e || std::atoi(e) > 0;
+ #else
+         // An integrated GPU shares the CPU's memory and is the long side of a frame: with the fences not waited for,
+         // the Intel UHD went from 26.2 to 31.3 fps docked and 37.8 to 40.1 at 720p in the Flower Kingdom intro
+         // (docs/nvn/studies/intel-igpu-1710.md). Pipelined is the default there; NX_PIPELINED=0 turns it off.
+         if (!e) return gpu_is_integrated();
+         return std::atoi(e) > 0;
+ #endif
+     }();
+     return on;
+ }
+
+ bool async_gpu() {
+-    static const bool on = pipelined() || env_int("NX_ASYNC_GPU") > 0;
++    static const bool on = resident_flights_on() || pipelined() || env_int("NX_ASYNC_GPU") > 0;
+     return on;
+ }
+
+ FrameTimes& frame_times() { return g_times; }
+ uint64_t frame_completed() { return g_completed; }
+
+ void frame_init(VkCommandPool pool, uint32_t family, VkBuffer ring, uint8_t* ring_ptr, uint64_t ring_size) {
+     // NX_ASYNC_GPU=1 (or 2): two frames in flight; 3 or 4: that many. A frame is a submit and a present, a slot each.
+     // NX_PIPELINED likewise (at most that many submits in flight, whatever the slots).
+     uint32_t frames = uint32_t(std::clamp(env_int(pipelined() ? "NX_PIPELINED" : "NX_ASYNC_GPU"), 2, 4));
++    if (resident_flights_on()) frames=FlightPolicy::limit;
+     g_max_replays = frames;
+     g_slot_count = std::min(kMaxSlots, frames * 2);
+     VkDevice d = vk_device();
+     g_slot_pools = std::getenv("NX_CB_RESET") == nullptr;
+     for (uint32_t k = 0; k < g_slot_count; k++) {
+         if (g_slot_pools) {
+             VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+             pci.queueFamilyIndex = family;
+             g_slot_pools = p_vkCreateCommandPool(d, &pci, nullptr, &g_slots[k].pool) == VK_SUCCESS;
+         }
+         VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+         cai.commandPool = g_slot_pools ? g_slots[k].pool : pool;
+@@ -366,58 +372,66 @@ void frame_init(VkCommandPool pool, uint32_t family, VkBuffer ring, uint8_t* rin
+ VkCommandBuffer frame_begin(bool replay) {
+     // NX_ASYNC_GPU: this replay may read the results of the last submit that had write-backs. Pipelined: they are
+     // in guest memory since that submit returned.
+     if (!pipelined() && replay && g_barrier > g_completed) retire_through(g_barrier);
+     Slot& s = g_slots[g_next];
+     if (s.serial) retire_through(s.serial);
+     janitor_wait(s.reset_done);
+     if (g_slot_pools && s.pool_used) p_vkResetCommandPool(vk_device(), s.pool, 0);  // none of its parts is in flight
+     s.pool_used = true;
+     g_next = (g_next + 1) % g_slot_count;
+     g_begin = g_head;
+     s.replay = replay, s.part = s.queued = s.waited = 0, s.split_part = -1, s.ok = true;
++    s.early_write_backs.clear(); s.early_prepared=false;
+     s.begin_ns = plat::monotonic_ns();
+     g_plan_dispatches = g_seen_dispatches = 0;
+     g_chunking = false;
+     if (!begin_part(s.cbs[0])) {
+         g_current = nullptr;
+         return VK_NULL_HANDLE;
+     }
+     g_current = &s;
+     gpu_busy_part_begin(uint32_t(&s - g_slots), 0, s.cbs[0]);  // NX_GPU_PROFILE=3
+     return s.cbs[0];
+ }
+
+ // ---- pipelined: the split after the last dispatch ----------------------------------------------------------------
+
+ size_t frame_plan_split(const std::vector<std::shared_ptr<CmdList>>& lists) {
+     static const bool off = std::getenv("NX_PIPELINED_NO_SPLIT") != nullptr;
+     g_plan_dispatches = g_seen_dispatches = 0;
+     g_chunking = g_chunk_draws && g_current, g_chunk_from = UINT64_MAX;  // not with the profile (not called then)
+     // NX_COMPUTE_SEPARATE's write-backs are not counted by written_bind_count(): such a submit is waited for whole.
+-    if (!pipelined() || off || !g_current || replay::written_separate()) return SIZE_MAX;
++    if ((!pipelined() && !resident_flights_on()) || off || !g_current || replay::written_separate()) return SIZE_MAX;
+     size_t last = SIZE_MAX;
+     for (size_t k = 0; k < lists.size(); k++)
+         if (uint32_t n = count_dispatches(*lists[k], 0)) g_plan_dispatches += n, last = k;
+     return last;
+ }
+
+ VkCommandBuffer frame_cb(VkCommandBuffer cb) { return g_current ? g_current->cbs[g_current->part] : cb; }
+
+ VkCommandBuffer frame_split(VkCommandBuffer cb) {
+     Slot* s = g_current;
+-    if (!pipelined() || !s || s->split_part >= 0 || cb != s->cbs[s->part] || s->part + 1 >= kMaxParts)
++    if ((!pipelined() && !resident_flights_on()) || !s || s->split_part >= 0 || cb != s->cbs[s->part] || s->part + 1 >= kMaxParts)
+         return frame_cb(cb);
+     s->split_part = int(s->part);
+     s->binds_at_split = replay::written_bind_count();
++    if (resident_flights_on() && !replay::g_resident_graphics_writer) {
++        // Keep canonical regions available to later reads. Their exact identities are checked at
++        // frame_submit; any later writer/merge or observer forces the final-part eager fallback.
++        pass_end_only(cb,0);
++        s->early_write_backs=replay::written_peek();
++        prepare_write_backs(cb,s->early_write_backs); s->early_prepared=true;
++    }
+     g_stats.splits++, g_stats.first_ns += plat::monotonic_ns() - s->begin_ns;
+     VkCommandBuffer next = next_part(*s);
+     if (!(s->queued >> s->split_part & 1))
+         log("nvn/vk: the part with a split submit's dispatches was not queued: its compute results are lost");
+     return next;
+ }
+
+ VkCommandBuffer frame_chunk(VkCommandBuffer cb, uint64_t draws, bool pass_open) {
+     Slot* s = g_current;
+     // Two parts are kept for the split and the last one.
+     if (!g_chunking || !s || cb != s->cbs[s->part] || s->part + 2 >= kMaxParts) return cb;
+     if (g_chunk_from == UINT64_MAX) g_chunk_from = draws;
+@@ -441,40 +455,61 @@ VkSemaphore frame_acquire_semaphore() {  // the next slot's (frame_begin takes t
+ VkSemaphore frame_rendered_semaphore(uint32_t image) {
+     if (image >= kMaxSlots) image = kMaxSlots - 1;
+     if (!g_rendered[image]) {
+         VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+         p_vkCreateSemaphore(vk_device(), &sci, nullptr, &g_rendered[image]);
+     }
+     return g_rendered[image];
+ }
+
+ void frame_submit(VkSemaphore wait, VkSemaphore signal, std::vector<WriteBack> write_backs, bool wait_done) {
+     if (!g_current) return;
+     Slot& s = *g_current;
++    const bool same=FlightPolicy::same_ranges(write_backs,s.early_write_backs);
++    const bool early_ready=resident_flights_on() && s.early_prepared && !replay::g_resident_graphics_writer &&
++        FlightPolicy::early(s.split_part>=0 && (s.queued>>s.split_part&1),s.ok,wait_done,same,
++                            s.binds_at_split,replay::written_bind_count());
++    if (early_ready) write_backs=std::move(s.early_write_backs);
++    else if (s.ok) prepare_write_backs(s.cbs[s.part],write_backs);
++    s.early_write_backs.clear();
+     g_current = nullptr;
+-    if (pipelined() && s.replay) {
++    if ((pipelined() || resident_flights_on()) && s.replay) {
+         g_stats.submits++;
+         if (s.split_part >= 0) g_stats.replay_ns += plat::monotonic_ns() - s.begin_ns;
+     }
+     if (s.ok) gpu_busy_part_end(uint32_t(&s - g_slots), s.part, s.cbs[s.part]);
+     const bool has_last = s.ok && submit_part(s.cbs[s.part], s.fences[s.part], wait, signal);
+     if (has_last) s.queued |= 1u << s.part;
+     if (!s.queued) return;  // nothing ran: no results to copy back, the slot stays free
+     s.serial = ++g_submitted;
+     s.ring_end = g_head;
+     s.write_backs = std::move(write_backs);
+     // The dispatches were in a part that never ran: the buffers hold no results, and copying them back would put the
+     // inputs (or older data) over guest memory.
+     const bool has_first = s.split_part >= 0 && (s.queued >> s.split_part & 1);
+     if (s.split_part >= 0 && !has_first) s.write_backs.clear();
++    if (resident_flights_on()) {
++        if (!s.write_backs.empty() && early_ready && has_first && has_last) {
++            VkFence fences[kMaxParts];
++            wait_fences(fences,queued_fences(s,uint32_t(s.split_part)+1,fences));
++            apply_write_backs(s); ++g_stats.waited_first;
++            ++replay::resident_stats().flight_eager; ++replay::resident_stats().flight_deferred;
++            // Whole-submit/NVN completion stays unpublished until ALL parts retire. The only
++            // results CPU code can read are merged now; later GPU commands only read these ranges.
++        } else if (FlightPolicy::eager(!s.write_backs.empty(),wait_done)) {
++            ++replay::resident_stats().flight_eager; ++g_stats.waited_whole; retire_through(s.serial);
++        } else ++replay::resident_stats().flight_deferred;
++        while (FlightPolicy::throttle(replays_in_flight()) && retire_oldest()) {}
++        return;
++    }
+     if (pipelined()) {
+         // At most g_max_replays submits in flight, this one included: the oldest are waited for once this one is
+         // queued (before, the rest waited behind them and the GPU idled between the two parts).
+         struct Throttle {
+             Slot& s;
+             ~Throttle() {
+                 if (!s.replay) return;
+                 bool waited = false;
+                 while (replays_in_flight() > g_max_replays && retire_oldest()) waited = true;
+                 g_stats.throttled += waited;
+             }
+         } throttle{s};
+@@ -510,34 +545,38 @@ void frame_wait_all() {
+ uint64_t frame_upload_used() { return g_head - g_begin; }
+ uint64_t frame_ring_size() { return async_gpu() ? g_ring_size : 0; }
+
+ void frame_log(uint64_t frames) {
+     gpu_busy_log(frames);
+     if (uint64_t waits = g_game_waits.exchange(0))
+         log("nvn/vk: the game's waits (syncs, finish, pool invalidate/finalize): %llu blocked, %.2f ms per frame",
+             (unsigned long long)waits, double(g_game_wait_ns.exchange(0)) / 1e6 / double(frames));
+     if (g_staging_count)
+         log("nvn/vk: staging: %llu buffers, %.1f MB over %llu frames", (unsigned long long)g_staging_count,
+             double(g_staging_bytes) / 1e6, (unsigned long long)frames);
+     g_staging_count = g_staging_bytes = 0;
+-    if (!pipelined() || !g_stats.submits) return;
++    if ((!pipelined() && !resident_flights_on()) || !g_stats.submits) return;
+     const Stats& t = g_stats;
+     log("nvn/vk: pipelined: %llu submits, %llu split (first part: %.0f%% of the replay), write-backs after the first "
+         "part %llu, after the whole submit %llu, %llu waited for the oldest in flight, %llu chunks queued early",
+         (unsigned long long)t.submits, (unsigned long long)t.splits,
+         t.replay_ns ? 100.0 * double(t.first_ns) / double(t.replay_ns) : 0.0, (unsigned long long)t.waited_first,
+         (unsigned long long)t.waited_whole, (unsigned long long)t.throttled, (unsigned long long)t.chunks);
+     g_stats = {};
+ }
+
++bool frame_writeback_flags_fit(uint64_t size) {
++    return g_current && writeback_flags_fit(g_head,g_begin,g_ring_size,size,256,true);
++}
++
+ Upload frame_upload_alloc(uint64_t size, uint64_t align) {
+     uint64_t at = (g_head + align - 1) & ~(align - 1);
+     if (at % g_ring_size + size > g_ring_size) at += g_ring_size - at % g_ring_size;  // never split: the next lap
+     while (at + size > g_tail + g_ring_size)  // the oldest submits' data is still read: wait for them
+         if (!retire_oldest()) {
+             // The submit's parts queued so far may still read its data: wait for them first.
+             if (g_current && g_current->waited < g_current->part) {
+                 VkFence fences[kMaxParts];
+                 wait_fences(fences, queued_fences(*g_current, g_current->part, fences));
+                 g_current->waited = g_current->part;
+             }
+             log("nvn/vk: upload buffer full (%llu bytes in this submit)", (unsigned long long)(at + size - g_begin));
+@@ -560,25 +599,32 @@ VkDescriptorSet frame_descriptor_set(VkDescriptorSetLayout layout) {
+     ai.descriptorSetCount = 1;
+     ai.pSetLayouts = &layout;
+     VkDescriptorSet set = VK_NULL_HANDLE;
+     if (p_vkAllocateDescriptorSets(vk_device(), &ai, &set) != VK_SUCCESS) log("nvn/vk: descriptor pool exhausted");
+     return set;
+ }
+
+ // nvn.h: what nvnQueueFenceSync records and nvnSyncWait / nvnQueueFinish wait for. The synchronous path has nothing
+ // in flight when the game gets control back: 0, and no wait. Pipelined submits are in flight, but nothing the game
+ // can observe depends on them: compute results are in guest memory when gpu_submit returns, the GPU reads its inputs
+ // from the ring (never from guest memory), and images, descriptor pools and ring stretches are kept until their
+ // submit is retired. So it is 0 there too, and those calls neither wait nor take the GPU lock.
+-uint64_t gpu_serial() { return async_gpu() && !pipelined() ? g_submitted.load() : 0; }
++uint64_t gpu_serial() {
++    if (resident_flights_on()) {
++        // A fence recorded concurrently with replay must include that submit once replay/writeback
++        // has returned, rather than capturing the previous serial while its first part is running.
++        std::lock_guard lk(gpu_lock()); return g_submitted.load();
++    }
++    return async_gpu() && !pipelined() ? g_submitted.load() : 0;
++}
+ uint64_t gpu_write_back_serial() { return async_gpu() && !pipelined() ? g_barrier.load() : 0; }
+
+ bool gpu_wait(uint64_t serial) {
+     if (!serial || pipelined() || g_completed >= serial) return false;
+     uint64_t t0 = plat::monotonic_ns();
+     std::lock_guard lk(gpu_lock());
+     if (g_completed < serial) retire_through(serial);
+     g_game_waits++, g_game_wait_ns += plat::monotonic_ns() - t0;
+     return true;
+ }
+
+ void free_retired_images(uint64_t completed) {
+diff --git a/runtime/src/nvn/nvn_sets.cpp b/runtime/src/nvn/nvn_sets.cpp
+index a49e435..be600a0 100644
+--- a/runtime/src/nvn/nvn_sets.cpp
++++ b/runtime/src/nvn/nvn_sets.cpp
+@@ -501,25 +501,27 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
+                                 (unsigned long long)r.address, s->hash.c_str(), (unsigned long long)r.size, int(written_overlaps(p, r.size)), nonzero,
+                                 (unsigned long long)nz, (long long)first, line.c_str());
+                         }
+                     }
+                     bool indexed = b.set == 0 && b.binding < 64 && (dynamic_uniform_bindings(s) >> b.binding & 1);
+                     info = buffer_of(cb, p, p ? std::min<uint64_t>(r.size, 0x10000) : 0, pad_min(indexed ? 0x10000 : 0x1000));
+                     break;
+                 }
+                 case NvnSource::StorageBuffer: {
+                     const uint8_t* p;
+                     uint64_t size;
+                     bool written = storage(s, b, st, p, size);
+-                    if (!written && s->stage != ShaderStage::Compute && written_overlaps(p, size)) written_count_bind();
++                    if (!written && s->stage != ShaderStage::Compute && written_overlaps(p,size) &&
++                        (!resident_flights_on() || FlightPolicy::later_storage_may_write(written_storage_bindings(s),b.binding)))
++                        written_count_bind();
+                     // At least 64 KB: Metal does not bound-check, and a shader writing past a small or missing
+                     // buffer overwrote the next data in the upload buffer (garbage everywhere after a compute).
+                     info = buffer_of(cb, p, size, written ? 0x10000 : pad_min(0x10000), written);
+                     break;
+                 }
+                 case NvnSource::DriverConstants: {
+                     if (const uint8_t* block = shared ? constants_block(s->stage, st) : nullptr) {
+                         Upload u = dedup_upload(block, 0x1000, 0x1000, 256);
+                         info = {u.buffer, u.offset, 0x1000};
+                         break;
+                     }
+                     auto c0 = driver_constants(s->stage, st);
+diff --git a/runtime/src/kernel.cpp b/runtime/src/kernel.cpp
+index 6c2ae0c..4efa3ca 100644
+--- a/runtime/src/kernel.cpp
++++ b/runtime/src/kernel.cpp
+@@ -808,25 +808,30 @@ static void svc_impl(CPU& c, uint32_t imm, uint64_t pc) {
+ // NX_SVC_PROFILE=1: wall time of the game main thread's kernel calls that took 30 us or more, by call and caller,
+ // logged every 600 frames (where the main thread sleeps: job barriers, mutexes, waits on the replay).
+ namespace {
+ thread_local int t_svc_role = 0;  // 1 game main, 2 the thread that presents
+ std::mutex g_svc_lock;
+ std::map<std::tuple<int, uint32_t, uint64_t>, std::pair<uint64_t, uint64_t>> g_svc_prof;  // (role, svc, pc) -> (ns, calls)
+ bool svc_profile_on() {
+     static const bool on = std::getenv("NX_SVC_PROFILE") != nullptr;
+     return on;
+ }
+ }  // namespace
+
+-void svc_profile_mark(int role) { t_svc_role = role; }
++void svc_profile_mark(int role) {
++    t_svc_role=role;
++    if (svc_profile_on())
++        log("svc profile thread: role=%d host_tid=%lld guest_id=%llu",role,
++            (long long)plat::current_thread_id(),(unsigned long long)(t_self ? t_self->id : 0));
++}
+
+ void svc_profile_report(uint64_t frames, int role) {
+     if (!svc_profile_on()) return;
+     std::lock_guard lk(g_svc_lock);
+     std::vector<std::pair<uint64_t, std::tuple<int, uint32_t, uint64_t>>> v;
+     uint64_t total = 0;
+     for (auto& [k, val] : g_svc_prof)
+         if (std::get<0>(k) == role) v.push_back({val.first, k}), total += val.first;
+     std::sort(v.rbegin(), v.rend());
+     log("svc profile: role %d thread blocked %.2f ms per frame in calls over 30 us (over %llu frames)", role,
+         double(total) / 1e6 / double(frames), (unsigned long long)frames);
+     for (size_t i = 0; i < v.size() && i < 8; i++) {

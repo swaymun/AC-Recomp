@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 import zlib
@@ -20,6 +21,7 @@ class FixtureCase(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.repo = Path(self.temp.name).resolve()
         subprocess.run(['git', 'init', '-q', str(self.repo)], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'config', 'core.autocrlf', 'false'], check=True)
         (self.repo / '.gitignore').write_text('.local/\n')
         self.out = self.repo / '.local/game-private/sample'
 
@@ -216,7 +218,7 @@ class ManifestTests(FixtureCase):
         self.out.mkdir(parents=True)
         log = self.out / 'progress.jsonl'
         # A malicious/mock child can print arbitrary secret-like material. Discard all of it.
-        rc = m.run_child(['python3', '-c', 'print("secret_fixture_value"); raise SystemExit(4)'], log, 'fixture')
+        rc = m.run_child([sys.executable, '-c', 'print("secret_fixture_value"); raise SystemExit(4)'], log, 'fixture')
         self.assertEqual(rc, 4)
         self.assertNotIn('secret_fixture_value', log.read_text())
         self.assertIn('exit_code', log.read_text())
@@ -285,7 +287,13 @@ source='0100000000001000 fixture.nsp/fixture.nca 1 -'
         def build(ref, out, log):
             mock_tool.chmod(0o700)
             return mock_tool, {'revision': m.PIN, 'fixture': True}
-        with patch.object(m, 'build_importer', build):
+        run_child = m.run_child
+        def run_fixture(command, log, phase, **kw):
+            # Windows does not execute Python shebangs through CreateProcess.
+            if command[0] == str(mock_tool):
+                command = [sys.executable, *command]
+            return run_child(command, log, phase, **kw)
+        with patch.object(m, 'build_importer', build), patch.object(m, 'run_child', run_fixture):
             m.execute(args)
             manifest = json.loads((self.out / '.wrapper/manifest.json').read_text())
             self.assertEqual(manifest['title_id'], '0100000000001000')

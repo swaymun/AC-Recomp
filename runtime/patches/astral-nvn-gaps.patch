@@ -1,0 +1,728 @@
+diff --git a/runtime/src/nvn/nvn.h b/runtime/src/nvn/nvn.h
+index 433dc68..62aaff4 100644
+--- a/runtime/src/nvn/nvn.h
++++ b/runtime/src/nvn/nvn.h
+@@ -309,6 +309,8 @@ VkFormat vk_vertex_format(uint32_t format);
+ // objects (blend, depth/stencil, vertex layouts, ...) are decoded when recorded, through the SDK driver's getters,
+ // and kept in the list's blobs: the game may reuse its structs right after the call.
+
++struct CommandFence;
++
+ struct Cmd {
+     enum Op : uint8_t {
+         SetRenderTargets, ClearColor, ClearDepthStencil, SetViewport, SetScissor, CallList,
+@@ -319,12 +321,14 @@ struct Cmd {
+         BindImage, DispatchCompute,
+         SetStencilRef, SetStencilMask, SetStencilValueMask, SetPolygonOffsetClamp, SetDepthBounds, SetDepthClamp,
+         BindDeferred,  // mask: 0 textures, 1 images, 2 uniform buffers, 3 storage buffers; a[0] the guest array
++        DrawElementsIndirect, FenceSync, SetAlphaRef, SetLineWidth,
+         BindMultisampleState,  // n: alpha to coverage enabled (nvn_state.cpp)
+     } op;
+     uint32_t n = 0, mask = 0;
+     uint64_t a[9] = {};  // textures (render targets: colors then depth), handles, GPU addresses, sizes, ...
+     float f[4] = {};
+     int32_t i[4] = {};
++    std::shared_ptr<CommandFence> fence;  // retained across command-list copies and sync finalization
+     uint32_t blob = 0;  // index into CmdList::blobs (decoded state, inline data)
+ };
+
+@@ -391,7 +395,7 @@ void record(uint64_t cmdbuf, Cmd cmd, const void* blob = nullptr, size_t size =
+ // uses, taken on the game's thread at nvnQueueSubmitCommands, keyed by array address.
+ using DeferredValues = std::unordered_map<uint64_t, std::vector<uint64_t>>;
+ DeferredValues deferred_snapshot(const std::vector<std::shared_ptr<CmdList>>& lists);
+-void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_ptr<const DeferredValues> deferred = {});
++bool gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_ptr<const DeferredValues> deferred = {}, bool wait_done = false);
+ const DeferredValues* current_deferred();  // the submit being replayed
+ // nvn_worker.cpp: the replay thread. worker_run queues a job (runs it at once when the thread is off) and returns its
+ // serial (0: done); worker_wait waits for a serial; worker_finish for everything queued so far.
+diff --git a/runtime/src/nvn/nvn_draw.cpp b/runtime/src/nvn/nvn_draw.cpp
+index a4d846e..86fbc7d 100644
+--- a/runtime/src/nvn/nvn_draw.cpp
++++ b/runtime/src/nvn/nvn_draw.cpp
+@@ -12,6 +12,7 @@
+ #include <set>
+
+ #include "nvn_draw_state.h"
++#include "nvn_gap_helpers.h"
+ #include "nvn_ultrawide.h"
+ #include "platform.h"
+
+@@ -399,6 +400,17 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
+     key.color = g_state.color, key.mask = g_state.mask, key.depth = g_state.depth, key.polygon = g_state.polygon;
+     key.color_count = t.color_count, key.depth_clamp = g_state.depth_clamp;
+     key.alpha_to_coverage = g_state.alpha_to_coverage;
++    if (key.color.alpha_test > 0 && key.color.alpha_test < 8) key.alpha_ref = g_state.alpha_ref;
++    static const auto line_limits = [] {
++        VkPhysicalDeviceProperties properties{};
++        p_vkGetPhysicalDeviceProperties(vk_physical(), &properties);
++        return std::array<float, 2>{properties.limits.lineWidthRange[0], properties.limits.lineWidthRange[1]};
++    }();
++    key.line_width = supported_line_width(g_state.line_width, vk_features().wideLines, line_limits[0], line_limits[1]);
++    static std::set<uint32_t> alpha_seen;
++    if (alpha_seen.insert(key.color.alpha_test).second)
++        log("nvn: draw alpha test mode %u, reference %g (specialized fragment discard when active)",
++            key.color.alpha_test, g_state.alpha_ref);
+     for (uint32_t k = 0; k < t.color_count; k++) {
+         GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
+         key.color_formats[k] = img ? view_format(*img, t.views.format[k]) : unused_slot_format();
+@@ -513,11 +525,11 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
+             g_bound.has_index = true, g_bound.index = in.index, g_bound.index_type = in.index_type, g_state_set++;
+         }
+         bool q = zero_draws_on() && zero_draws_begin(cb, vs->hash + " " + (fs ? fs->hash : std::string("-")));
+-        p_vkCmdDrawIndexed(cb, count, uint32_t(std::max(1, c.i[3])), 0, c.i[1], uint32_t(c.i[2]));
++        p_vkCmdDrawIndexed(cb, count, uint32_t(c.i[3]), 0, c.i[1], uint32_t(c.i[2]));
+         if (q) zero_draws_end(cb);
+     } else {
+         bool q = zero_draws_on() && zero_draws_begin(cb, vs->hash + " " + (fs ? fs->hash : std::string("-")));
+-        p_vkCmdDraw(cb, uint32_t(c.i[1]), uint32_t(std::max(1, c.i[3])), uint32_t(c.i[0]), uint32_t(c.i[2]));
++        p_vkCmdDraw(cb, uint32_t(c.i[1]), uint32_t(c.i[3]), uint32_t(c.i[0]), uint32_t(c.i[2]));
+         if (q) zero_draws_end(cb);
+     }
+     g_stats.done++;
+diff --git a/runtime/src/nvn/nvn_draw_state.cpp b/runtime/src/nvn/nvn_draw_state.cpp
+index fc9c389..f31b101 100644
+--- a/runtime/src/nvn/nvn_draw_state.cpp
++++ b/runtime/src/nvn/nvn_draw_state.cpp
+@@ -32,6 +32,9 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
+         return c.blob < list.blobs.size() && list.blobs[c.blob].size() >= size ? list.blobs[c.blob].data() : nullptr;
+     };
+     switch (c.op) {
++        case Cmd::SetAlphaRef: s.alpha_ref = c.f[0]; break;
++        case Cmd::SetLineWidth: s.line_width = c.f[0]; break;
++        case Cmd::FenceSync: break;  // completed after this submit's GPU fence, never during recording
+         case Cmd::SetViewport:
+             std::memcpy(s.viewport, c.i, sizeof s.viewport), s.has_viewport = true;
+             break;
+diff --git a/runtime/src/nvn/nvn_draw_state.h b/runtime/src/nvn/nvn_draw_state.h
+index 65ae7bd..814cd35 100644
+--- a/runtime/src/nvn/nvn_draw_state.h
++++ b/runtime/src/nvn/nvn_draw_state.h
+@@ -15,6 +15,21 @@ struct Range {
+     uint64_t address = 0, size = 0;
+ };
+
++inline bool decode_indexed_indirect(const Cmd& indirect, const uint8_t* bytes, Cmd& draw) {
++    if (!bytes || indirect.mask > 2) fatal("nvn: invalid indexed indirect address or index type");
++    uint32_t args[5];
++    std::memcpy(args, bytes, sizeof args);
++    if (!args[0] || !args[1]) return false;  // zero instances must not become one
++    const uint64_t offset = uint64_t(args[2]) * (1u << indirect.mask);
++    if (offset > UINT64_MAX - indirect.a[0]) fatal("nvn: indexed indirect address overflow");
++    draw = Cmd{Cmd::DrawElements};
++    draw.n = indirect.n, draw.mask = indirect.mask;
++    draw.a[0] = indirect.a[0] + offset;
++    draw.i[0] = int32_t(args[0]), draw.i[1] = int32_t(args[3]);
++    draw.i[2] = int32_t(args[4]), draw.i[3] = int32_t(args[1]);
++    return true;
++}
++
+ struct State {
+     uint64_t program = 0;
+ #if defined(NX_ASTRAL_STRICT)
+@@ -31,6 +46,7 @@ struct State {
+     ChannelMaskInfo mask;
+     DepthStencilInfo depth;
+     PolygonInfo polygon;
++    float alpha_ref = 0, line_width = 1;
+     float blend_color[4] = {};
+     int32_t viewport[4] = {}, scissor[4] = {};
+     bool rasterizer_discard = false, render_enable = true;  // SetRasterizerDiscard / SetRenderEnable: draws skipped
+diff --git a/runtime/src/nvn/nvn_frames.cpp b/runtime/src/nvn/nvn_frames.cpp
+index 45a9859..18e6263 100644
+--- a/runtime/src/nvn/nvn_frames.cpp
++++ b/runtime/src/nvn/nvn_frames.cpp
+@@ -140,7 +140,7 @@ void wait_fences(const VkFence* fences, uint32_t n) {
+     VkResult r = p_vkWaitForFences(vk_device(), n, fences, VK_TRUE, kFenceTimeout);
+     if (r == VK_TIMEOUT) gpu_hung("a submit did not finish in 2 s");
+     if (r == VK_ERROR_DEVICE_LOST) gpu_hung("vkWaitForFences");
+-    if (r != VK_SUCCESS) log("nvn/vk: vkWaitForFences failed (%d)", int(r));
++    if (r != VK_SUCCESS) fatal("nvn/vk: vkWaitForFences failed (%d)", int(r));
+     g_times.fence_ns += plat::monotonic_ns() - t0;
+ }
+
+@@ -252,7 +252,7 @@ bool submit_part(VkCommandBuffer cb, VkFence fence, VkSemaphore wait, VkSemaphor
+     VkResult r = p_vkQueueSubmit(vk_queue(), 1, &si, fence);
+     g_times.encode_ns += plat::monotonic_ns() - t0;
+     if (r == VK_ERROR_DEVICE_LOST) gpu_hung("vkQueueSubmit");
+-    if (r != VK_SUCCESS) log("nvn/vk: vkQueueSubmit failed (%d)", int(r));
++    if (r != VK_SUCCESS) fatal("nvn/vk: vkQueueSubmit failed (%d)", int(r));
+     return r == VK_SUCCESS;
+ }
+
+diff --git a/runtime/src/nvn/nvn_gap_helpers.h b/runtime/src/nvn/nvn_gap_helpers.h
+new file mode 100644
+index 0000000..697fc22
+--- /dev/null
++++ b/runtime/src/nvn/nvn_gap_helpers.h
+@@ -0,0 +1,109 @@
++// Original NVN gap helpers. No guest shader bytes or game constants belong here.
++#pragma once
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <map>
++#include <vector>
++
++namespace nx::nvn {
++constexpr uint32_t kAlphaRefSpecId = 0xAC14;
++inline float supported_line_width(float requested, bool wide, float lo, float hi) {
++    if (!std::isfinite(requested) || requested <= 0) fatal("nvn: invalid line width");
++    return wide ? std::clamp(requested, lo, hi) : 1.0f;
++}
++
++// Reject impossible compute-copy ranges before pointer arithmetic or host allocations.
++inline bool written_range_fits(uint64_t address, uint64_t size, uint64_t padded, uint64_t capacity) {
++    return address && size && size <= UINTPTR_MAX - address && padded >= size && padded <= capacity;
++}
++inline bool written_copy_fits(uint64_t size, uint64_t off, uint64_t padded, uint64_t capacity) {
++    constexpr uint64_t tail = 0x10000 + 16, align = 256;
++    return capacity >= tail + align && size <= capacity - tail - align &&
++           padded <= capacity - align && off <= capacity - align - padded;
++}
++
++// Add a specialization-controlled alpha comparison at each normal exit of the fragment entry point.
++// The translator emits location 0 as a float4 Output variable. Unrecognized active layouts fail visibly.
++inline bool patch_alpha_test(std::vector<uint32_t>& code, uint32_t func) {
++    if (func == 0 || func == 8) return true;  // unbound/default state, ALWAYS
++    if (func > 8 || code.size() < 5) return false;
++    uint32_t entry = 0, output = 0, float_t = 0, bool_t = 0, vector_t = 0;
++    size_t types_at = 0, functions_at = 0;
++    std::map<uint32_t, uint32_t> locations, pointers, variables;
++    std::map<uint32_t, std::pair<uint32_t, uint32_t>> vectors;
++    for (size_t i = 5; i < code.size();) {
++        const uint32_t wc = code[i] >> 16, op = code[i] & 0xffff;
++        if (!wc || i + wc > code.size()) return false;
++        if (!types_at && op >= 19 && op <= 39) types_at = i;
++        if (!functions_at && op == 54) functions_at = i;
++        if (op == 15 && wc >= 4 && code[i+1] == 4) {
++            if (entry) return false;  // multiple fragment entry points need per-entry interface selection
++            entry = code[i+2];
++        }
++        if (op == 71 && wc >= 4 && code[i+2] == 30) locations[code[i+1]] = code[i+3];
++        if (op == 71 && wc >= 4 && code[i+2] == 1 && code[i+3] == kAlphaRefSpecId) return false;
++        if (op == 20 && wc == 2) bool_t = code[i+1];
++        if (op == 22 && wc == 3 && code[i+2] == 32) float_t = code[i+1];
++        if (op == 23 && wc == 4) vectors[code[i+1]] = {code[i+2], code[i+3]};
++        if (op == 32 && wc == 4 && code[i+2] == 3) pointers[code[i+1]] = code[i+3];
++        if (op == 59 && wc >= 4 && code[i+3] == 3) variables[code[i+2]] = code[i+1];
++        i += wc;
++    }
++    if (!entry || !types_at || !functions_at) return false;
++    for (const auto& [id, loc] : locations) {
++        auto var = variables.find(id);
++        if (loc || var == variables.end()) continue;
++        auto ptr = pointers.find(var->second);
++        if (ptr == pointers.end()) return false;
++        auto vec = vectors.find(ptr->second);
++        if (vec == vectors.end() || vec->second.first != float_t || vec->second.second != 4) return false;
++        output = id, vector_t = ptr->second;
++    }
++    uint32_t bound = code[3];
++    auto id = [&] { return bound++; };
++    std::vector<uint32_t> declarations, annotations, out(code.begin(), code.begin()+5);
++    auto emit = [](std::vector<uint32_t>& dst, uint32_t op, std::initializer_list<uint32_t> args) {
++        dst.push_back((uint32_t(args.size()+1) << 16) | op);
++        dst.insert(dst.end(), args.begin(), args.end());
++    };
++    if (!bool_t) { bool_t = id(); emit(declarations, 20, {bool_t}); }
++    if (!float_t) { float_t = id(); emit(declarations, 22, {float_t, 32}); }
++    uint32_t ref = id(), one = id();
++    emit(declarations, 50, {float_t, ref, 0});  // OpSpecConstant float, default 0
++    emit(declarations, 43, {float_t, one, 0x3f800000});
++    emit(annotations, 71, {ref, 1, kAlphaRefSpecId});
++    uint32_t function = 0;
++    const uint32_t compare[] = {0, 0, 184, 180, 188, 186, 183, 190};
++    for (size_t i = 5; i < code.size();) {
++        uint32_t wc = code[i] >> 16, op = code[i] & 0xffff;
++        if (i == types_at) out.insert(out.end(), annotations.begin(), annotations.end());
++        if (i == functions_at) out.insert(out.end(), declarations.begin(), declarations.end());
++        if (op == 54) function = code[i+2];
++        // Fixed-function alpha test discards before depth/stencil writes. EarlyFragmentTests would defeat it.
++        if (op == 16 && wc == 3 && code[i+1] == entry && code[i+2] == 9) { i += wc; continue; }
++        if (op == 253 && function == entry) {
++            if (func == 1) { emit(out, 252, {}); i += wc; continue; }  // NEVER
++            uint32_t alpha = one;
++            if (output) {
++                uint32_t value = id(); alpha = id();
++                emit(out, 61, {vector_t, value, output});
++                emit(out, 81, {float_t, alpha, value, 3});
++            }
++            uint32_t pass = id(), merge = id(), kill = id();
++            emit(out, compare[func], {bool_t, pass, alpha, ref});
++            emit(out, 247, {merge, 0});
++            emit(out, 250, {pass, merge, kill});
++            emit(out, 248, {kill}); emit(out, 252, {});
++            emit(out, 248, {merge});
++        }
++        out.insert(out.end(), code.begin()+i, code.begin()+i+wc);
++        if (op == 56) function = 0;
++        i += wc;
++    }
++    out[3] = bound;
++    code.swap(out);
++    return true;
++}
++}  // namespace nx::nvn
+diff --git a/runtime/src/nvn/nvn_pipeline.cpp b/runtime/src/nvn/nvn_pipeline.cpp
+index 1105674..30f86b5 100644
+--- a/runtime/src/nvn/nvn_pipeline.cpp
++++ b/runtime/src/nvn/nvn_pipeline.cpp
+@@ -16,6 +16,7 @@
+ #include <unordered_map>
+
+ #include "nvn_pipeline.h"
++#include "nvn_gap_helpers.h"
+ #include "nvn_ultrawide.h"
+ #include "platform.h"
+ #if defined(NX_ASTRAL_STRICT) && defined(__APPLE__)
+@@ -85,18 +86,20 @@ VkShaderStageFlags stage_bit(ShaderStage s) {
+
+ // `kinds`: per vertex input location, 0 float or the integer kind of its attribute format (vertex_int_kind).
+ // `unwritten`: fragment input locations the vertex stage does not write (default_unwritten_inputs).
+-VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr, uint32_t unwritten = 0) {
+-    static std::map<std::tuple<const ShaderInfo*, std::string, uint32_t>, VkShaderModule> cache;
++VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr, uint32_t unwritten = 0, uint32_t alpha_func = 8) {
++    static std::map<std::tuple<const ShaderInfo*, std::string, uint32_t, uint32_t>, VkShaderModule> cache;
+     // The integer-vertex-input patch (skinned models' bone indices; without it Metal refuses every character's
+     // pipeline, DEBUG.md #25/#26). NX_INT_ATTRIBS=0 turns it off.
+     static const char* int_env = std::getenv("NX_INT_ATTRIBS");
+     static const bool off = int_env && int_env[0] == '0';
+     std::string k = kinds && !off ? std::string(reinterpret_cast<const char*>(kinds), 16) : std::string(16, '\0');
+-    auto& m = cache[{s, k, unwritten}];
++    auto& m = cache[{s, k, unwritten, alpha_func}];
+     if (!m) {
+         bool is_patched = false;
+         const uint8_t* int_kinds = k != std::string(16, '\0') ? reinterpret_cast<const uint8_t*>(k.data()) : nullptr;
+         std::vector<uint32_t> code = patched_spirv(s, int_kinds, unwritten, &is_patched);
++        if (s->stage == ShaderStage::Fragment && !patch_alpha_test(code, alpha_func))
++            fatal("nvn: cannot emulate active alpha test for fragment shader %s", s->hash.c_str());
+         if (s->stage == ShaderStage::Vertex && uw_on()) {  // NX_ULTRAWIDE: gl_Position.x * spec constant 0
+             std::vector<uint32_t> scaled;
+             if (patch_x_scale(code, scaled)) code.swap(scaled);
+@@ -280,6 +283,7 @@ std::string state_bytes(const PipelineKey& k) {
+     PipelineKey c;
+     std::memset(&c, 0, sizeof c);
+     c.topology = k.topology;
++    c.alpha_ref = k.alpha_ref; c.line_width = k.line_width;
+     for (int i = 0; i < 16; ++i) {
+         c.attribs[i].format = k.attribs[i].format;
+         c.attribs[i].offset = k.attribs[i].offset;
+@@ -544,6 +548,8 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
+
+     VkPipelineShaderStageCreateInfo stages[2]{};
+     VkSpecializationInfo spec_info{};
++    VkSpecializationMapEntry alpha_entry{kAlphaRefSpecId, 0, sizeof(float)};
++    VkSpecializationInfo alpha_spec{1, &alpha_entry, sizeof(float), &key.alpha_ref};
+     float uw_x_value = 1.0f;
+     uint32_t nstages = 0;
+     uint8_t int_kinds[16] = {};
+@@ -569,8 +575,10 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
+         auto& st = stages[nstages++];
+         st.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+         st.stage = VkShaderStageFlagBits(stage_bit(s->stage));
+-        st.module = module_of(s, s == key.vs ? int_kinds : nullptr, s == key.fs ? unwritten : 0);
++        st.module = module_of(s, s == key.vs ? int_kinds : nullptr, s == key.fs ? unwritten : 0, s == key.fs ? key.color.alpha_test : 8);
+         st.pName = "main";
++        if (s == key.fs && key.color.alpha_test > 0 && key.color.alpha_test < 8)
++            st.pSpecializationInfo = &alpha_spec;
+         if (s == key.vs && key.uw_x > 0) {  // NX_ULTRAWIDE: constant 0 of the patched vertex module
+             static VkSpecializationMapEntry entry{0, 0, sizeof(float)};
+             spec_info = {1, &entry, sizeof(float), &uw_x_value};
+@@ -629,7 +637,7 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
+     // NVNfrontFace CW 0 / CCW 1, taken as is: the draws use a negative-height viewport (nvn_draw.cpp) that gives NVN's
+     // upper-left-origin mapping, so windings match NVN's.
+     rs.frontFace = key.polygon.front == 0 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+-    rs.lineWidth = 1.0f;
++    rs.lineWidth = key.line_width;
+     // SetDepthClamp: clamps instead of clipping at the near and far planes, like depthClampEnable (a device feature;
+     // nvn_vk.cpp enables every core feature the GPU has, and MoltenVK has it through Metal's depth clip mode).
+     rs.depthClampEnable = key.depth_clamp && vk_features().depthClamp ? VK_TRUE : VK_FALSE;
+diff --git a/runtime/src/nvn/nvn_pipeline.h b/runtime/src/nvn/nvn_pipeline.h
+index c92e533..dd24e24 100644
+--- a/runtime/src/nvn/nvn_pipeline.h
++++ b/runtime/src/nvn/nvn_pipeline.h
+@@ -75,6 +75,7 @@ struct PipelineKey {
+     uint32_t depth_clamp = 0;  // SetDepthClamp (applied only where the device has the depthClamp feature)
+     uint32_t ufloat_colors = 0;  // bit k: colour target k is R11G11B10F (no alpha: destination alpha reads 1)
+     uint32_t alpha_to_coverage = 0;  // BindMultisampleState (G7)
++    float alpha_ref = 0, line_width = 1;
+     float uw_x = 0;  // NX_ULTRAWIDE: gl_Position.x scale of the vertex stage (0: none, the module has no constant)
+ };
+ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout);
+diff --git a/runtime/src/nvn/nvn_queue.cpp b/runtime/src/nvn/nvn_queue.cpp
+index fd58862..28b6b3e 100644
+--- a/runtime/src/nvn/nvn_queue.cpp
++++ b/runtime/src/nvn/nvn_queue.cpp
+@@ -38,6 +38,30 @@ extern std::atomic<uint64_t> g_tick_calls, g_yield_calls, g_sleep_calls;
+ }
+ namespace nx::nvn {
+
++// One retained completion per command-fence execution. A reused list receives a fresh completion on
++// each submission, so an older queued execution cannot release a wait on a newer one.
++struct FenceCompletion {
++    std::mutex mutex;
++    std::condition_variable cv;
++    bool done = false;
++    void signal() { { std::lock_guard lk(mutex); done = true; } cv.notify_all(); }
++    uint32_t wait(uint64_t timeout) {
++        std::unique_lock lk(mutex);
++        if (done) return 0;  // ALREADY_SIGNALED
++        if (!timeout) return 2;  // TIMEOUT_EXPIRED
++        if (timeout == UINT64_MAX) cv.wait(lk, [&] { return done; });
++        else if (!cv.wait_for(lk, std::chrono::nanoseconds(std::min<uint64_t>(timeout, INT64_MAX)),
++                              [&] { return done; })) return 2;
++        return 1;  // CONDITION_SATISFIED
++    }
++};
++struct CommandFence {
++    uint64_t guest = 0;
++    bool submitted = false;
++    std::shared_ptr<FenceCompletion> completion = std::make_shared<FenceCompletion>();
++};
++std::mutex g_command_fence_lock;  // protects recording/submission's association with a sync
++
+ // Submits the game made and submits whose replay (and GPU work, write-backs) finished. The game records the next frame
+ // on one thread while another submits the last one, and our replay runs inside nvnQueueSubmitCommands: a fence the
+ // game waits on must not pass before the submits it follows were replayed, or the game rewrites the next frame's
+@@ -128,6 +152,7 @@ namespace {
+ // ---- syncs ------------------------------------------------------------------------------------------------------
+
+ struct Sync : Object {
++    std::shared_ptr<FenceCompletion> command_completion;  // protected by g_command_fence_lock
+     std::atomic<bool> signaled{false};
+     std::atomic<uint64_t> serial{0};  // NX_ASYNC_GPU: the submit it waits for (0: none; always 0 otherwise)
+     std::atomic<uint64_t> job{0};     // the replay-thread job that fences it (0: none)
+@@ -142,12 +167,20 @@ void SyncInitialize(CPU& c) {  // NVNboolean (NVNsync*, NVNdevice*)
+ void SyncFinalize(CPU& c) { destroy(c.x[0]); }
+
+ void signal_sync(uint64_t guest) {
++    std::lock_guard lk(g_command_fence_lock);
++    if (auto* s = get<Sync>(guest)) s->command_completion.reset();
+     if (auto* s = get<Sync>(guest)) s->serial = 0, s->job = 0, s->seq = 0, s->signaled = true;
+ }
+
+ // NVNsyncWaitResult (const NVNsync*, u64 timeout). Always 0 (already signaled), as before: a fenced submit is waited
+ // for whatever the timeout, 2 s at most (then the GPU hung and the process ends). Correct results before latency.
+ void SyncWait(CPU& c) {
++    std::shared_ptr<FenceCompletion> completion;
++    {
++        std::lock_guard lk(g_command_fence_lock);
++        if (auto* s = get<Sync>(c.x[0])) completion = s->command_completion;
++    }
++    if (completion) { c.x[0] = completion->wait(c.x[1]); return; }
+     auto* s = get<Sync>(c.x[0]);
+     tl("syncwait>");
+     if (s) wait_submits(s->seq.load(), kWaitSync);
+@@ -157,9 +190,46 @@ void SyncWait(CPU& c) {
+     c.x[0] = 0;
+ }
+
++void CommandBufferFenceSync(CPU& c) {
++    if (uint32_t(c.x[2]) > 1) fatal("nvn: unsupported fence condition");
++    Cmd cmd{Cmd::FenceSync};
++    cmd.fence = std::make_shared<CommandFence>();
++    cmd.fence->guest = c.x[1];
++    {
++        std::lock_guard lk(g_command_fence_lock);
++        auto* s = get<Sync>(c.x[1]);
++        if (!s) fatal("nvn: command fence on unknown sync");
++        s->command_completion = cmd.fence->completion;
++    }
++    record(c.x[0], cmd);
++}
++
++using FenceCompletions = std::vector<std::shared_ptr<FenceCompletion>>;
++void arm_command_fences(const CmdList& list, int depth, FenceCompletions& out) {
++    for (const Cmd& cmd : list.cmds) {
++        if (cmd.op == Cmd::CallList && depth < 8) {
++            if (auto called = command_list(cmd.a[0])) arm_command_fences(*called, depth + 1, out);
++        }
++        if (cmd.op != Cmd::FenceSync || !cmd.fence) continue;
++        std::lock_guard lk(g_command_fence_lock);
++        auto& f = *cmd.fence;
++        if (f.submitted) f.completion = std::make_shared<FenceCompletion>();
++        f.submitted = true;
++        if (auto* s = get<Sync>(f.guest)) s->command_completion = f.completion;
++        out.push_back(f.completion);
++    }
++}
++
+ // ---- queues -----------------------------------------------------------------------------------------------------
+
+
++std::atomic<uint32_t> g_window_origin{1};  // preserve the existing upper-left host convention
++void DeviceSetWindowOriginMode(CPU& c) {
++    if (uint32_t(c.x[1]) != 1) fatal("nvn: lower-left window origin needs viewport, copy and presentation support");
++    g_window_origin = 1;
++}
++void DeviceGetWindowOriginMode(CPU& c) { c.x[0] = g_window_origin.load(); }
++
+ void QueueInitialize(CPU& c) { c.x[0] = 1; }  // NVNboolean (NVNqueue*, const NVNqueueBuilder*)
+ void QueueFinalize(CPU&) {}
+ void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHandle*)
+@@ -188,10 +258,18 @@ void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHa
+         std::lock_guard lk(g_sub_lock);
+         g_sub_called++;
+     }
++    FenceCompletions fences;
++    for (const auto& list : lists) arm_command_fences(*list, 0, fences);
+     tl("submit-call");
+-    worker_run([lists = std::move(lists), deferred] {
++    worker_run([lists = std::move(lists), deferred, fences = std::move(fences)] {
+         tl("replay>");
+-        gpu_submit(lists, deferred);
++        if (!gpu_submit(lists, deferred, !fences.empty())) fatal("nvn: GPU submission failed");
++        // Conservative ALL_COMMANDS completion, also for GRAPHICS_WORLD_SPACE: preceding work and
++        // this submit's write-backs are complete. Never publish a signal while the GPU is in flight.
++        for (const auto& completion : fences) completion->signal();
++        static uint64_t signaled = 0;
++        if (!fences.empty() && ++signaled <= 8)
++            log("nvn: command fences completed after GPU submission (%zu)", fences.size());
+         tl("replay<");
+         submit_done();
+     });
+@@ -204,6 +282,8 @@ void QueueFinish(CPU&) {
+ }
+ // (NVNqueue*, NVNsync*, NVNsyncCondition, int flags): every condition taken as "all previous work complete".
+ void QueueFenceSync(CPU& c) {
++    { std::lock_guard lk(g_command_fence_lock);
++      if (auto* s = get<Sync>(c.x[1])) s->command_completion.reset(); }
+     uint64_t guest = c.x[1];  // the fence goes after the work queued so far: its serial is taken on the replay thread
+     if (auto* s = get<Sync>(guest)) {
+         s->signaled = true;
+@@ -641,9 +721,12 @@ int pipeline_depth_mode() {
+     return g_depth_mode;
+ }
+ #endif
++NX_HLE("nvnCommandBufferFenceSync", CommandBufferFenceSync);
+ NX_HLE("nvnSyncInitialize", SyncInitialize);
+ NX_HLE("nvnSyncFinalize", SyncFinalize);
+ NX_HLE("nvnSyncWait", SyncWait);
++NX_HLE("nvnDeviceSetWindowOriginMode", DeviceSetWindowOriginMode);
++NX_HLE("nvnDeviceGetWindowOriginMode", DeviceGetWindowOriginMode);
+ NX_HLE("nvnQueueInitialize", QueueInitialize);
+ NX_HLE("nvnQueueFinalize", QueueFinalize);
+ NX_HLE("nvnQueueSubmitCommands", QueueSubmitCommands);
+diff --git a/runtime/src/nvn/nvn_replay.cpp b/runtime/src/nvn/nvn_replay.cpp
+index 4a3f02e..59959d8 100644
+--- a/runtime/src/nvn/nvn_replay.cpp
++++ b/runtime/src/nvn/nvn_replay.cpp
+@@ -75,6 +75,24 @@ void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth
+                     }
+                 }
+                 break;
++            case Cmd::DrawElementsIndirect: {
++                // Prior submits' write-backs are visible at begin(true). Only current replay writes
++                // need a checkpoint; written_read keeps 16/32-bit GPU index data ordered on the GPU.
++                const uint8_t* args = replay::guest_bytes(c.a[1]);
++                if (replay::written_separate() || replay::written_overlaps(args, 20))
++                    cb = replay_checkpoint(cb);
++                Cmd draw{Cmd::DrawElements};
++                if (replay::decode_indexed_indirect(c, replay::guest_bytes(c.a[1]), draw)) {
++                    if (c.mask == 0 && replay::written_overlaps(replay::guest_bytes(draw.a[0]), uint32_t(draw.i[0])))
++                        cb = replay_checkpoint(cb);  // 8-bit indices are widened on the CPU
++                    static uint64_t n = 0;
++                    if (++n <= 8) log("nvn: indexed indirect replay %llu: count %u instances %u first-address %llx base-vertex %d base-instance %u",
++                        (unsigned long long)n, uint32_t(draw.i[0]), uint32_t(draw.i[3]),
++                        (unsigned long long)draw.a[0], draw.i[1], uint32_t(draw.i[2]));
++                    draw_command(cb, draw, list, st);
++                }
++                break;
++            }
+             case Cmd::CopyTextureToTexture:
+                 draw_end_rendering(cb, 5);
+                 if (gpu_profile_on()) gpu_profile_mark(cb, "texture copies");
+diff --git a/runtime/src/nvn/nvn_state.cpp b/runtime/src/nvn/nvn_state.cpp
+index 38a216e..07cd64b 100644
+--- a/runtime/src/nvn/nvn_state.cpp
++++ b/runtime/src/nvn/nvn_state.cpp
+@@ -274,6 +274,27 @@ void DrawElements(CPU& c) { draw_elements(c, 0, 0, 1); }
+ void DrawElementsBaseVertex(CPU& c) { draw_elements(c, int32_t(c.x[5]), 0, 1); }
+ void DrawElementsInstanced(CPU& c) { draw_elements(c, int32_t(c.x[5]), int32_t(c.x[6]), int32_t(c.x[7])); }
+
++void DrawElementsIndirect(CPU& c) {
++    static std::atomic<bool> logged{false};
++    if (!logged.exchange(true)) log("nvn: indexed indirect command recorded for ordered replay");
++    g_recorded_draws++;
++    Cmd cmd{Cmd::DrawElementsIndirect};
++    cmd.n = uint32_t(c.x[1]);
++    cmd.mask = uint32_t(c.x[2]);
++    cmd.a[0] = c.x[3];  // index buffer base
++    cmd.a[1] = c.x[4];  // one packed 20-byte NVN indexed-indirect record, no stride argument
++    record(c.x[0], cmd);  // do not snapshot arguments here: earlier dispatches may write them
++}
++void SetAlphaRef(CPU& c) {
++    Cmd cmd{Cmd::SetAlphaRef};
++    cmd.f[0] = c.v[0].f32[0];
++    record(c.x[0], cmd);
++}
++void SetLineWidth(CPU& c) {
++    Cmd cmd{Cmd::SetLineWidth};
++    cmd.f[0] = c.v[0].f32[0];
++    record(c.x[0], cmd);
++}
+ void ignore(CPU&) {}
+
+ // ReportCounter(cmd, NVNcounterType, NVNbufferAddress): the GPU writes {u64 value, u64 timestamp} there when it gets
+@@ -315,6 +336,9 @@ NX_HLE("nvnCommandBufferSetBlendColor", SetBlendColor);
+ NX_HLE("nvnCommandBufferSetDepthRange", SetDepthRange);
+ NX_HLE("nvnCommandBufferDrawArrays", DrawArrays);
+ NX_HLE("nvnCommandBufferDrawArraysInstanced", DrawArraysInstanced);
++NX_HLE("nvnCommandBufferDrawElementsIndirect", DrawElementsIndirect);
++NX_HLE("nvnCommandBufferSetAlphaRef", SetAlphaRef);
++NX_HLE("nvnCommandBufferSetLineWidth", SetLineWidth);
+ NX_HLE("nvnCommandBufferDrawElements", DrawElements);
+ NX_HLE("nvnCommandBufferDrawElementsBaseVertex", DrawElementsBaseVertex);
+ NX_HLE("nvnCommandBufferDrawElementsInstanced", DrawElementsInstanced);
+diff --git a/runtime/src/nvn/nvn_vk.cpp b/runtime/src/nvn/nvn_vk.cpp
+index 90fe279..9a88a3e 100644
+--- a/runtime/src/nvn/nvn_vk.cpp
++++ b/runtime/src/nvn/nvn_vk.cpp
+@@ -427,6 +427,8 @@ uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
+     return 0;
+ }
+
++uint64_t upload_capacity() { return g_upload_size; }
++
+ Upload upload_alloc(uint64_t size, uint64_t align) {
+     if (async_gpu()) return frame_upload_alloc(size, align);
+     uint64_t at = (g_upload_used + align - 1) & ~(align - 1);
+@@ -525,10 +527,11 @@ void end_and_wait(VkSemaphore wait, VkSemaphore signal) {
+     bool queued = check(p_vkQueueSubmit(g_queue, 1, &si, g_fence), "vkQueueSubmit");
+     uint64_t t1 = plat::monotonic_ns();
+     // 2 s at most: a frame's work takes milliseconds; longer is a shader that does not end.
++    if (!queued) fatal("nvn: failed to queue synchronous GPU submission");
+     if (queued) {
+         VkResult w = p_vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, 2'000'000'000ull);
+         if (w == VK_TIMEOUT) gpu_hung("a submit did not finish in 2 s");
+-        check(w, "vkWaitForFences");
++        if (!check(w, "vkWaitForFences")) fatal("nvn: GPU completion failed");
+     }
+     frame_times().encode_ns += t1 - t0, frame_times().fence_ns += plat::monotonic_ns() - t1;
+ }
+@@ -566,7 +569,7 @@ std::shared_ptr<const DeferredValues> g_deferred;  // the submit being replayed
+ }
+ const DeferredValues* current_deferred() { return g_deferred.get(); }
+
+-void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_ptr<const DeferredValues> deferred) {
++bool gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_ptr<const DeferredValues> deferred, bool wait_done) {
+     g_deferred = std::move(deferred);
+     std::lock_guard lk(g_gpu);
+     uint64_t t_in = plat::monotonic_ns();
+@@ -574,7 +577,7 @@ void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_
+     uint64_t lists_epoch = 0;
+     for (auto& l : lists) lists_epoch = std::max(lists_epoch, l->epoch);
+     ReplayScope replay(lists_epoch);  // the texture mark (#55, #57), then drain_objects (under the GPU lock, #50)
+-    if (!init()) return;
++    if (!init()) return false;
+     bool async = async_gpu();
+     if (!async) {  // the previous submit was waited for: all of it is free
+         free_retired_images(UINT64_MAX);
+@@ -583,7 +586,7 @@ void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_
+     } else if (pipelined()) {  // what the retired submits were the last to use (they free nothing themselves)
+         free_retired_images(frame_completed());
+     }
+-    if (!begin(true)) return;
++    if (!begin(true)) return false;
+     draw_begin_submit();
+     gpu_profile_begin(g_cb);
+     zero_draws_begin_submit(g_cb);
+@@ -606,7 +609,7 @@ void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_
+     gpu_profile_mark(g_cb, "end");
+     if (async)  // the profile, zero-draw queries and snapshots read this submit's results right below: waited for
+         frame_submit(VK_NULL_HANDLE, VK_NULL_HANDLE, draw_take_write_backs(),
+-                     gpu_profile_on() || zero_draws_on() || debug_snapshots_pending());
++                     wait_done || gpu_profile_on() || zero_draws_on() || debug_snapshots_pending());
+     else
+         end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
+     draw_end_submit();  // not waited for: snapshots only (the write-backs went with the submit)
+@@ -615,6 +618,23 @@ void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_
+     const FrameTimes f2 = frame_times();
+     g_timing.encode_ns += f2.encode_ns - f_in.encode_ns, g_timing.fence_ns += f2.fence_ns - f_in.fence_ns;
+     g_timing.submit_ns += plat::monotonic_ns() - t_in;
++    return true;
++}
++
++// Complete a prefix of a replay before reading GPU-generated indirect arguments on the CPU.
++// Continue in a fresh command buffer; replay state and target state survive, but uploaded bindings do not.
++VkCommandBuffer replay_checkpoint(VkCommandBuffer cb) {
++    g_cb = frame_cb(cb);
++    draw_end_rendering(g_cb);
++    gpu_profile_mark(g_cb, "indirect readback");
++    if (async_gpu()) frame_submit(VK_NULL_HANDLE, VK_NULL_HANDLE, draw_take_write_backs(), true);
++    else end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
++    draw_end_submit();
++    gpu_profile_collect(), zero_draws_collect();
++    if (!begin(true)) fatal("nvn: cannot resume indirect replay");
++    draw_begin_submit();
++    gpu_profile_begin(g_cb), zero_draws_begin_submit(g_cb);
++    return g_cb;
+ }
+
+ // Headless: the presented texture is only counted, logged and dumped (no swapchain). Nothing is submitted unless a
+diff --git a/runtime/src/nvn/nvn_vk.h b/runtime/src/nvn/nvn_vk.h
+index f4e6529..e234aa8 100644
+--- a/runtime/src/nvn/nvn_vk.h
++++ b/runtime/src/nvn/nvn_vk.h
+@@ -226,6 +226,8 @@ bool mask_clear(VkCommandBuffer cb, const Targets& t, uint32_t slot, uint32_t ma
+                 const VkRect2D& rect);
+ // nvn_replay.cpp: a command list into `cb` (`depth`: CallList nesting).
+ void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth);
++uint64_t upload_capacity();  // actual host upload-ring bound, including synchronous mode
++VkCommandBuffer replay_checkpoint(VkCommandBuffer cb);  // complete prior GPU writes before CPU indirect decoding
+ std::shared_ptr<CmdList> submit_command_list(uint64_t handle);  // command_list(), once per handle per submit
+ void submit_lists_reset();  // at each submit's start (draw_begin_submit)
+
+diff --git a/runtime/src/nvn/nvn_written.cpp b/runtime/src/nvn/nvn_written.cpp
+index acb66da..c3592f2 100644
+--- a/runtime/src/nvn/nvn_written.cpp
++++ b/runtime/src/nvn/nvn_written.cpp
+@@ -10,10 +10,12 @@
+ #include <cstring>
+ #include <iterator>
+ #include <map>
++#include <new>
+ #include <string>
+ #include <vector>
+
+ #include "nvn_draw_state.h"
++#include "nvn_gap_helpers.h"
+
+ namespace nx::nvn::replay {
+
+@@ -118,6 +120,10 @@ void written_count_bind() { g_binds++; }
+
+ Upload written_bind(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_t padded) {
+     g_binds++;
++    if (!written_range_fits(uint64_t(p), size, padded, upload_capacity()))
++        fatal("nvn: invalid written_bind range: address %llx size %llu padded %llu capacity %llu",
++              (unsigned long long)p, (unsigned long long)size, (unsigned long long)padded,
++              (unsigned long long)upload_capacity());
+     std::vector<It> old = overlapping(p, size);
+     if (It it = containing(p, size, padded, bind_align(), old); it != g_regions.end()) {
+         write_after_read(cb);
+@@ -129,13 +135,22 @@ Upload written_bind(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_
+     const uint8_t* hi = p + size;
+     for (It it : old) lo = std::min(lo, it->first), hi = std::max(hi, it->first + it->second.size);
+     uint64_t n = uint64_t(hi - lo), off = uint64_t(p - lo);
++    if (!written_copy_fits(n, off, padded, upload_capacity()))
++        fatal("nvn: written_bind merged copy exceeds upload ring: size %llu offset %llu padded %llu capacity %llu regions %zu",
++              (unsigned long long)n, (unsigned long long)off, (unsigned long long)padded,
++              (unsigned long long)upload_capacity(), old.size());
+     Region r;
+     r.size = n;
+     r.cap = std::max(n + kTail, off + padded);
+     r.up = alloc_anchored(r.cap, off);
+     std::memcpy(r.up.ptr, lo, n);
+     std::memset(r.up.ptr + n, 0, r.cap - n);
+-    r.before = std::make_shared<std::vector<uint8_t>>(r.up.ptr, r.up.ptr + n);
++    try {
++        r.before = std::make_shared<std::vector<uint8_t>>(r.up.ptr, r.up.ptr + n);
++    } catch (const std::bad_alloc&) {
++        fatal("nvn: written_bind snapshot allocation failed: size %llu cap %llu padded %llu regions %zu",
++              (unsigned long long)n, (unsigned long long)r.cap, (unsigned long long)padded, old.size());
++    }
+     for (It it : old)  // their parts: as they were before their own GPU writes
+         if (it->second.before)
+             std::memcpy(r.before->data() + (it->first - lo), it->second.before->data(), it->second.before->size());

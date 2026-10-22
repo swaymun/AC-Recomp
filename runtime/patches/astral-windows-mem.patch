@@ -1,0 +1,978 @@
+# Windows-only opt-in lifetimes and allocation/commit attribution; before Windows perf.
+diff --git a/runtime/src/hle_fiber.cpp b/runtime/src/hle_fiber.cpp
+--- a/runtime/src/hle_fiber.cpp
++++ b/runtime/src/hle_fiber.cpp
+@@ -1,3 +1,6 @@
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++#include "win_mem_account.h"
++#endif
+ // Original stackful bridge. Guest lifecycle and TLS remain SDK-owned.
+ #include <nx/runtime.h>
+ #include "kernel.h"
+@@ -91,7 +94,14 @@
+     size_t allocation_bytes = 0;
+     bool suspended = false;
+ #if defined(_WIN32)
+-    ~Context() { if (allocation) DeleteFiber(allocation); } // a created fiber, never the running one or the root
++    ~Context() {
++        if (allocation) {
++            DeleteFiber(allocation);  // never the running fiber or the root
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++            if (memtrace::enabled()) memtrace::ledger().freed(memtrace::Domain::HostStack, memtrace::handle(allocation));
++#endif
++        }
++    }
+ #else
+     ~Context() { if (allocation) munmap(allocation, allocation_bytes); }
+ #endif
+@@ -190,6 +200,10 @@
+     d->allocation_bytes=host_stack_bytes;
+     d->allocation=CreateFiberEx(64*1024,host_stack_bytes,FIBER_FLAG_FLOAT_SWITCH,&fiber_main,nullptr);
+     if (!d->allocation) fatal("fiber: stack reservation failed");
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    if (memtrace::enabled()) memtrace::ledger().allocated(memtrace::Domain::HostStack,
++        memtrace::handle(d->allocation), memtrace::Pool::HostStackReserve, d->allocation_bytes);
++#endif
+     d->host.fiber=d->allocation;
+ #else
+     const size_t page=size_t(sysconf(_SC_PAGESIZE));
+diff --git a/runtime/src/memguard_win.cpp b/runtime/src/memguard_win.cpp
+--- a/runtime/src/memguard_win.cpp
++++ b/runtime/src/memguard_win.cpp
+@@ -16,6 +16,9 @@
+ #include <nx/runtime.h>
+
+ #include "platform.h"
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++#include "win_mem_va.h"
++#endif
+ #endif
+
+ namespace nx::plat {
+@@ -43,6 +46,9 @@
+     log("memory: guard on, limit %.1f GB (NX_MEM_LIMIT_GB)", gb);
+     std::thread([limit, gb] {
+         uint64_t ticks = 0, peak = 0;
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++        uint64_t traced_peak = 0;
++#endif
+         for (;;) {
+             std::this_thread::sleep_for(std::chrono::milliseconds(250));
+             uint64_t f = memory_footprint();
+@@ -55,10 +61,27 @@
+                 std::snprintf(msg, sizeof msg, "memory: %.2f GB is over the %.1f GB limit (NX_MEM_LIMIT_GB): stopping",
+                               double(f) / double(1ull << 30), gb);
+                 log("%s", msg);
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++                if (memtrace::enabled())
++                    log("memtrace: process ts_ns=%llu private_bytes=%llu peak_private_bytes=%llu guard_stop=1",
++                        (unsigned long long)monotonic_ns(), (unsigned long long)f, (unsigned long long)peak);
++#endif
+                 std::fprintf(stderr, "%s\n", msg);
+                 std::fflush(nullptr);
+                 TerminateProcess(GetCurrentProcess(), 3);
+             }
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++            // Preserve the guard's 250 ms peak exactly, and inventory rapid load peaks
++            // as they cross 64 MiB steps between the regular five-second samples.
++            if (memtrace::enabled() && (ticks % 20 == 0 ||
++                (f > traced_peak && f - traced_peak >= (64ull << 20)))) {
++                if (f > traced_peak) traced_peak = f;
++                log("memtrace: process ts_ns=%llu private_bytes=%llu peak_private_bytes=%llu guard_stop=0",
++                    (unsigned long long)monotonic_ns(), (unsigned long long)f, (unsigned long long)peak);
++                try { memtrace::sample(f); }
++                catch (...) { log("memtrace: sample failed; guard remains active"); }
++            }
++#endif
+         }
+     }).detach();
+ }
+diff --git a/runtime/src/nvn/nvn.h b/runtime/src/nvn/nvn.h
+--- a/runtime/src/nvn/nvn.h
++++ b/runtime/src/nvn/nvn.h
+@@ -188,6 +188,10 @@
+ // ---- textures and windows ---------------------------------------------------------------------------------------
+
+ struct GpuImage;  // the Vulkan side of a texture (nvn_vk.cpp)
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++void retire_image(std::shared_ptr<GpuImage> image);  // drop after its last possible GPU submit
++void memory_trace_objects(uint64_t stamp);
++#endif
+
+ struct Texture : Object {
+     uint32_t target = 0, format = 0, flags = 0, levels = 0, samples = 0, depth_stencil_mode = 0;
+diff --git a/runtime/src/nvn/nvn_frames.cpp b/runtime/src/nvn/nvn_frames.cpp
+--- a/runtime/src/nvn/nvn_frames.cpp
++++ b/runtime/src/nvn/nvn_frames.cpp
+@@ -1,3 +1,9 @@
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++#include "win_mem_account.h"
++#endif
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++#include "nvn_retire.h"
++#endif
+ // Submits that are not waited for (the design, and what stays synchronous and why:
+ // private/wonder/patches/async_submit.md). The synchronous path waits for every submit's fence before returning to
+ // the game, so the submitting thread stalls for the whole GPU time of each frame. Here a submit or a present takes one
+@@ -676,10 +682,33 @@
+                                           [&](const auto& e) { return std::get<0>(e) > completed; });
+         for (auto it = done; it != g_staging.end(); ++it) staging.push_back({std::get<1>(*it), std::get<2>(*it)});
+         g_staging.erase(done, g_staging.end());
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++        if (memtrace::enabled()) memtrace::ledger().retirement(g_grave.size(), g_staging.size(), g_reusable.size());
++#endif
+     }
+     for (auto& [b, m] : staging) p_vkDestroyBuffer(vk_device(), b, nullptr), p_vkFreeMemory(vk_device(), m, nullptr);
+ #if defined(__linux__) && !defined(__ANDROID__)
+     g_linux_staging.retire(completed, linux_staging_dispose);
++#endif
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    if (memtrace::enabled()) {
++        static uint64_t last_objects = 0;
++        const uint64_t now = plat::monotonic_ns();
++        if (now - last_objects >= 5'000'000'000ull) {
++            last_objects = now; memory_trace_objects(now);
++        }
++    }
++    if (detail::image_retirement_on()) {
++        detail::release_retired_images(dead, [&](GpuImage& img) {
++            if (!img.image) return;
++            forget_image_views(img);
++            if (img.view) p_vkDestroyImageView(vk_device(), img.view, nullptr);
++            p_vkDestroyImage(vk_device(), img.image, nullptr);
++            if (img.memory) p_vkFreeMemory(vk_device(), img.memory, nullptr);
++            img.image = VK_NULL_HANDLE, img.memory = VK_NULL_HANDLE, img.view = VK_NULL_HANDLE;
++        });
++        return;
++    }
+ #endif
+     for (auto& img : dead) {
+         if (!img || !img->image) continue;
+@@ -691,6 +720,16 @@
+         img->image = VK_NULL_HANDLE, img->memory = VK_NULL_HANDLE, img->view = VK_NULL_HANDLE;
+     }
+ }
++
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++// Dropping the last shared_ptr alone does not destroy Vulkan handles. Expiring snapshots
++// keep the existing last-possible-submit serial, just like Texture::~Texture.
++void retire_image(std::shared_ptr<GpuImage> image) {
++    if (!image) return;
++    std::lock_guard lk(g_grave_lock);
++    g_grave.push_back({g_submitted + 1, std::move(image)});
++}
++#endif
+
+ // Images of destroyed textures are freed once no submit can use them: the one being recorded now included (a replay
+ // on another thread may hold it), hence the serial after the last submitted. Before the graveyard no image was ever
+@@ -712,6 +751,9 @@
+ // to RGBA8 staged 312 MB in one submit, wrapping over its own data before the GPU had copied it (DEBUG-2 #72). Freed
+ // once the submit being recorded is retired (as images in the grave). Falls back to the ring if allocation fails.
+ Upload staging_alloc(uint64_t size) {
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    memtrace::Tag memory_category(memtrace::Pool::Staging);
++#endif
+     g_staging_count++, g_staging_bytes += size;
+     VkDevice d = vk_device();
+     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+diff --git a/runtime/src/nvn/nvn_image.cpp b/runtime/src/nvn/nvn_image.cpp
+--- a/runtime/src/nvn/nvn_image.cpp
++++ b/runtime/src/nvn/nvn_image.cpp
+@@ -1,3 +1,8 @@
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++#include "win_mem_account.h"
++#include "nvn_retire.h"
++#include "platform.h"
++#endif
+ // The VkImage behind an NVN texture, and its layout transitions (split from nvn_vk.cpp). Under the GPU lock.
+ #include <algorithm>
+ #include <cstdlib>
+@@ -77,10 +82,116 @@
+ };
+ std::map<StorageKey, std::weak_ptr<GpuImage>> g_live_images;
+
++
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++VkQueue vk_queue();
++uint64_t submit_start_ns();
++// Under the GPU lock. A live NVN object may outlive its last sample by a whole scene;
++// decoded ASTC backing is a reconstructible cache, not permanent guest GPU storage.
++void trim_windows_image_cache() {
++    static const bool evict = detail::image_cache_on();
++    if (!evict && !memtrace::enabled()) return;
++    const uint64_t now = plat::monotonic_ns();
++    static uint64_t last_scan = 0;
++    if (now - last_scan < 250'000'000ull) return;
++    last_scan = now;
++    std::unique_lock lock(objects_lock(), std::try_to_lock);
++    if (!lock.owns_lock()) return;
++    struct Group {
++        std::shared_ptr<GpuImage> image;
++        std::vector<Texture*> owners;
++        bool restorable = true;
++    };
++    std::map<GpuImage*, Group> groups;
++    auto backing_valid = [](const Texture& texture) {
++        auto it = objects().find(texture.pool);
++        auto* pool = it == objects().end() ? nullptr : dynamic_cast<MemoryPool*>(it->second.get());
++        if (!pool || texture.offset > pool->size || texture.storage_size > pool->size - texture.offset) return false;
++        if (pool->memory) return texture.memory == pool->memory + texture.offset;
++        auto map = pool->mappings.upper_bound(texture.offset);
++        if (map == pool->mappings.begin()) return false;
++        --map;
++        const auto& m = map->second;
++        uint64_t offset = texture.offset - map->first;
++        if (offset > m.size || texture.storage_size > m.size - offset) return false;
++        auto physical = objects().find(m.physical);
++        auto* p = physical == objects().end() ? nullptr : dynamic_cast<MemoryPool*>(physical->second.get());
++        if (!p || !p->memory || m.physical_offset > p->size || offset > p->size - m.physical_offset ||
++            texture.storage_size > p->size - m.physical_offset - offset) return false;
++        return texture.memory == p->memory + m.physical_offset + offset;
++    };
++    for (auto& [key, object] : objects()) {
++        auto* texture = dynamic_cast<Texture*>(object.get());
++        if (!texture || !texture->image || !texture->image->image) continue;
++        auto& group = groups[texture->image.get()];
++        if (!group.image) group.image = texture->image;
++        group.owners.push_back(texture);
++        group.restorable &= key < (1ull << 63) && texture->memory && texture->storage_size &&
++            !texture->has_writes.load() && astc_decoded(texture->format) && backing_valid(*texture);
++    }
++    constexpr uint64_t budget = 1ull << 30;
++    uint64_t live = 0, cold = 0, protected_bytes = 0;
++    std::vector<Group*> candidates;
++    const uint64_t recording = submit_start_ns();
++    for (auto& [pointer, group] : groups) {
++        auto& image = *group.image;
++        live += image.memory_bytes;
++        // Extra owners include deferred incarnations and retirement slots; never discard them.
++        bool external = group.image.use_count() != long(group.owners.size() + 1);
++        if (detail::cold_image_candidate(image.cache_last_use_ns, now, recording,
++                group.restorable && !external, image.uploaded, image.rendered, image.texels)) {
++            cold += image.memory_bytes;
++            candidates.push_back(&group);
++        } else protected_bytes += image.memory_bytes;
++    }
++    static uint64_t total_bytes = 0, total_images = 0, last_report = 0;
++    uint64_t released = 0, count = 0;
++    if (evict && live > budget && !candidates.empty()) {
++        std::sort(candidates.begin(), candidates.end(), [](const Group* a, const Group* b) {
++            return a->image->cache_last_use_ns < b->image->cache_last_use_ns;
++        });
++        // Only images unused by this entire recording are eligible. Queue idle covers
++        // every previous submitted slot without submitting/changing the current buffer.
++        if (p_vkQueueWaitIdle(vk_queue()) != VK_SUCCESS) gpu_hung("image cache queue wait failed");
++        for (auto* group : candidates) {
++            if (live - released <= budget) break;
++            auto& image = *group->image;
++            forget_image_views(image);
++            if (image.view) p_vkDestroyImageView(vk_device(), image.view, nullptr);
++            p_vkDestroyImage(vk_device(), image.image, nullptr);
++            if (image.memory) p_vkFreeMemory(vk_device(), image.memory, nullptr);
++            image.image = VK_NULL_HANDLE; image.view = VK_NULL_HANDLE; image.memory = VK_NULL_HANDLE;
++            for (auto* texture : group->owners) texture->image.reset();
++            released += image.memory_bytes; ++count;
++        }
++        // Weak keys must not keep growing when old scene images are discarded.
++        for (auto it = g_live_images.begin(); it != g_live_images.end();) {
++            auto image = it->second.lock();
++            if (!image || !image->image) it = g_live_images.erase(it); else ++it;
++        }
++        total_bytes += released; total_images += count;
++    }
++    if (memtrace::enabled() && (released || now - last_report >= 5'000'000'000ull)) {
++        last_report = now;
++        log("memtrace: image_cache ts_ns=%llu live=%llu cold=%llu protected=%llu released=%llu images=%llu "
++            "total_released=%llu total_images=%llu budget=%llu enabled=%u",
++            (unsigned long long)now, (unsigned long long)live, (unsigned long long)cold,
++            (unsigned long long)protected_bytes, (unsigned long long)released, (unsigned long long)count,
++            (unsigned long long)total_bytes, (unsigned long long)total_images,
++            (unsigned long long)budget, unsigned(evict));
++    }
++}
++#endif
++
+ GpuImage* image_of(uint64_t guest) {
+     Texture* t = get<Texture>(guest);
+     if (!t) return nullptr;
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    auto touch = [](GpuImage* image) { if (image) image->cache_last_use_ns = plat::monotonic_ns(); return image; };
++    if (t->image) return touch(t->image.get());
++#else
+     if (t->image) return t->image.get();
++#endif
+     uint32_t swizzle = uint32_t(t->swizzle[0]) | uint32_t(t->swizzle[1]) << 8 | uint32_t(t->swizzle[2]) << 16 |
+                   uint32_t(t->swizzle[3]) << 24;
+     // Swizzles apply when sampling (sampled_view, #44): neither the key's nor a pool view's keeps textures from sharing.
+@@ -98,9 +209,18 @@
+                 static uint64_t shares = 0;
+                 if (++shares % 1000 == 1) log("nvn/vk: %llu textures shared an image with another", (unsigned long long)shares);
+                 t->image = shared;
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++                return touch(shared.get());
++#else
+                 return shared.get();
++#endif
+             }
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    if ((t->image = reuse_image(*t))) return touch(t->image.get());
++    trim_windows_image_cache();
++#else
+     if ((t->image = reuse_image(*t))) return t->image.get();
++#endif
+     auto img = std::make_shared<GpuImage>();
+     img->format = bc_host_decode(t->format) ? bc_decoded_format(t->format) : vk_format(t->format);  // nvn_bc.cpp
+     img->nvn_format = t->format;
+@@ -195,7 +315,13 @@
+     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+     ai.allocationSize = req.size;
+     ai.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    memtrace::Tag memory_category(memtrace::Pool::Images);
++#endif
+     if (!check(p_vkAllocateMemory(vk_device(), &ai, nullptr, &img->memory), "vkAllocateMemory")) return nullptr;
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    img->memory_bytes = req.size;
++#endif
+     p_vkBindImageMemory(vk_device(), img->image, img->memory, 0);
+     constexpr VkComponentSwizzle kSwizzle[] = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_R,
+                                                VK_COMPONENT_SWIZZLE_G,    VK_COMPONENT_SWIZZLE_B,   VK_COMPONENT_SWIZZLE_A};
+@@ -215,7 +341,11 @@
+             img->width, img->height, img->layers, img->levels, t->target, t->format, int(img->format));
+     t->image = img;
+     if (t->memory) g_live_images[key] = img;
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    return touch(img.get());
++#else
+     return img.get();
++#endif
+ }
+
+ void transition(VkCommandBuffer cb, GpuImage& img, VkImageLayout to) {
+diff --git a/runtime/src/nvn/nvn_objects.cpp b/runtime/src/nvn/nvn_objects.cpp
+--- a/runtime/src/nvn/nvn_objects.cpp
++++ b/runtime/src/nvn/nvn_objects.cpp
+@@ -1,3 +1,6 @@
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++#include "nvn_retire.h"
++#endif
+ // NVN objects, CPU side (docs/NVN.md, N3): memory pools and GPU addresses, buffers, textures, samplers, texture and
+ // sampler pools. Signatures come from the game's call sites (nvn_trace.txt); builder state is read back
+ // through the SDK driver's getters (nvn.h). The Vulkan side hangs off these objects.
+@@ -448,6 +451,7 @@
+     destroy(guest);
+ }
+
++
+ // ---- pool snapshots ---------------------------------------------------------------------------------------------
+ // An NVN texture pool holds a copy of each registered texture's descriptor: a game may finalize the NVNtexture, or
+ // re-initialize it as something else, and still sample the slot. Wonder does both with its light-probe cubemaps at a
+@@ -511,6 +515,10 @@
+         auto* snap = so == objects().end() ? nullptr : dynamic_cast<Texture*>(so->second.get());
+         if (snap && std::max<uint64_t>(since, snap->last_sampled) + 2'000'000'000ull > now) break;
+         g_snapshot_images.pop_front();
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++        if (snap && detail::image_retirement_on()) retire_image(std::move(snap->image));
++        else
++#endif
+         if (snap) snap->image.reset();
+     }
+ }
+@@ -680,6 +688,30 @@
+ void DeviceGetImageHandle(CPU& c) { c.x[0] = c.x[1] & 0xFFFFF; }
+
+ }  // namespace
++
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++// Sample on the GPU owner without waiting on a game-thread object lock. This also
++// exposes the CPU texel queue that caused the historical title-movie leak.
++void memory_trace_objects(uint64_t stamp) {
++    std::unique_lock lock(objects_lock(), std::try_to_lock);
++    if (!lock.owns_lock()) {
++        log("memtrace: texture_queues ts_ns=%llu busy=1", (unsigned long long)stamp);
++        return;
++    }
++    uint64_t bytes = 0, capacity = 0, writes = 0, textures = 0;
++    for (const auto& [guest, object] : objects()) {
++        auto* texture = dynamic_cast<Texture*>(object.get());
++        if (!texture) continue;
++        ++textures;
++        for (const auto& write : texture->writes) {
++            bytes += write.data.size(); capacity += write.data.capacity(); ++writes;
++        }
++    }
++    log("memtrace: texture_queues ts_ns=%llu live_bytes=%llu capacity_bytes=%llu writes=%llu textures=%llu busy=0",
++        (unsigned long long)stamp, (unsigned long long)bytes, (unsigned long long)capacity,
++        (unsigned long long)writes, (unsigned long long)textures);
++}
++#endif
+
+ NX_HLE("nvnMemoryPoolInitialize", MemoryPoolInitialize);
+ NX_HLE("nvnMemoryPoolFinalize", MemoryPoolFinalize);
+diff --git a/runtime/src/nvn/nvn_retire.h b/runtime/src/nvn/nvn_retire.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/nvn/nvn_retire.h
+@@ -0,0 +1,64 @@
++// Retired references must be released as they are visited: several entries can own one image.
++#pragma once
++#include <atomic>
++#include <cstdint>
++#include <cstdlib>
++#include <cstddef>
++#include <memory>
++#include <vector>
++
++namespace nx::nvn::detail {
++inline bool memory_trace() {
++    static const bool on = [] { const char* e = std::getenv("NX_MEM_TRACE"); return e && e[0] == '1' && !e[1]; }();
++    return on;
++}
++inline bool image_retirement_on() {
++    static const bool on = [] { const char* e = std::getenv("NX_WINDOWS_IMAGE_RETIRE_FIX"); return e && e[0] == '1' && !e[1]; }();
++    return on;
++}
++inline bool image_cache_on() {
++    static const bool on = [] { const char* e = std::getenv("NX_WINDOWS_IMAGE_CACHE"); return e && e[0] == '1' && !e[1]; }();
++    return on;
++}
++inline bool cold_image_candidate(uint64_t last_use, uint64_t now, uint64_t recording,
++                                 bool restorable, bool uploaded, bool rendered, bool texels) {
++    return restorable && uploaded && !rendered && !texels && last_use && recording &&
++        last_use < recording && now > last_use && now - last_use >= 250'000'000ull;
++}
++template<class Image, class Destroy>
++void release_retired_images(std::vector<std::shared_ptr<Image>>& retired, Destroy destroy) {
++    for (auto& image : retired) {
++        if (!image) continue;
++        if (image.use_count() == 1) destroy(*image);
++        // Another entry in this same batch may be the final owner. Keeping this reference
++        // until vector destruction would make every duplicate look externally owned.
++        image.reset();
++    }
++}
++// Only a new, never-written image can be uploaded ahead of the main replay command buffer.
++inline bool fresh_upload_candidate(bool uploaded, bool defined_layout, bool rendered, bool texels,
++                                   bool decoded_astc, uint64_t bytes) {
++    return !uploaded && !defined_layout && !rendered && !texels && decoded_astc && bytes >= (1ull << 20);
++}
++
++// Opt-in lifetime accounting for compute snapshots, including copies held by in-flight slots.
++struct SnapshotStats {
++    std::atomic<uint64_t> live{0}, peak{0}, total{0}, allocations{0}, frees{0};
++};
++inline std::shared_ptr<std::vector<uint8_t>> snapshot_copy(const uint8_t* p, std::size_t size, SnapshotStats* stats) {
++    if (!stats) return p ? std::make_shared<std::vector<uint8_t>>(p, p + size) : std::make_shared<std::vector<uint8_t>>(size);
++    auto* copy = p ? new std::vector<uint8_t>(p, p + size) : new std::vector<uint8_t>(size);
++    uint64_t live = stats->live.fetch_add(size, std::memory_order_relaxed) + size;
++    uint64_t peak = stats->peak.load(std::memory_order_relaxed);
++    while (live > peak && !stats->peak.compare_exchange_weak(peak, live, std::memory_order_relaxed)) {}
++    stats->total.fetch_add(size, std::memory_order_relaxed);
++    stats->allocations.fetch_add(1, std::memory_order_relaxed);
++    // shared_ptr invokes this deleter even if allocating its control block throws.
++    return std::shared_ptr<std::vector<uint8_t>>(copy, [stats](auto* v) {
++        stats->live.fetch_sub(v->size(), std::memory_order_relaxed);
++        stats->frees.fetch_add(1, std::memory_order_relaxed);
++        delete v;
++    });
++}
++inline SnapshotStats compute_snapshots, resident_snapshots;
++}  // namespace nx::nvn::detail
+diff --git a/runtime/src/nvn/nvn_upload.cpp b/runtime/src/nvn/nvn_upload.cpp
+--- a/runtime/src/nvn/nvn_upload.cpp
++++ b/runtime/src/nvn/nvn_upload.cpp
+@@ -1,3 +1,6 @@
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++#include "win_mem_account.h"
++#endif
+ // Texture uploads (nvn_pipeline.h): guest pool memory into the host image, untiled, widened where the host stores a
+ // format wider than NVN does, and checked against what the copies read (docs/nvn/DEBUG.md #50).
+ #include <algorithm>
+@@ -9,11 +12,18 @@
+ #include "nvn_astc.h"
+ #include "nvn_pipeline.h"
+ #include "nvn_tiling.h"
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++#include "nvn_retire.h"
++#endif
+ #include "platform.h"
+
+ namespace nx::nvn {
+
+ using namespace nx::vk;
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++VkQueue vk_queue();
++uint32_t vk_queue_family();
++#endif
+
+ namespace {
+
+@@ -93,6 +103,100 @@
+         log("nvn/vk: ASTC decoded on the CPU: %llu textures, %.1f MB, %.0f ms, %llu invalid blocks",
+             (unsigned long long)textures, double(bytes) / 1e6, double(ns) / 1e6, (unsigned long long)invalid);
+ }
++
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++// New ASTC images have no commands referring to them yet. Complete their uploads separately:
++// otherwise every decoded texture in a scene-load submit keeps a second, host-visible copy until
++// that entire submit finishes. On WDDM both the images and these staging allocations consume commit.
++bool upload_fresh_astc(GpuImage& img, const std::vector<uint8_t>& bytes,
++                       const std::vector<VkBufferImageCopy>& copies) {
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    memtrace::Tag memory_category(memtrace::Pool::FreshStaging);
++#endif
++    static const bool enabled = [] {
++        const char* e = std::getenv("NX_WINDOWS_STREAM_UPLOADS");
++        return e && e[0] == '1' && !e[1];
++    }();
++    if (!enabled) return false;
++    static VkCommandPool pool = VK_NULL_HANDLE;
++    static VkCommandBuffer cb = VK_NULL_HANDLE;
++    static VkFence fence = VK_NULL_HANDLE;
++    VkDevice device = vk_device();
++    if (!pool) {
++        VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++        pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
++        pi.queueFamilyIndex = vk_queue_family();
++        if (p_vkCreateCommandPool(device, &pi, nullptr, &pool) != VK_SUCCESS) {
++            pool = VK_NULL_HANDLE; return false;  // failed API output does not transfer ownership
++        }
++        VkCommandBufferAllocateInfo ci{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++        ci.commandPool = pool; ci.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ci.commandBufferCount = 1;
++        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++        if (p_vkAllocateCommandBuffers(device, &ci, &cb) != VK_SUCCESS ||
++            p_vkCreateFence(device, &fi, nullptr, &fence) != VK_SUCCESS) {
++            p_vkDestroyCommandPool(device, pool, nullptr); pool = VK_NULL_HANDLE; cb = VK_NULL_HANDLE;
++            return false;
++        }
++    }
++    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++    bi.size = bytes.size(); bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++    VkBuffer buffer = VK_NULL_HANDLE;
++    if (p_vkCreateBuffer(device, &bi, nullptr, &buffer) != VK_SUCCESS) return false;
++    VkMemoryRequirements req{};
++    p_vkGetBufferMemoryRequirements(device, buffer, &req);
++    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++    ai.allocationSize = req.size; ai.memoryTypeIndex = upload_memory_type(req.memoryTypeBits);
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    auto release = [&] {
++        p_vkDestroyBuffer(device, buffer, nullptr);
++        if (memory) p_vkFreeMemory(device, memory, nullptr);
++    };
++    void* mapped = nullptr;
++    const VkResult allocated = p_vkAllocateMemory(device, &ai, nullptr, &memory);
++    if (allocated != VK_SUCCESS) memory = VK_NULL_HANDLE;  // never free an undefined error output
++    if (allocated != VK_SUCCESS ||
++        p_vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS ||
++        p_vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
++        release(); return false;
++    }
++    std::memcpy(mapped, bytes.data(), bytes.size());
++    p_vkUnmapMemory(device, memory);
++    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    if (p_vkResetCommandBuffer(cb, 0) != VK_SUCCESS || p_vkBeginCommandBuffer(cb, &begin) != VK_SUCCESS) {
++        release(); return false;
++    }
++    const VkImageLayout before = img.layout;
++    transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    p_vkCmdCopyBufferToImage(cb, buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                            uint32_t(copies.size()), copies.data());
++    // The later main command buffer performs its usual image transition before sampling.
++    // This barrier makes transfer writes available to all subsequent work on the same queue.
++    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++    p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                           0, 1, &barrier, 0, nullptr, 0, nullptr);
++    if (p_vkEndCommandBuffer(cb) != VK_SUCCESS || p_vkResetFences(device, 1, &fence) != VK_SUCCESS) {
++        img.layout = before; release(); return false;
++    }
++    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++    submit.commandBufferCount = 1; submit.pCommandBuffers = &cb;
++    VkResult queued = p_vkQueueSubmit(vk_queue(), 1, &submit, fence);
++    if (queued == VK_ERROR_DEVICE_LOST) gpu_hung("fresh texture upload: device lost");
++    if (queued != VK_SUCCESS) gpu_hung("fresh texture upload submit failed");
++    // Never free staging memory while it might still be read by the GPU.
++    if (p_vkWaitForFences(device, 1, &fence, VK_TRUE, 2'000'000'000ull) != VK_SUCCESS)
++        gpu_hung("fresh texture upload did not complete");
++    release();
++    static uint64_t uploads = 0, total = 0, peak = 0;
++    uploads++; total += bytes.size(); peak = std::max<uint64_t>(peak, bytes.size());
++    if (std::getenv("NX_MEM_TRACE") && uploads % 32 == 0)
++        log("memtrace: fresh uploads=%llu bytes=%llu peak_staging=%llu", (unsigned long long)uploads,
++            (unsigned long long)total, (unsigned long long)peak);
++    return true;
++}
++#endif
+
+ // Whether a 1 MB+ upload gets a staging buffer of its own (PHASE4.md U1). In steady state (a course frame stages ~30
+ // such textures, ~40 MB per second) the ring takes them: a fresh buffer each was an allocation (a kgsl ioctl that
+@@ -314,6 +418,21 @@
+         decode_astc(t.format, linear, levels, layers, bw, bh);
+         bw = bh = 1, bytes = host_bytes = 4;
+     }
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    if (!widen && detail::fresh_upload_candidate(was_uploaded, img.layout != VK_IMAGE_LAYOUT_UNDEFINED,
++                                                 img.rendered, img.texels, astc_decoded(t.format), linear.size())) {
++        std::vector<VkBufferImageCopy> fresh;
++        for (uint32_t k = 0; k < levels.size(); k++) {
++            VkBufferImageCopy r{};
++            r.bufferOffset = levels[k].offset;
++            r.imageSubresource = {img.aspect, k, 0, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? 1u : img.layers};
++            r.imageExtent = {levels[k].width, levels[k].height, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? layers : 1u};
++            fresh.push_back(r);
++        }
++        if (copies_fit(t, fresh.data(), uint32_t(fresh.size()), 0, linear.size(), bw, bh, host_bytes) &&
++            upload_fresh_astc(img, linear, fresh)) return;
++    }
++#endif
+     // Widened, every offset in the linear buffer doubles (level offsets are multiples of the 4-byte texel).
+     uint64_t scale = widen ? 2 : 1;
+     Upload u;
+diff --git a/runtime/src/nvn/nvn_vk.cpp b/runtime/src/nvn/nvn_vk.cpp
+--- a/runtime/src/nvn/nvn_vk.cpp
++++ b/runtime/src/nvn/nvn_vk.cpp
+@@ -1,3 +1,7 @@
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++#include "win_mem_vk.h"
++#include "nvn_retire.h"
++#endif
+ #if defined(NX_ASTRAL_STRICT) && (defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
+ #include "nvn_shader_cache.h"
+ #endif
+@@ -252,6 +256,9 @@
+     dci.ppEnabledExtensionNames = dexts.data();
+     dci.pNext = &features;
+     if (!check(p_create_device(g_physical, &dci, nullptr, &g_device), "vkCreateDevice")) return false;
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    memtrace::install_vulkan();
++#endif
+     p_vkGetDeviceQueue(g_device, g_family, 0, &g_queue);
+
+     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+@@ -478,6 +485,9 @@
+ namespace {
+
+ void make_upload_buffer(uint64_t size) {
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    memtrace::Tag memory_category(memtrace::Pool::UploadRing);
++#endif
+     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+     bi.size = size;
+     bi.usage = kUploadUsage;
+diff --git a/runtime/src/nvn/nvn_vk.h b/runtime/src/nvn/nvn_vk.h
+--- a/runtime/src/nvn/nvn_vk.h
++++ b/runtime/src/nvn/nvn_vk.h
+@@ -1,3 +1,6 @@
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++#include "win_mem_account.h"
++#endif
+ // The Vulkan side of NVN, shared between nvn_vk.cpp (device, images, submit, present) and nvn_draw.cpp (pipelines,
+ // resources, draws). Everything here runs under the GPU lock taken by gpu_submit / gpu_present.
+ #pragma once
+@@ -11,6 +14,10 @@
+ namespace nx::nvn {
+
+ struct GpuImage {
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    uint64_t memory_bytes = 0, cache_last_use_ns = 0;
++    ~GpuImage() { if (image && memtrace::enabled()) memtrace::ledger().orphaned_image(memtrace::handle(memory)); }
++#endif
+     VkImage image = VK_NULL_HANDLE;
+     VkDeviceMemory memory = VK_NULL_HANDLE;
+     VkImageView view = VK_NULL_HANDLE;  // every level and layer
+diff --git a/runtime/src/nvn/nvn_written.cpp b/runtime/src/nvn/nvn_written.cpp
+--- a/runtime/src/nvn/nvn_written.cpp
++++ b/runtime/src/nvn/nvn_written.cpp
+@@ -1,3 +1,6 @@
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++#include "nvn_retire.h"
++#endif
+ // Compute results within a submit (docs/nvn/GLITCH-PLAN.md G5). A storage buffer a compute shader writes is a copy in
+ // the upload buffer, written back to guest memory once the submit completed. Each binding used to get a copy of its
+ // own: later draws and dispatches of the submit read the guest bytes from before the dispatch, two dispatches writing
+@@ -135,7 +138,11 @@
+     r.up = alloc_anchored(r.cap, off);
+     std::memcpy(r.up.ptr, lo, n);
+     std::memset(r.up.ptr + n, 0, r.cap - n);
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    r.before = detail::snapshot_copy(r.up.ptr, size_t(n), detail::memory_trace() ? &detail::compute_snapshots : nullptr);
++#else
+     r.before = std::make_shared<std::vector<uint8_t>>(r.up.ptr, r.up.ptr + n);
++#endif
+     for (It it : old)  // their parts: as they were before their own GPU writes
+         if (it->second.before)
+             std::memcpy(r.before->data() + (it->first - lo), it->second.before->data(), it->second.before->size());
+diff --git a/runtime/src/win_mem_account.h b/runtime/src/win_mem_account.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/win_mem_account.h
+@@ -0,0 +1,104 @@
++// Optional Windows allocation accounting. Values are explicit payload/reservation sizes,
++// not an estimate of opaque driver memory or process commit. No game inputs required.
++#pragma once
++#include <array>
++#include <cstdint>
++#include <cstddef>
++#include <cstdlib>
++#include <map>
++#include <mutex>
++#include <type_traits>
++
++namespace nx::memtrace {
++enum class Pool { Images, UploadRing, Staging, FreshStaging, Resident, OtherVulkan,
++                  ShaderCode, GraphicsPipelines, ComputePipelines, DecodedPrepared,
++                  DecodedStore, HostStackReserve, Count };
++enum class Domain { Memory, Shader, Pipeline, HostStack };
++inline constexpr size_t pool_count = size_t(Pool::Count);
++inline constexpr const char* names[] = {"images", "upload_ring", "staging", "fresh_staging", "resident",
++    "other_vulkan", "shader_code", "graphics_pipelines", "compute_pipelines", "decoded_prepared",
++    "decoded_store", "host_stack_reserve"};
++struct Counter { uint64_t live = 0, peak = 0, total = 0, allocations = 0, frees = 0; };
++struct Sample {
++    std::array<Counter, pool_count> pools{};
++    uint64_t dropped = 0, unknown_frees = 0, orphaned_images = 0, orphaned_bytes = 0;
++    uint64_t retired_refs = 0, staging_buffers = 0, reusable_images = 0;
++};
++inline bool enabled() {
++    static const bool on = [] { const char* e = std::getenv("NX_MEM_TRACE"); return e && e[0] == '1' && !e[1]; }();
++    return on;
++}
++template<class Handle> uint64_t handle(Handle h) {
++    if constexpr (std::is_pointer_v<Handle>) return uint64_t(reinterpret_cast<uintptr_t>(h));
++    else return uint64_t(h);
++}
++// The ledger never holds its mutex across a Vulkan call, logging, or resource release.
++// Failed diagnostics are visible as dropped records; they must never change an API result.
++class Ledger {
++    struct Allocation { Pool pool; uint64_t bytes; };
++    std::mutex mutex;
++    std::map<std::pair<Domain, uint64_t>, Allocation> live;
++    Sample stats;
++    void add(Pool p, uint64_t bytes) {
++        auto& c = stats.pools[size_t(p)];
++        c.live += bytes; c.total += bytes; ++c.allocations;
++        if (c.live > c.peak) c.peak = c.live;
++    }
++    void sub(Pool p, uint64_t bytes) {
++        auto& c = stats.pools[size_t(p)];
++        if (bytes > c.live) { ++stats.dropped; return; }
++        c.live -= bytes; ++c.frees;
++    }
++public:
++    void allocated(Domain domain, uint64_t token, Pool pool, uint64_t bytes) noexcept {
++        try {
++            std::lock_guard lock(mutex);
++            if (!token || !live.emplace(std::make_pair(domain, token), Allocation{pool, bytes}).second) {
++                ++stats.dropped; return;
++            }
++            add(pool, bytes);
++        } catch (...) { note_drop(); }
++    }
++    void freed(Domain domain, uint64_t token) noexcept {
++        if (!token) return;
++        try {
++            std::lock_guard lock(mutex);
++            auto it = live.find({domain, token});
++            if (it == live.end()) { ++stats.unknown_frees; return; }
++            sub(it->second.pool, it->second.bytes); live.erase(it);
++        } catch (...) { note_drop(); }
++    }
++    void payload_add(Pool pool, uint64_t bytes) noexcept {
++        try { std::lock_guard lock(mutex); add(pool, bytes); } catch (...) { note_drop(); }
++    }
++    void payload_free(Pool pool, uint64_t bytes) noexcept {
++        try { std::lock_guard lock(mutex); sub(pool, bytes); } catch (...) { note_drop(); }
++    }
++    void orphaned_image(uint64_t memory) noexcept {
++        try {
++            std::lock_guard lock(mutex);
++            auto it = live.find({Domain::Memory, memory});
++            if (it != live.end() && it->second.pool == Pool::Images) {
++                ++stats.orphaned_images; stats.orphaned_bytes += it->second.bytes;
++            }
++        } catch (...) { note_drop(); }
++    }
++    void retirement(uint64_t refs, uint64_t staging, uint64_t reusable) noexcept {
++        try {
++            std::lock_guard lock(mutex);
++            stats.retired_refs = refs; stats.staging_buffers = staging; stats.reusable_images = reusable;
++        } catch (...) { note_drop(); }
++    }
++    void note_drop() noexcept {
++        try { std::lock_guard lock(mutex); ++stats.dropped; } catch (...) {}
++    }
++    Sample snapshot() { std::lock_guard lock(mutex); return stats; }
++};
++inline Ledger& ledger() { static auto* value = new Ledger; return *value; }  // process lifetime, including deleters
++inline thread_local Pool allocation_pool = Pool::OtherVulkan;
++struct Tag {
++    Pool previous = allocation_pool;
++    explicit Tag(Pool pool) { allocation_pool = pool; }
++    ~Tag() { allocation_pool = previous; }
++};
++}  // namespace nx::memtrace
+diff --git a/runtime/src/win_mem_va.h b/runtime/src/win_mem_va.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/win_mem_va.h
+@@ -0,0 +1,92 @@
++// Read-only commit inventory. VA commitment, explicit Vulkan bytes and PrivateUsage
++// have different accounting domains; report them separately, never add them together.
++#pragma once
++#include <windows.h>
++#include <map>
++#include "win_mem_account.h"
++#include "nvn/nvn_retire.h"
++
++namespace nx::memtrace {
++inline void report_snapshot(const char* name, const nvn::detail::SnapshotStats& s, uint64_t stamp) {
++    log("memtrace: snapshots ts_ns=%llu name=%s live=%llu peak=%llu total=%llu allocations=%llu frees=%llu",
++        (unsigned long long)stamp, name, (unsigned long long)s.live.load(), (unsigned long long)s.peak.load(),
++        (unsigned long long)s.total.load(), (unsigned long long)s.allocations.load(), (unsigned long long)s.frees.load());
++}
++inline void sample(uint64_t private_bytes) {
++    if (!enabled()) return;
++    const uint64_t stamp = plat::monotonic_ns();
++    const auto s = ledger().snapshot();
++    for (size_t i = 0; i < pool_count; ++i) {
++        const auto& c = s.pools[i];
++        log("memtrace: pool ts_ns=%llu name=%s live=%llu peak=%llu total=%llu allocations=%llu frees=%llu unit=%s",
++            (unsigned long long)stamp, names[i], (unsigned long long)c.live, (unsigned long long)c.peak,
++            (unsigned long long)c.total, (unsigned long long)c.allocations, (unsigned long long)c.frees,
++            i == size_t(Pool::GraphicsPipelines) || i == size_t(Pool::ComputePipelines) ? "objects" : "bytes");
++    }
++    log("memtrace: ownership ts_ns=%llu dropped=%llu unknown_frees=%llu orphaned_images=%llu orphaned_bytes=%llu "
++        "retired_refs=%llu staging_buffers=%llu reusable_images=%llu private_bytes=%llu",
++        (unsigned long long)stamp, (unsigned long long)s.dropped, (unsigned long long)s.unknown_frees,
++        (unsigned long long)s.orphaned_images, (unsigned long long)s.orphaned_bytes,
++        (unsigned long long)s.retired_refs, (unsigned long long)s.staging_buffers,
++        (unsigned long long)s.reusable_images, (unsigned long long)private_bytes);
++    report_snapshot("compute", nvn::detail::compute_snapshots, stamp);
++    report_snapshot("resident", nvn::detail::resident_snapshots, stamp);
++    struct Group { uint64_t reserved = 0, committed = 0; bool guard = false; };
++    std::map<uintptr_t, Group> groups;
++    uint64_t committed_private = 0, committed_mapped = 0, committed_image = 0;
++    uint64_t guest_heap = 0, guest_alias = 0, guest_stack_kernel = 0;
++    uintptr_t address = 0;
++    MEMORY_BASIC_INFORMATION info{};
++    auto in = [](uintptr_t p, uint64_t base, uint64_t size) { return p >= base && p - base < size; };
++    bool query_failed = false;
++    SYSTEM_INFO system{}; GetSystemInfo(&system);
++    const auto maximum = reinterpret_cast<uintptr_t>(system.lpMaximumApplicationAddress);
++    while (address <= maximum) {
++        if (!VirtualQueryEx(GetCurrentProcess(), reinterpret_cast<void*>(address), &info, sizeof info)) {
++            query_failed = true; break;
++        }
++        const auto start = reinterpret_cast<uintptr_t>(info.BaseAddress);
++        if (!info.RegionSize || start > UINTPTR_MAX - info.RegionSize || start + info.RegionSize <= address) {
++            query_failed = true; break;
++        }
++        if (info.State != MEM_FREE) {
++            auto& g = groups[reinterpret_cast<uintptr_t>(info.AllocationBase)];
++            g.reserved += info.RegionSize;
++            if (info.State == MEM_COMMIT) {
++                g.committed += info.RegionSize; g.guard |= (info.Protect & PAGE_GUARD) != 0;
++                if (info.Type == MEM_PRIVATE) committed_private += info.RegionSize;
++                else if (info.Type == MEM_MAPPED) committed_mapped += info.RegionSize;
++                else if (info.Type == MEM_IMAGE) committed_image += info.RegionSize;
++                if (in(start, kHeapBase, kHeapMax)) guest_heap += info.RegionSize;
++                if (in(start, kAliasBase, kAliasSize)) guest_alias += info.RegionSize;
++                if (in(start, kStackBase, kStackSize) || in(start, kKernelBase, kKernelSize))
++                    guest_stack_kernel += info.RegionSize;
++            }
++        }
++        address = start + info.RegionSize;
++    }
++    uint64_t guarded_commit = 0, guarded_reserve = 0, guarded_groups = 0;
++    for (const auto& [base, g] : groups) {
++        if (!g.guard) continue;
++        ++guarded_groups; guarded_commit += g.committed; guarded_reserve += g.reserved;
++    }
++    log("memtrace: va ts_ns=%llu private=%llu mapped=%llu image=%llu guest_heap=%llu guest_alias=%llu "
++        "guest_stack_kernel=%llu guarded_stack_groups=%llu guarded_stack_commit=%llu guarded_stack_reserve=%llu query_failed=%u",
++        (unsigned long long)stamp, (unsigned long long)committed_private, (unsigned long long)committed_mapped,
++        (unsigned long long)committed_image, (unsigned long long)guest_heap, (unsigned long long)guest_alias,
++        (unsigned long long)guest_stack_kernel, (unsigned long long)guarded_groups,
++        (unsigned long long)guarded_commit, (unsigned long long)guarded_reserve, unsigned(query_failed));
++    // Preserve the allocation-base inventory at each new 64 MiB private-byte high.
++    // Small reservations remain in the complete aggregate above.
++    static uint64_t last_peak = 0;
++    if (private_bytes > last_peak && private_bytes - last_peak >= (64ull << 20)) {
++        last_peak = private_bytes;
++        for (const auto& [base, g] : groups) {
++            if (g.committed < (16ull << 20) && !g.guard) continue;
++            log("memtrace: va_peak ts_ns=%llu base=%llx reserved=%llu committed=%llu guard=%u private_bytes=%llu",
++                (unsigned long long)stamp, (unsigned long long)base, (unsigned long long)g.reserved,
++                (unsigned long long)g.committed, unsigned(g.guard), (unsigned long long)private_bytes);
++        }
++    }
++}
++}  // namespace nx::memtrace
+diff --git a/runtime/src/win_mem_vk.h b/runtime/src/win_mem_vk.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/win_mem_vk.h
+@@ -0,0 +1,61 @@
++// Install once before the first device allocation; never installed without NX_MEM_TRACE=1.
++#pragma once
++#include "win_mem_account.h"
++#include "vk_gen.h"
++namespace nx::memtrace {
++using namespace nx::vk;
++inline PFN_vkAllocateMemory real_allocate = nullptr;
++inline PFN_vkFreeMemory real_free = nullptr;
++inline PFN_vkCreateShaderModule real_shader = nullptr;
++inline PFN_vkDestroyShaderModule real_destroy_shader = nullptr;
++inline PFN_vkCreateGraphicsPipelines real_graphics = nullptr;
++inline PFN_vkCreateComputePipelines real_compute = nullptr;
++inline PFN_vkDestroyPipeline real_destroy_pipeline = nullptr;
++inline VKAPI_ATTR VkResult VKAPI_CALL allocate(VkDevice d, const VkMemoryAllocateInfo* info,
++                                               const VkAllocationCallbacks* cb, VkDeviceMemory* out) {
++    VkResult result = real_allocate(d, info, cb, out);
++    if (result == VK_SUCCESS) ledger().allocated(Domain::Memory, handle(*out), allocation_pool, info->allocationSize);
++    return result;
++}
++inline VKAPI_ATTR void VKAPI_CALL free_memory(VkDevice d, VkDeviceMemory memory, const VkAllocationCallbacks* cb) {
++    ledger().freed(Domain::Memory, handle(memory));
++    real_free(d, memory, cb);
++}
++inline VKAPI_ATTR VkResult VKAPI_CALL shader(VkDevice d, const VkShaderModuleCreateInfo* info,
++                                             const VkAllocationCallbacks* cb, VkShaderModule* out) {
++    VkResult result = real_shader(d, info, cb, out);
++    if (result == VK_SUCCESS) ledger().allocated(Domain::Shader, handle(*out), Pool::ShaderCode, info->codeSize);
++    return result;
++}
++inline VKAPI_ATTR void VKAPI_CALL destroy_shader(VkDevice d, VkShaderModule m, const VkAllocationCallbacks* cb) {
++    ledger().freed(Domain::Shader, handle(m)); real_destroy_shader(d, m, cb);
++}
++inline VKAPI_ATTR VkResult VKAPI_CALL graphics(VkDevice d, VkPipelineCache cache, uint32_t count,
++    const VkGraphicsPipelineCreateInfo* info, const VkAllocationCallbacks* cb, VkPipeline* out) {
++    VkResult result = real_graphics(d, cache, count, info, cb, out);
++    // Vulkan may return successful individual pipeline handles even when the batch fails.
++    for (uint32_t i = 0; i < count; ++i)
++        if (out[i]) ledger().allocated(Domain::Pipeline, handle(out[i]), Pool::GraphicsPipelines, 1);
++    return result;
++}
++inline VKAPI_ATTR VkResult VKAPI_CALL compute(VkDevice d, VkPipelineCache cache, uint32_t count,
++    const VkComputePipelineCreateInfo* info, const VkAllocationCallbacks* cb, VkPipeline* out) {
++    VkResult result = real_compute(d, cache, count, info, cb, out);
++    for (uint32_t i = 0; i < count; ++i)
++        if (out[i]) ledger().allocated(Domain::Pipeline, handle(out[i]), Pool::ComputePipelines, 1);
++    return result;
++}
++inline VKAPI_ATTR void VKAPI_CALL destroy_pipeline(VkDevice d, VkPipeline p, const VkAllocationCallbacks* cb) {
++    ledger().freed(Domain::Pipeline, handle(p)); real_destroy_pipeline(d, p, cb);
++}
++inline void install_vulkan() {
++    if (!enabled() || real_allocate) return;
++    real_allocate = p_vkAllocateMemory; p_vkAllocateMemory = allocate;
++    real_free = p_vkFreeMemory; p_vkFreeMemory = free_memory;
++    real_shader = p_vkCreateShaderModule; p_vkCreateShaderModule = shader;
++    real_destroy_shader = p_vkDestroyShaderModule; p_vkDestroyShaderModule = destroy_shader;
++    real_graphics = p_vkCreateGraphicsPipelines; p_vkCreateGraphicsPipelines = graphics;
++    real_compute = p_vkCreateComputePipelines; p_vkCreateComputePipelines = compute;
++    real_destroy_pipeline = p_vkDestroyPipeline; p_vkDestroyPipeline = destroy_pipeline;
++}
++}  // namespace nx::memtrace

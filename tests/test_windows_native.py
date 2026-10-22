@@ -20,6 +20,23 @@ w = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(w)
 
 
+def frozen_overlay(name):
+    """The archived profile predates the comment-only public-export rewrite.
+
+    Use its exact historical patch bytes; never re-bless changed live overlays by
+    replacing CUMULATIVE_HASHES. Integration runs require the private Git history.
+    """
+    path = ROOT / 'runtime/patches' / name
+    if w.sha(path) == w.CUMULATIVE_HASHES[name]:
+        return path.read_bytes()
+    raw = subprocess.check_output(['git', 'show',
+        '47d82ea285e43d2ae260f28e703cd5aa2cf96420^:runtime/patches/' + name], cwd=ROOT)
+    import hashlib
+    if hashlib.sha256(raw).hexdigest() != w.CUMULATIVE_HASHES[name]:
+        raise AssertionError('archived patch identity mismatch: ' + name)
+    return raw
+
+
 class DriverTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='windows native ')
@@ -241,7 +258,7 @@ else: sys.exit(12)
                         patches=dict(w.CUMULATIVE_HASHES), input_manifest_sha256='a'*64)
         (self.root/'overlays').mkdir()
         for name in w.PROFILES[w.CUMULATIVE_PROFILE]:
-            shutil.copyfile(ROOT/'runtime/patches'/name, self.root/'overlays'/name)
+            (self.root/'overlays'/name).write_bytes(frozen_overlay(name))
         generated = {mod: {'files': {'table.cpp': w.sha(self.root/'gen'/mod/'table.cpp')}}
                      for mod in ('main', 'sdk')}
         receipt = {'schema': 1, 'state': 'accepted', 'pin': w.PIN,
@@ -294,7 +311,7 @@ else: sys.exit(12)
         patchroot = self.root/'runtime/patches'
         patchroot.mkdir(parents=True)
         for name in w.PROFILES[w.CUMULATIVE_PROFILE]:
-            shutil.copyfile(ROOT/'runtime/patches'/name, patchroot/name)
+            (patchroot/name).write_bytes(frozen_overlay(name))
         self.assertEqual(len(w.profile_patches(w.DEFAULT_PROFILE, self.root)), 3)
         self.assertEqual(len(w.profile_patches(w.CUMULATIVE_PROFILE, self.root)), 11)
         patch = patchroot/'astral-hid.patch'
@@ -341,7 +358,11 @@ else: sys.exit(12)
             '.local/orchestrate/2026-10-18/worktrees/PIN-004/.local/references/SuperMarioWonderRecomp')))
         self.assertTrue(reference.is_dir(), 'provide clean pinned Wonder using WINDOWS_REFERENCE')
         source = self.root/'prepared'
-        patches = w.profile_patches(w.CUMULATIVE_PROFILE, ROOT)
+        patchroot = self.root / 'runtime/patches'
+        patchroot.mkdir(parents=True)
+        for name in w.PROFILES[w.CUMULATIVE_PROFILE]:
+            (patchroot / name).write_bytes(frozen_overlay(name))
+        patches = w.profile_patches(w.CUMULATIVE_PROFILE, self.root)
         fingerprint = prep.prepare_source(reference, source, patches)
         self.assertEqual(prep.git(source, 'rev-parse', 'HEAD'), w.PIN)
         self.assertEqual(fingerprint, prep.source_fingerprint(source))
@@ -378,6 +399,105 @@ else: sys.exit(12)
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('must execute on Windows', p.stderr)
         self.assertFalse((self.root / 'out').exists())
+
+
+class PlayerHelpersTests(unittest.TestCase):
+    def test_native_archive_reader_refuses_links_and_binds_open_handle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            file = root / 'archive.pkz'
+            file.write_bytes(b'synthetic archive')
+            with w.windows_regular_open(file) as stream:
+                self.assertEqual(stream.read(), b'synthetic archive')
+            os.link(file, root / 'hardlink')
+            with self.assertRaisesRegex(ValueError, 'single-link regular'):
+                w.windows_regular_open(file)
+            (root / 'hardlink').unlink()
+            if os.name != 'nt':
+                (root / 'symbolic').symlink_to(file)
+                with self.assertRaisesRegex(ValueError, 'symbolic archive path'):
+                    w.windows_regular_open(root / 'symbolic')
+            replacement = root / 'replacement'
+            replacement.write_bytes(b'other archive')
+            original_open = os.open
+            def swap_then_open(path, flags):
+                os.replace(replacement, file)
+                return original_open(path, flags)
+            with mock.patch.object(w.os, 'open', side_effect=swap_then_open):
+                with self.assertRaisesRegex(ValueError, 'changed while opening'):
+                    w.windows_regular_open(file)
+
+    def test_archive_reader_is_installed_in_real_spawned_workers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            file = root / 'fixture.pkz'
+            file.write_bytes(b'fixture archive bytes')
+            script = root / 'spawn_reader.py'
+            script.write_text('''import concurrent.futures,multiprocessing,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+import windows_native as w
+def read(path):
+ import inventory_astral_pkz as pkz
+ with pkz.regular_open(Path(path)) as stream: return stream.read()
+if __name__ == '__main__':
+ with concurrent.futures.ProcessPoolExecutor(max_workers=2,mp_context=multiprocessing.get_context('spawn'),initializer=w.install_windows_archive_reader) as pool:
+  assert pool.submit(read,sys.argv[2]).result(timeout=20)==b'fixture archive bytes'
+ print('PASS spawned native reader')
+''')
+            result = subprocess.run([sys.executable, str(script), str(ROOT / 'tools'), str(file)],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('PASS spawned native reader', result.stdout)
+
+    def test_cmd_environment_keeps_equals_and_skips_pseudo_variables(self):
+        self.assertEqual(w.parse_environment('banner\r\n=C:=C:\\src\r\nPath=A;B\r\nLIB=x=y\r\n'),
+                         {'PATH': 'A;B', 'LIB': 'x=y'})
+
+    def test_developer_environment_uses_vswhere_and_x64_prompt(self):
+        with mock.patch.object(Path, 'is_file', return_value=True), \
+             mock.patch.object(w.subprocess, 'check_output', side_effect=[
+                 'C:/VS Build Tools\n', 'Path=old\nINCLUDE=inc\nLIB=lib\n']), \
+             mock.patch.object(w.shutil, 'which', return_value='clang-cl.exe'):
+            env = w.developer_environment()
+            calls = w.subprocess.check_output.call_args_list
+        self.assertIn('Microsoft.VisualStudio.Component.VC.Tools.x86.x64', calls[0].args[0])
+        self.assertIn('"C:/VS Build Tools/Common7/Tools/VsDevCmd.bat"', calls[1].args[0])
+        self.assertIn('-arch=x64 -host_arch=x64', calls[1].args[0])
+        self.assertIn('Llvm/x64/bin', env['PATH'])
+        self.assertEqual(env['INCLUDE'], 'inc')
+
+    def test_incomplete_developer_environment_fails_closed(self):
+        with mock.patch.object(Path, 'is_file', return_value=True), \
+             mock.patch.object(w.subprocess, 'check_output', side_effect=['C:/VS', 'PATH=x\n']):
+            with self.assertRaisesRegex(ValueError, 'INCLUDE/LIB/PATH'):
+                w.developer_environment()
+
+    def test_junction_detection_uses_mount_point_tag(self):
+        path = mock.Mock()
+        with mock.patch.object(w.stat, 'IO_REPARSE_TAG_MOUNT_POINT', 0xa0000003, create=True):
+            path.lstat.return_value = SimpleNamespace(st_reparse_tag=0xa0000003)
+            self.assertTrue(w.is_junction(path))
+            path.lstat.return_value = SimpleNamespace(st_reparse_tag=0xa000000c)
+            self.assertFalse(w.is_junction(path))
+            path.lstat.side_effect = FileNotFoundError()
+            self.assertFalse(w.is_junction(path))
+
+    def test_termination_targets_only_invocation_pid(self):
+        process = mock.Mock(pid=4321)
+        with mock.patch.object(w.subprocess, 'run') as run:
+            w.terminate_tree(process)
+        self.assertEqual(run.call_args.args[0], ['taskkill.exe', '/PID', '4321', '/T', '/F'])
+        process.wait.assert_called_once_with(timeout=30)
+
+    def test_archived_profile_still_rejects_evolved_live_patches(self):
+        drift = [name for name, digest in w.CUMULATIVE_HASHES.items()
+                 if w.sha(ROOT / 'runtime/patches' / name) != digest]
+        if drift:
+            with self.assertRaisesRegex(ValueError, 'landed Windows patch identity mismatch'):
+                w.profile_patches(w.CUMULATIVE_PROFILE, ROOT)
+        self.assertEqual(w.CUMULATIVE_HASHES['astral-bootstrap.patch'],
+                         '05f84f0025cc7074f157232e066288fae8f8b5c9ada535820cf2c5a2adff2f7c')
 
 
 if __name__ == '__main__':

@@ -1,17 +1,18 @@
 diff --git a/runtime/src/hle_audio.cpp b/runtime/src/hle_audio.cpp
 --- a/runtime/src/hle_audio.cpp
 +++ b/runtime/src/hle_audio.cpp
-@@ -18,6 +18,9 @@
+@@ -18,6 +18,10 @@
  
  #include "kernel.h"
  #include "platform.h"
 +#if defined(NX_ASTRAL_STRICT)
 +#include "wav_stream.h"
++#include "audio_probe.h"
 +#endif
  
  namespace nx {
  
-@@ -82,6 +85,65 @@ void release(void* ctx) {
+@@ -82,6 +86,94 @@
      g_out.cv.notify_all();
  }
  
@@ -24,6 +25,7 @@ diff --git a/runtime/src/hle_audio.cpp b/runtime/src/hle_audio.cpp
 +struct AudioDump {
 +    std::mutex lock;
 +    WavStream wav;
++    FILE* timing = nullptr;
 +    int owner = 0;
 +    bool done = false;
 +};
@@ -35,6 +37,7 @@ diff --git a/runtime/src/hle_audio.cpp b/runtime/src/hle_audio.cpp
 +    AudioDump& d = audio_dump();
 +    std::lock_guard lk(d.lock);
 +    d.wav.close();
++    if (d.timing) std::fclose(d.timing), d.timing = nullptr;
 +    d.done = true;  // no later sound may reopen (and truncate) the finished file
 +}
 +void dump_pcm(int source, const int16_t* pcm, size_t frames) {
@@ -59,6 +62,8 @@ diff --git a/runtime/src/hle_audio.cpp b/runtime/src/hle_audio.cpp
 +            d.done = true;
 +            return;
 +        }
++        d.timing = std::fopen((std::string(path) + ".jsonl").c_str(), "w");
++        if (!d.timing) log("audio: NX_AUDIO_DUMP: cannot create timing sidecar");
 +        d.owner = source;
 +        std::atexit(audio_dump_close);  // a normal exit; a killed process keeps the last fix-up
 +        const char* what = source == kDumpAudioOut ? "AudioOut output" : "renderer mix";
@@ -67,8 +72,33 @@ diff --git a/runtime/src/hle_audio.cpp b/runtime/src/hle_audio.cpp
 +        else
 +            log("audio: dumping the %s to %s, the whole session", what, path);
 +    }
-+    if (!d.wav.write(pcm, frames)) {
++    const uint64_t at = d.wav.frames(), now = plat::monotonic_ns();
++    bool more = d.wav.write(pcm, frames);
++    if (d.timing) {
++        audio_probe::Event e;
++        while (audio_probe::pop(e))
++            std::fprintf(d.timing, "{\"type\":\"host\",\"frame\":%llu,\"monotonic_ns\":%llu,"
++                         "\"missing_frames\":%llu,\"underrun_callbacks\":%llu,\"late_callback_ns\":%llu,\"startup\":%s}\n",
++                         (unsigned long long)e.frame, (unsigned long long)e.monotonic_ns,
++                         (unsigned long long)e.missing_frames, (unsigned long long)e.underrun_callbacks, (unsigned long long)e.late_ns,
++                         e.startup ? "true" : "false");
++        std::fprintf(d.timing, "{\"type\":\"pcm\",\"frame\":%llu,\"frames\":%llu,\"monotonic_ns\":%llu,"
++                     "\"source\":%d,\"host_probe_active\":%s,\"host_underrun_callbacks\":%llu,\"host_missing_frames\":%llu,"
++                     "\"lost_host_events\":%llu,\"host_callbacks\":%llu,\"host_requested_frames\":%llu,\"host_late_callbacks\":%llu}\n", (unsigned long long)at,
++                     (unsigned long long)(d.wav.frames() - at), (unsigned long long)now, source,
++                     audio_probe::enabled ? "true" : "false",
++                     (unsigned long long)audio_probe::underruns.load(std::memory_order_relaxed),
++                     (unsigned long long)audio_probe::missing.load(std::memory_order_relaxed),
++                     (unsigned long long)audio_probe::lost.load(std::memory_order_relaxed),
++                     (unsigned long long)audio_probe::callbacks.load(std::memory_order_relaxed),
++                     (unsigned long long)audio_probe::requested.load(std::memory_order_relaxed),
++                     (unsigned long long)audio_probe::late_callbacks.load(std::memory_order_relaxed));
++        // Keep the sidecar durable at each WAV-sized quarter-second interval, and at the limit.
++        if (!more || at / 12000 != d.wav.frames() / 12000) std::fflush(d.timing);
++    }
++    if (!more) {
 +        d.done = true;
++        if (d.timing) std::fclose(d.timing), d.timing = nullptr;
 +        log("audio: wrote %s (%llu frames%s)", path, (unsigned long long)d.wav.frames(),
 +            d.wav.failed() ? ", stopped by a write error" : "");
 +    }
@@ -77,7 +107,7 @@ diff --git a/runtime/src/hle_audio.cpp b/runtime/src/hle_audio.cpp
  void render_block_done(void* ctx);
  bool render_owns(void* ctx);
  void device_done(void* ctx) {
-@@ -110,6 +172,9 @@ void player() {
+@@ -110,6 +202,9 @@
              g_out.queued.pop_front();
              g_out.inflight.emplace(packet.get(), packet);
          }
@@ -87,7 +117,7 @@ diff --git a/runtime/src/hle_audio.cpp b/runtime/src/hle_audio.cpp
          if (device && plat::audio_submit(packet->pcm.data(), packet->pcm.size(), packet.get())) continue;
          // A missing/rejecting sink never establishes audible output. Pace, then release.
          std::unique_lock lk(g_out.lock);
-@@ -407,6 +472,7 @@ void CommandListProcessorProcess(CPU& c) {
+@@ -407,6 +502,7 @@
      capture_device_sink(proc);
  }
  
@@ -95,7 +125,7 @@ diff --git a/runtime/src/hle_audio.cpp b/runtime/src/hle_audio.cpp
  void write_wav(const char* path, const std::vector<int16_t>& pcm) {
      FILE* f = std::fopen(path, "wb");
      if (!f) return;
-@@ -419,6 +485,7 @@ void write_wav(const char* path, const std::vector<int16_t>& pcm) {
+@@ -419,6 +515,7 @@
      std::fclose(f);
      log("audio: wrote %s (%zu frames)", path, pcm.size() / 2);
  }
@@ -103,7 +133,7 @@ diff --git a/runtime/src/hle_audio.cpp b/runtime/src/hle_audio.cpp
  
  // Called by the render thread after each 5 ms frame.
  void render_submit() {
-@@ -439,10 +506,15 @@ void render_submit() {
+@@ -439,10 +536,15 @@
          any |= v != 0;
      }
      o.silent += !any;
@@ -223,3 +253,61 @@ new file mode 100644
 +};
 +
 +}  // namespace nx
+diff --git a/runtime/src/audio_probe.h b/runtime/src/audio_probe.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/audio_probe.h
+@@ -0,0 +1,53 @@
++// Non-blocking diagnostic handoff: one host callback producer, one PCM dump consumer.
++// No file I/O, allocation or logging in the callback. Overflow is counted explicitly.
++#pragma once
++#include <atomic>
++#include <cstdint>
++namespace nx::audio_probe {
++struct Event {
++    uint64_t frame, monotonic_ns, missing_frames, underrun_callbacks, late_ns;
++    bool startup;
++};
++inline constexpr unsigned kCapacity = 1024;
++inline Event events[kCapacity];
++inline std::atomic<unsigned> head{0}, tail{0};
++inline std::atomic<uint64_t> callbacks{0}, requested{0}, underruns{0}, missing{0}, lost{0};
++inline std::atomic<uint64_t> late_callbacks{0};
++inline std::atomic<bool> submitted{false};
++inline bool enabled = false;  // set before the device is resumed
++inline uint64_t previous_ns = 0, previous_frames = 0;
++inline uint64_t cursor = 0;  // callback thread only
++inline void callback(uint64_t frames, uint64_t absent, uint64_t now) {
++    if (!enabled) return;
++    callbacks.fetch_add(1, std::memory_order_relaxed);
++    requested.fetch_add(frames, std::memory_order_relaxed);
++    uint64_t late = 0;
++    if (frames) {
++        const uint64_t expected = previous_frames * 1000000000ull / 48000;
++        if (previous_frames && now > previous_ns && now - previous_ns > expected + 20000000ull)
++            late = now - previous_ns - expected;
++        previous_ns = now, previous_frames = frames;
++    }
++    if (late) late_callbacks.fetch_add(1, std::memory_order_relaxed);
++    if (absent || late) {
++        uint64_t count = absent ? underruns.fetch_add(1, std::memory_order_relaxed) + 1
++                                : underruns.load(std::memory_order_relaxed);
++        missing.fetch_add(absent, std::memory_order_relaxed);
++        unsigned h = head.load(std::memory_order_relaxed), next = (h + 1) % kCapacity;
++        if (next == tail.load(std::memory_order_acquire))
++            lost.fetch_add(1, std::memory_order_relaxed);
++        else {
++            events[h] = {cursor, now, absent, count, late, !submitted.load(std::memory_order_relaxed)};
++            head.store(next, std::memory_order_release);
++        }
++    }
++    cursor += frames;
++}
++inline bool pop(Event& event) {
++    unsigned t = tail.load(std::memory_order_relaxed);
++    if (t == head.load(std::memory_order_acquire)) return false;
++    event = events[t];
++    tail.store((t + 1) % kCapacity, std::memory_order_release);
++    return true;
++}
++}  // namespace nx::audio_probe

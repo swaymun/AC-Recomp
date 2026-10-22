@@ -1,0 +1,346 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 033c7ea..987d2c5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -201,7 +201,7 @@ if(NX_GAME STREQUAL "astral")
+     list(APPEND NX_RUNTIME_SOURCES runtime/src/perf_hud.cpp runtime/src/nvn/nvn_hud.cpp)
+ endif()
+ # Astral strict, SDL3 desktop hosts (macOS, Linux): the launcher and remappable controls (docs/ASTRAL_LAUNCHER.md).
+-if(NX_GAME STREQUAL "astral" AND NOT ANDROID AND NOT IOS AND NOT WIN32)
++if(NX_GAME STREQUAL "astral" AND NOT ANDROID AND NOT IOS)
+     list(APPEND NX_RUNTIME_SOURCES runtime/src/input_map.cpp runtime/src/launcher.cpp)
+ endif()
+
+@@ -273,6 +273,12 @@ else()
+         runtime/src/hle_fiber.cpp)
+     target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}" "${NX_VULKAN_SDK}/Include")
+     target_link_libraries(${NX_GAME} PRIVATE game_main game_sdk xinput xaudio2 ole32 psapi)
++    if(NX_GAME STREQUAL "astral")
++        find_package(SDL3 3.2 REQUIRED CONFIG)
++        target_link_libraries(${NX_GAME} PRIVATE SDL3::SDL3 shell32)
++        add_custom_command(TARGET ${NX_GAME} POST_BUILD
++            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL3::SDL3> $<TARGET_FILE_DIR:${NX_GAME}>)
++    endif()
+     # The runtime uses the portable C library (getenv, fopen, ...) on every host: no "_s" variants.
+     target_compile_definitions(${NX_GAME} PRIVATE _CRT_SECURE_NO_WARNINGS _SILENCE_CXX20_U8PATH_DEPRECATION_WARNING)
+     if(MSVC)
+@@ -318,7 +324,7 @@ set(NX_MAIN_VARIANT_LIST "" CACHE FILEPATH "Variant main file list (tools/acr_bu
+ set(NX_MAIN_VARIANT_NAME "60fps" CACHE STRING "Suffix of the variant executable")
+ # A one-rate build (acr_build --fps 30|60): the launcher shows that rate on its Frame rate row.
+ set(NX_SINGLE_FPS "" CACHE STRING "Frame rate of a one-rate build (30 or 60), empty with both")
+-if(NX_GAME STREQUAL "astral" AND NX_SINGLE_FPS MATCHES "^(30|60)$" AND NOT ANDROID AND NOT IOS AND NOT WIN32)
++if(NX_GAME STREQUAL "astral" AND NX_SINGLE_FPS MATCHES "^(30|60)$" AND NOT ANDROID AND NOT IOS)
+     set_property(SOURCE runtime/src/launcher.cpp APPEND PROPERTY COMPILE_DEFINITIONS NX_SINGLE_FPS=${NX_SINGLE_FPS})
+ endif()
+ if(NX_GAME STREQUAL "astral" AND NX_MAIN_VARIANT_LIST AND NOT ANDROID AND NOT IOS AND NOT WIN32)
+diff --git a/runtime/src/input_map.cpp b/runtime/src/input_map.cpp
+index 971cb32..d11d94d 100644
+--- a/runtime/src/input_map.cpp
++++ b/runtime/src/input_map.cpp
+@@ -2,6 +2,7 @@
+ // docs/ASTRAL_LAUNCHER.md).
+ #if defined(NX_ASTRAL_STRICT)
+ #include "input_map.h"
++#include "windows_env.h"
+ #include "save_profile.h"
+
+ #include <algorithm>
+diff --git a/runtime/src/launcher.cpp b/runtime/src/launcher.cpp
+index 3f300b6..5e7e901 100644
+--- a/runtime/src/launcher.cpp
++++ b/runtime/src/launcher.cpp
+@@ -13,7 +13,14 @@
+ #include <map>
+
+ #include <cerrno>
++#if defined(_WIN32)
++#include <windows.h>
++#include <shellapi.h>
++#include <process.h>
++#include "windows_env.h"
++#else
+ #include <unistd.h>
++#endif
+ #if defined(__APPLE__)
+ #include <crt_externs.h>
+ #include <mach-o/dyld.h>
+@@ -1292,7 +1299,14 @@ bool run(Menu& m) {
+
+ std::string self_exe() {
+     std::error_code ec;
+-#if defined(__APPLE__)
++#if defined(_WIN32)
++    std::wstring path(32768, L'\0');
++    DWORD n = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
++    if (!n || n >= path.size()) return "";
++    path.resize(n);
++    auto utf8 = std::filesystem::path(path).u8string();
++    return std::string(utf8.begin(), utf8.end());
++#elif defined(__APPLE__)
+     uint32_t n = 0;
+     _NSGetExecutablePath(nullptr, &n);
+     std::string p(n + 1, '\0');
+@@ -1310,13 +1324,27 @@ std::string fps_variant(const std::string& self, bool want60) {
+     if constexpr (astral_fps::mode != 0) return "";  // a dynamic build must not switch into a stale legacy sibling
+     static const std::string kTag = "-60fps";
+     if (self.empty()) return "";
++#if defined(_WIN32)
++    auto p = std::filesystem::u8path(self);
++    auto stem = p.stem().u8string();
++    std::string name(stem.begin(), stem.end());
++#else
+     std::filesystem::path p(self);
+     std::string name = p.filename().string();
++#endif
+     bool is60 = name.size() > kTag.size() && name.compare(name.size() - kTag.size(), kTag.size(), kTag) == 0;
+     if (want60 == is60) return self;
+     std::string base = is60 ? name.substr(0, name.size() - kTag.size()) : name;
++#if defined(_WIN32)
++    auto path = p.parent_path() / std::filesystem::u8path((want60 ? base + kTag : base) + p.extension().string());
++    auto utf8 = path.u8string();
++    std::string other(utf8.begin(), utf8.end());
++    std::error_code ec;
++    return std::filesystem::is_regular_file(std::filesystem::u8path(other), ec) ? other : "";
++#else
+     std::string other = (p.parent_path() / (want60 ? base + kTag : base)).string();
+     return access(other.c_str(), X_OK) == 0 ? other : "";
++#endif
+ }
+
+ int running_fps(const std::string& self) {
+@@ -1327,14 +1355,29 @@ int running_fps(const std::string& self) {
+     return NX_SINGLE_FPS;
+ #else
+     static const std::string kTag = "-60fps";
++#if defined(_WIN32)
++    auto stem = std::filesystem::u8path(self).stem().u8string();
++    std::string name(stem.begin(), stem.end());
++#else
+     std::string name = std::filesystem::path(self).filename().string();
++#endif
+     return name.size() > kTag.size() && name.compare(name.size() - kTag.size(), kTag.size(), kTag) == 0 ? 60 : 30;
+ #endif
+ }
+
+ static std::vector<std::string> own_args() {
+     std::vector<std::string> out;
+-#if defined(__APPLE__)
++#if defined(_WIN32)
++    int count = 0;
++    wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &count);
++    if (argv) {
++        for (int i = 0; i < count; ++i) {
++            auto a = std::filesystem::path(argv[i]).u8string();
++            out.emplace_back(a.begin(), a.end());
++        }
++        LocalFree(argv);
++    }
++#elif defined(__APPLE__)
+     char** argv = *_NSGetArgv();
+     for (int i = 0, n = *_NSGetArgc(); i < n; i++) out.push_back(argv[i] ? argv[i] : "");
+ #else
+@@ -1373,7 +1416,40 @@ bool reexec(const std::string& exe, const char* why) {
+ #endif
+     SDL_InitFlags was = SDL_WasInit(0);
+     SDL_Quit();
++#if defined(_WIN32)
++    std::vector<std::wstring> wide;
++    for (const auto& a : args) {
++        std::wstring quoted = L"\"";
++        unsigned slashes = 0;
++        for (wchar_t c : std::filesystem::u8path(a).wstring()) {
++            if (c == L'\\') { ++slashes; continue; }
++            quoted.append(c == L'"' ? slashes * 2 + 1 : slashes, L'\\');
++            quoted += c;
++            slashes = 0;
++        }
++        quoted.append(slashes * 2, L'\\');
++        quoted += L'"';
++        wide.push_back(std::move(quoted));
++    }
++    std::vector<const wchar_t*> wargv;
++    for (const auto& a : wide) wargv.push_back(a.c_str());
++    wargv.push_back(nullptr);
++    // Keep the launcher parent alive until the selected binary exits; no POSIX exec on Windows.
++    // A successful child may itself exit 0xffffffff: _P_WAIT also returns -1 for that status.
++    // Keep the process handle so a child exit can never be mistaken for a failed spawn.
++    intptr_t spawned = _wspawnv(_P_NOWAIT, std::filesystem::u8path(exe).c_str(), wargv.data());
++    if (spawned != -1) {
++        HANDLE process = reinterpret_cast<HANDLE>(spawned);
++        DWORD code = 1;
++        bool ok = WaitForSingleObject(process, INFINITE) == WAIT_OBJECT_0 && GetExitCodeProcess(process, &code);
++        CloseHandle(process);
++        if (!ok) nx::log("launcher: could not wait for the selected binary; exiting");
++        std::fflush(nullptr);
++        ExitProcess(ok ? code : 1);
++    }
++#else
+     execv(exe.c_str(), argv.data());
++#endif
+     int err = errno;
+     SDL_Init(was);
+     nx::log("launcher: could not run %s (%s); staying in this binary", exe.c_str(), std::strerror(err));
+diff --git a/runtime/src/platform_win.cpp b/runtime/src/platform_win.cpp
+index e8aca4c..985af17 100644
+--- a/runtime/src/platform_win.cpp
++++ b/runtime/src/platform_win.cpp
+@@ -28,6 +28,8 @@
+ #endif
+ #if defined(NX_ASTRAL_STRICT)
+ #include "perf_hud.h"
++#include "input_map.h"
++#include "launcher.h"
+ #endif
+
+ namespace nx {
+@@ -203,6 +205,14 @@ static void window_thread(std::atomic<bool>* ready) {
+     if (const char* r = std::getenv("NX_RESOLUTION")) std::sscanf(r, "%ux%u", &rw, &rh);
+     int sh = GetSystemMetrics(SM_CYSCREEN);
+     int ch = std::max(540, sh * 8 / 10), cw = int(int64_t(ch) * rw / std::max(1u, rh));
++#if defined(NX_ASTRAL_STRICT)
++    unsigned requested_w = 0, requested_h = 0;
++    if (const char* value = std::getenv("NX_RESOLUTION"); value &&
++        std::sscanf(value, "%ux%u", &requested_w, &requested_h) == 2 && requested_w && requested_h) {
++        cw = int(std::min(requested_w, 8192u));
++        ch = int(std::min(requested_h, 8192u));
++    }
++#endif
+     RECT r{0, 0, cw, ch};
+     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+     int w = r.right - r.left, h = r.bottom - r.top;
+@@ -255,6 +265,88 @@ size_t read_touches(TouchPoint*, size_t) { return 0; }  // no touch-screen sourc
+
+ #endif
+ void read_pad(PadState& p) {
++#if defined(NX_ASTRAL_STRICT)
++    input::Frame frame;
++    XINPUT_STATE xs{};
++    // An idle first controller must not swallow a newly connected player's input.
++    // Prefer the first active pad; retain the first connected one when all are neutral.
++    bool connected = false;
++    for (DWORD slot = 0; slot < XUSER_MAX_COUNT; ++slot) {
++        XINPUT_STATE candidate{};
++        if (XInputGetState(slot, &candidate) != ERROR_SUCCESS) continue;
++        if (!connected) xs = candidate, connected = true;
++        const auto& g = candidate.Gamepad;
++        if (g.wButtons || g.bLeftTrigger > 30 || g.bRightTrigger > 30 ||
++            std::abs(int(g.sThumbLX)) > input::kStickDeadzone || std::abs(int(g.sThumbLY)) > input::kStickDeadzone ||
++            std::abs(int(g.sThumbRX)) > input::kStickDeadzone || std::abs(int(g.sThumbRY)) > input::kStickDeadzone) {
++            xs = candidate;
++            break;
++        }
++    }
++    if (connected) {
++        frame.has_pad = true;
++        const auto& g = xs.Gamepad;
++        const WORD masks[] = {XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
++            XINPUT_GAMEPAD_BACK, XINPUT_GAMEPAD_START, XINPUT_GAMEPAD_LEFT_THUMB, XINPUT_GAMEPAD_RIGHT_THUMB,
++            XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER,
++            XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT};
++        const SDL_GamepadButton buttons[] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST,
++            SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH, SDL_GAMEPAD_BUTTON_BACK, SDL_GAMEPAD_BUTTON_START,
++            SDL_GAMEPAD_BUTTON_LEFT_STICK, SDL_GAMEPAD_BUTTON_RIGHT_STICK, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,
++            SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_DOWN,
++            SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT};
++        for (size_t i = 0; i < std::size(masks); ++i) frame.buttons[buttons[i]] = (g.wButtons & masks[i]) != 0;
++        frame.axes[SDL_GAMEPAD_AXIS_LEFTX] = g.sThumbLX;
++        frame.axes[SDL_GAMEPAD_AXIS_LEFTY] = int16_t(std::clamp(-int(g.sThumbLY), -32768, 32767));
++        frame.axes[SDL_GAMEPAD_AXIS_RIGHTX] = g.sThumbRX;
++        frame.axes[SDL_GAMEPAD_AXIS_RIGHTY] = int16_t(std::clamp(-int(g.sThumbRY), -32768, 32767));
++        frame.axes[SDL_GAMEPAD_AXIS_LEFT_TRIGGER] = int16_t(int(g.bLeftTrigger) * 32767 / 255);
++        frame.axes[SDL_GAMEPAD_AXIS_RIGHT_TRIGGER] = int16_t(int(g.bRightTrigger) * 32767 / 255);
++    }
++    bool keys[SDL_SCANCODE_COUNT]{};
++    if (g_window && GetForegroundWindow() == g_window) {
++        // Map physical SDL scancodes to Win32 scan codes; never sample a background window's keyboard.
++        for (int sc = 1; sc < SDL_SCANCODE_COUNT; ++sc) {
++            SDL_Keycode code = SDL_GetKeyFromScancode(SDL_Scancode(sc), SDL_KMOD_NONE, false);
++            int vk = 0;
++            if (code >= SDLK_A && code <= SDLK_Z) vk = 'A' + int(code - SDLK_A);
++            else if (code >= SDLK_0 && code <= SDLK_9) vk = '0' + int(code - SDLK_0);
++            else if (sc >= SDL_SCANCODE_F1 && sc <= SDL_SCANCODE_F12) vk = VK_F1 + sc - SDL_SCANCODE_F1;
++            else if (sc >= SDL_SCANCODE_F13 && sc <= SDL_SCANCODE_F24) vk = VK_F13 + sc - SDL_SCANCODE_F13;
++            else if (code > 0 && code < 128) {
++                SHORT mapped = VkKeyScanW(wchar_t(code));
++                if (mapped != -1) vk = mapped & 0xff;
++            }
++            else switch (sc) {
++                case SDL_SCANCODE_SPACE: vk = VK_SPACE; break;
++                case SDL_SCANCODE_RETURN: vk = VK_RETURN; break;
++                case SDL_SCANCODE_ESCAPE: vk = VK_ESCAPE; break;
++                case SDL_SCANCODE_BACKSPACE: vk = VK_BACK; break;
++                case SDL_SCANCODE_TAB: vk = VK_TAB; break;
++                case SDL_SCANCODE_INSERT: vk = VK_INSERT; break;
++                case SDL_SCANCODE_DELETE: vk = VK_DELETE; break;
++                case SDL_SCANCODE_HOME: vk = VK_HOME; break;
++                case SDL_SCANCODE_END: vk = VK_END; break;
++                case SDL_SCANCODE_PAGEUP: vk = VK_PRIOR; break;
++                case SDL_SCANCODE_PAGEDOWN: vk = VK_NEXT; break;
++                case SDL_SCANCODE_UP: vk = VK_UP; break;
++                case SDL_SCANCODE_DOWN: vk = VK_DOWN; break;
++                case SDL_SCANCODE_LEFT: vk = VK_LEFT; break;
++                case SDL_SCANCODE_RIGHT: vk = VK_RIGHT; break;
++                case SDL_SCANCODE_LSHIFT: vk = VK_LSHIFT; break;
++                case SDL_SCANCODE_RSHIFT: vk = VK_RSHIFT; break;
++                case SDL_SCANCODE_LCTRL: vk = VK_LCONTROL; break;
++                case SDL_SCANCODE_RCTRL: vk = VK_RCONTROL; break;
++                case SDL_SCANCODE_LALT: vk = VK_LMENU; break;
++                case SDL_SCANCODE_RALT: vk = VK_RMENU; break;
++                default: break;
++            }
++            if (vk) keys[sc] = (GetAsyncKeyState(vk) & 0x8000) != 0;
++        }
++        frame.keys = keys;
++    }
++    p = input::map(input::active(), frame);
++#else
+     XINPUT_STATE xs{};
+     if (XInputGetState(0, &xs) == ERROR_SUCCESS) {
+         const auto& g = xs.Gamepad;
+@@ -295,6 +387,7 @@ void read_pad(PadState& p) {
+     if (key('C')) p.buttons |= kZR;
+     if (key(VK_RETURN)) p.buttons |= kPlus;
+     if (key(VK_ESCAPE)) p.buttons |= kMinus;
++#endif
+     input_script(p);  // NX_INPUT_SCRIPT (input_script.cpp): unattended runs
+ }
+
+@@ -356,7 +449,8 @@ Voice g_callback;
+ bool audio_open(AudioDone done) {
+     g_done = done;
+     // Headless test runs (and NX_MUTE=1) are silent: no device, the callers pace themselves with a timer.
+-    if (headless() || std::getenv("NX_MUTE")) return false;
++    const char* mute = std::getenv("NX_MUTE");
++    if (headless() || (mute && *mute && *mute != '0')) return false;
+ #if defined(NX_ASTRAL_STRICT)
+     const char* probe_path = std::getenv("NX_AUDIO_DUMP");
+     audio_probe::enabled = probe_path && *probe_path;
+@@ -561,6 +655,13 @@ LONG WINAPI throw_tracer(EXCEPTION_POINTERS* e) {
+ }
+
+ int main() {
++#if defined(NX_ASTRAL_STRICT)
++    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
++        nx::log("launcher: SDL init failed: %s", SDL_GetError());
++        return 1;
++    }
++    if (!nx::launcher::start()) { SDL_Quit(); return 0; }
++#endif
+     nx::plat::start_memory_guard();  // before anything can grow: a leak must never freeze the machine (memguard_win.cpp)
+     SetUnhandledExceptionFilter(crash_handler);
+     if (const char* t = std::getenv("NX_THROW_TRACE"); t && *t == '1') AddVectoredExceptionHandler(1, throw_tracer);
+diff --git a/runtime/src/windows_env.h b/runtime/src/windows_env.h
+new file mode 100644
+index 0000000..bf47223
+--- /dev/null
++++ b/runtime/src/windows_env.h
+@@ -0,0 +1,9 @@
++// Windows CRT equivalent of POSIX setenv; launcher/settings export only before worker threads start.
++#pragma once
++#if defined(_WIN32)
++#include <cstdlib>
++inline int setenv(const char* name, const char* value, int overwrite) {
++    if (!overwrite && std::getenv(name)) return 0;
++    return _putenv_s(name, value);
++}
++#endif

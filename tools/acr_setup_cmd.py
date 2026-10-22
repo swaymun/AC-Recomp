@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Helper for 'AC-Recomp Setup.app': prerequisite checks and the tools/acr_build.py command line.
+"""Helper for AC-Recomp Setup: prerequisite checks and the tools/acr_build.py command line.
 
     acr_setup_cmd.py check                      JSON list of prerequisite rows (id, title, ok, detail, fix)
     acr_setup_cmd.py command [build options]    JSON {"argv": [...], "env": {...}} for the build
@@ -8,6 +8,12 @@
 
 Build options: --nsp FILE --keys FILE [--title-keys FILE] [--fonts DIR] --out DIR [--fps 60]
 [--render-res WxH] [--kit DIR] [--python EXE] [--dry-run].
+
+Windows: check --windows [--reuse-shaders], or run --windows --nsp FILE --keys FILE
+--out DIR [--title-keys FILE] [--spirv-dir DIR] [--fonts DIR] [--jobs N] [--no-desktop-shortcut].
+Alternatively reuse --import-dir DIR --control-receipt FILE. --to-stage control checks inputs only.
+The dump and keys are imported locally on Windows; a successful Windows build is followed by local icon/launcher
+compilation and per-user shortcut creation. A failed or dry-run build never creates shortcuts.
 
 The setup app passes file paths only; this helper never opens, prints, copies or hashes key files. It must run on
 the Python 3.9 that ships with the Xcode command-line tools, because it is what finds a newer Python for the build.
@@ -125,8 +131,11 @@ def brew_cmd(prefix, args):
 
 def nested(a, b):
     """True when a and b are the same folder or one is inside the other (after resolving links and '..')."""
-    a, b = os.path.realpath(os.path.expanduser(a)), os.path.realpath(os.path.expanduser(b))
-    return a == b or a.startswith(b.rstrip('/') + '/') or b.startswith(a.rstrip('/') + '/')
+    a, b = (os.path.normcase(os.path.realpath(os.path.expanduser(p))) for p in (a, b))
+    try:
+        return os.path.commonpath((a, b)) in (a, b)
+    except ValueError:  # Different drives on Windows.
+        return False
 
 
 def check_out(out, kits):
@@ -136,12 +145,23 @@ def check_out(out, kits):
             raise ValueError('the build folder %s overlaps the build kit at %s; choose another folder' % (out, kit))
 
 
-def build_argv(python, kit, nsp, keys, out, title_keys=None, fonts=None, fps=None, render_res=None):
+def build_argv(python, kit, nsp, keys, out, title_keys=None, fonts=None, fps=None, render_res=None,
+               import_dir=None, control_receipt=None, spirv_dir=None, jobs=None):
     """The tools/acr_build.py command line. Every input is a path; nothing is read here."""
-    for value, what in ((nsp, 'NSP'), (keys, 'prod.keys'), (out, 'build folder')):
+    inputs = ((import_dir, 'import folder'), (control_receipt, 'control receipt')) if import_dir else (
+        (nsp, 'NSP'), (keys, 'keys'))
+    for value, what in (*inputs, (out, 'build folder')):
         if not value:
             raise ValueError(what + ' is required')
-    argv = [python, '-u', os.path.join(kit, 'tools', 'acr_build.py'), '--nsp', nsp, '--keys', keys]
+    argv = [python, '-u', os.path.join(kit, 'tools', 'acr_build.py')]
+    if import_dir:
+        if nsp or keys or title_keys:
+            raise ValueError('an imported folder cannot be combined with dump/key options')
+        argv += ['--import-dir', import_dir, '--control-receipt', control_receipt]
+    else:
+        if control_receipt:
+            raise ValueError('control receipt requires an import folder')
+        argv += ['--nsp', nsp, '--keys', keys]
     if title_keys:
         argv += ['--title-keys', title_keys]
     if fonts:
@@ -155,7 +175,64 @@ def build_argv(python, kit, nsp, keys, out, title_keys=None, fonts=None, fps=Non
         if not RES.match(render_res):
             raise ValueError('render resolution must look like 2560x1440')
         argv += ['--render-res', render_res]
+    if spirv_dir:
+        argv += ['--spirv-dir', spirv_dir]
+    if jobs is not None:
+        if int(jobs) < 1:
+            raise ValueError('jobs must be positive')
+        argv += ['--jobs', str(jobs)]
     return argv
+
+
+def windows_check(reuse_shaders=False):
+    """Read-only Windows checks; installers are offered separately by Setup.ps1."""
+    import windows_native
+    rows = []
+    def row(name, title, ok, detail, required=True):
+        rows.append(dict(id=name, title=title, ok=bool(ok), detail=detail, required=required))
+    row('python', '64-bit Python 3.11 or newer', sys.version_info >= MIN_PYTHON and sys.maxsize > 2**32, sys.executable)
+    row('git', 'Git for Windows', shutil.which('git'), shutil.which('git') or 'not found')
+    try:
+        env = windows_native.developer_environment()
+        missing = [n for n in ('clang-cl', 'clang++', 'rc', 'cmake', 'ninja') if not shutil.which(n, path=env['PATH'])]
+        row('vs', 'Visual Studio C++ Build Tools', not missing,
+            'missing: ' + ', '.join(missing) if missing else 'C++ compiler, Clang, Windows SDK, CMake and Ninja found')
+    except (ValueError, OSError, subprocess.SubprocessError) as e:
+        row('vs', 'Visual Studio C++ Build Tools', False, str(e))
+    dotnet = shutil.which('dotnet')
+    try:
+        sdks = subprocess.run([dotnet, '--list-sdks'], capture_output=True, text=True, timeout=30).stdout if dotnet else ''
+    except (OSError, subprocess.SubprocessError):
+        sdks = ''
+    row('dotnet', '.NET 10 SDK', re.search(r'^10\.', sdks, re.M),
+        'not needed with translated shaders' if reuse_shaders else '.NET 10 SDK needed for shader translation',
+        not reuse_shaders)
+    import ctypes.util
+    row('shaders', 'Shader tools (spirv-val and zstd.dll)',
+        shutil.which('spirv-val') and ctypes.util.find_library('zstd'),
+        'not needed with translated shaders' if reuse_shaders else
+        'Install SPIRV-Tools and zstd.dll on PATH, or supply translated shaders from your Mac build',
+        not reuse_shaders)
+    return rows
+
+
+def windows_install(argv, kit, out, desktop=True, runner=subprocess.run):
+    """Run the real build first; a failed build must never create a success shortcut."""
+    env = windows_build_env(os.environ)
+    result = runner(argv, env=env)
+    if result.returncode:
+        return result.returncode
+    finish = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+              str(Path(kit) / 'ports/windows/FinishInstall.ps1'), '-InstallDir', str(out)]
+    if not desktop:
+        finish.append('-NoDesktopShortcut')
+    return runner(finish, env=env).returncode
+
+
+def windows_build_env(base):
+    """Python writes UTF-8 to pipes/logs and uses UTF-8 for default text files."""
+    return dict(base, PYTHONUTF8='1', PYTHONIOENCODING='utf-8', PYTHONUNBUFFERED='1',
+                DOTNET_CLI_TELEMETRY_OPTOUT='1')
 
 
 def build_env(base, prefixes=BREW_PREFIXES):
@@ -194,13 +271,15 @@ def parse(argv):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='cmd')
     sub.required = True
-    sub.add_parser('check')
+    c = sub.add_parser('check')
+    c.add_argument('--windows', action='store_true')
+    c.add_argument('--reuse-shaders', action='store_true')
     k = sub.add_parser('kit')
     k.add_argument('--dest', required=True)
     for name in ('command', 'run'):
         s = sub.add_parser(name)
-        s.add_argument('--nsp', required=True)
-        s.add_argument('--keys', required=True)
+        s.add_argument('--nsp')
+        s.add_argument('--keys')
         s.add_argument('--title-keys')
         s.add_argument('--fonts')
         s.add_argument('--out', required=True)
@@ -209,41 +288,69 @@ def parse(argv):
         s.add_argument('--kit', help='writable copy of the kit to build from (copied from this one if needed)')
         s.add_argument('--python', help='Python 3.11+ for the build (default: found automatically)')
         s.add_argument('--dry-run', action='store_true', help='pass --dry-run to the build (nothing is changed)')
+        s.add_argument('--import-dir')
+        s.add_argument('--control-receipt')
+        s.add_argument('--spirv-dir')
+        s.add_argument('--jobs', type=int)
+        s.add_argument('--to-stage', choices=('control',))
+        s.add_argument('--windows', action='store_true', help='finish a Windows install with icon and shortcuts')
+        s.add_argument('--no-desktop-shortcut', action='store_true')
     return p.parse_args(argv)
 
 
 def main(argv=None):
     a = parse(argv)
+    windows = getattr(a, 'windows', False) or sys.platform == 'win32'
+    if windows:
+        # Environment flags affect child interpreters, not this already-running
+        # helper. Its own redirected output must also handle Unicode paths.
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, 'reconfigure'):
+                stream.reconfigure(encoding='utf-8')
     if a.cmd == 'check':
-        print(json.dumps(check(), indent=1))
+        print(json.dumps(windows_check(a.reuse_shaders) if a.windows or sys.platform == 'win32' else check(), indent=1))
         return 0
     if a.cmd == 'kit':
         print(copy_kit(KIT, a.dest))
         return 0
-    python = a.python or find_python()[0]
+    python = a.python or (sys.executable if windows else find_python()[0])
     if not python:
         print('error: Python 3.11 or newer was not found; install it with: brew install python', file=sys.stderr)
         return 2
     kit = str(KIT)
     try:
         check_out(a.out, (str(KIT), a.kit))
+        if a.import_dir and nested(a.out, a.import_dir):
+            raise ValueError('the install folder must not overlap the imported game folder')
     except ValueError as e:
         print('error: ' + str(e), file=sys.stderr)
         return 2
     if a.kit:
-        kit = str(copy_kit(KIT, a.kit) if a.cmd == 'run' else a.kit)
+        kit = str(a.kit)
     try:
-        argv = build_argv(python, kit, a.nsp, a.keys, a.out, a.title_keys, a.fonts, a.fps, a.render_res)
+        argv = build_argv(python, kit, a.nsp, a.keys, a.out, a.title_keys, a.fonts, a.fps, a.render_res,
+                          a.import_dir, a.control_receipt, a.spirv_dir, a.jobs)
     except ValueError as e:
         print('error: ' + str(e), file=sys.stderr)
         return 2
+    if a.to_stage:
+        argv += ['--to-stage', a.to_stage]
     if a.dry_run:
         argv.append('--dry-run')
-    env = build_env(os.environ)
+    env = windows_build_env(os.environ) if windows else build_env(os.environ)
     if a.cmd == 'command':
-        print(json.dumps({'argv': argv, 'env': {'PATH': env['PATH']}}, indent=1))
+        names = ('PATH', 'PYTHONUTF8', 'PYTHONIOENCODING') if windows else ('PATH',)
+        exported = {k: env[k] for k in names}
+        print(json.dumps({'argv': argv, 'env': exported}, indent=1))
         return 0
-    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+    if a.kit and not a.dry_run:
+        copy_kit(KIT, a.kit)
+    if windows:
+        if a.dry_run or a.to_stage:
+            return subprocess.run(argv, env=env).returncode
+        return windows_install(argv, kit, a.out, not a.no_desktop_shortcut)
+    if not a.dry_run:
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     print('$ ' + ' '.join(argv[2:]), flush=True)
     try:
         os.setpgrp()  # the setup app signals the whole build (compilers too) when the player cancels

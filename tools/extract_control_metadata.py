@@ -26,6 +26,7 @@ SOURCES = ('nximport.cpp', 'nxcrypto.cpp', 'nximport_cli.cpp', 'nximport.h', 'nx
 UNIT_DIR = '.local/control-runtime-024/metadata'
 OWNER = Path(__file__).resolve().parents[1]
 MAX_SMALL = 4 << 20
+WINDOWS = sys.platform == 'win32'
 
 
 class Failure(Exception):
@@ -41,10 +42,17 @@ def utc():
     return datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
 
 
+def is_link(path):
+    try:
+        return path.is_symlink() or bool(getattr(path.lstat(), 'st_file_attributes', 0) & 0x400)
+    except FileNotFoundError:
+        return False
+
+
 def regular(path):
     s = path.lstat()
     require(stat.S_ISREG(s.st_mode) and s.st_nlink == 1, 'unsafe_input_file')
-    require(not any(p.is_symlink() for p in (path, *path.parents)), 'input_symlink')
+    require(not any(is_link(p) for p in (path, *path.parents)), 'input_symlink')
     return s
 
 
@@ -78,8 +86,8 @@ def hash_file(path):
 
 def atomic_json(path, value):
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix='.receipt-')
-    with os.fdopen(fd, 'w') as f:
-        os.fchmod(f.fileno(), 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+        os.chmod(tmp, 0o600)
         json.dump(value, f, indent=2, sort_keys=True)
         f.write('\n')
         f.flush()
@@ -87,7 +95,18 @@ def atomic_json(path, value):
     os.replace(tmp, path)
 
 
-def child(argv, cwd, seconds, deadline, capture=False):
+def terminate_tree(p):
+    if WINDOWS:
+        # Include owned descendants; never terminate unrelated compiler/game jobs.
+        subprocess.run(['taskkill.exe', '/PID', str(p.pid), '/T', '/F'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        if p.poll() is None:
+            p.kill()
+    else:
+        os.killpg(p.pid, signal.SIGKILL)
+
+
+def child(argv, cwd, seconds, deadline, capture=False, *, env=None):
     """Each invocation owns a new process group; no raw diagnostics escape."""
     limit = min(seconds, deadline - time.monotonic())
     require(limit > 0, 'total_deadline')
@@ -96,19 +115,20 @@ def child(argv, cwd, seconds, deadline, capture=False):
     start = time.monotonic()
     # Capturing is restricted to bounded Git source/hash-helper output by callers.
     with tempfile.TemporaryFile() as output:
-        p = subprocess.Popen(receipt['argv'], cwd=cwd, start_new_session=True,
+        p = subprocess.Popen(receipt['argv'], cwd=cwd, env=env, start_new_session=not WINDOWS,
                              stdout=output if capture else subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+                             stderr=subprocess.DEVNULL,
+                             **({'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if WINDOWS else {}))
         try:
             try:
                 rc = p.wait(timeout=limit)
             except subprocess.TimeoutExpired:
                 receipt['timed_out'] = True
-                os.killpg(p.pid, signal.SIGKILL)
+                terminate_tree(p)
                 rc = p.wait(timeout=5)
         except BaseException:
             try:
-                os.killpg(p.pid, signal.SIGKILL)
+                terminate_tree(p)
             except ProcessLookupError:
                 pass
             p.wait(timeout=5)
@@ -132,7 +152,7 @@ def private_output(repo, deadline, receipts):
     repo = repo.absolute()
     require(repo == OWNER, 'output_not_owning_worktree')
     root = repo / UNIT_DIR
-    require(not any(p.is_symlink() for p in (root, *root.parents)), 'output_symlink')
+    require(not any(is_link(p) for p in (root, *root.parents)), 'output_symlink')
     require(not git(repo, ['ls-files', '--', UNIT_DIR], deadline, receipts), 'output_tracked')
     record, _ = child(['git', '-C', str(repo), 'check-ignore', '--no-index', '-q', UNIT_DIR + '/receipt.json'],
                       repo, 10, deadline)
@@ -177,7 +197,7 @@ def retained_inputs(import_dir, manifest):
     require(all(old[k] == manifest['dump'][k] for k in ('sha256', 'size')), 'dump_receipt_mismatch')
     return {'program_id': program, 'npdm': actual,
             'dump_expected': {k: manifest['dump'][k] for k in ('size', 'sha256')},
-            'original_binding_limit': manifest.get('parent', {}).get('binding_limit')}
+            'original_binding_limit': (manifest.get('parent') or {}).get('binding_limit')}
 
 
 def audit(args):
@@ -300,8 +320,8 @@ def produce(args):
         report['inputs'] = retained_inputs(args.import_dir, manifest)
         report['manifest'] = identity(manifest_raw)
         stage = args.source_stage.absolute()
-        require(not any(p.is_symlink() for p in (stage, *stage.parents)), 'stage_symlink')
-        require(stage.stat().st_mode & 0o077 == 0, 'stage_permissions')
+        require(not any(is_link(p) for p in (stage, *stage.parents)), 'stage_symlink')
+        require(WINDOWS or stage.stat().st_mode & 0o077 == 0, 'stage_permissions')
         receipt_raw = small(stage / 'receipt.json')
         staged = json.loads(receipt_raw)['Astral Chain.nsp']
         dump = stage / 'Astral Chain.nsp'
@@ -318,19 +338,33 @@ def produce(args):
         for name in SOURCES:
             (directory / name).write_bytes(small(args.reference / (BASE + name)))
         for command in (['git', 'init', '-q', str(source)],
-                        ['git', '-C', str(source), 'apply', str(OWNER / 'runtime/patches/astral-control-import.patch')],
-                        ['c++', '-std=c++17', '-O2', str(directory / 'nximport.cpp'),
-                         str(directory / 'nxcrypto.cpp'), str(directory / 'nximport_cli.cpp'), '-o', str(run / 'nxcontrol')]):
+                        ['git', '-c', 'core.autocrlf=false', '-C', str(source), 'apply',
+                         str(OWNER / 'runtime/patches/astral-control-import.patch')]):
             rec, _ = child(command, args.repo, 90, deadline)
             receipts.append(rec)
             require(rec['exit_code'] == 0, 'native_preparation_failed')
-        report['native_binary'] = hash_file(run / 'nxcontrol')
+        tool = run / ('nxcontrol.exe' if WINDOWS else 'nxcontrol')
+        import import_owned_dump as owned
+        try:
+            command = owned.native_compile_command(source, tool, control=True)
+        except owned.ImportFailure:
+            raise Failure('native_preparation_failed') from None
+        env = None
+        if WINDOWS:
+            import windows_native
+            env = windows_native.developer_environment()
+        else:
+            command[0] = 'c++'
+        rec, _ = child(command, args.repo, 90, deadline, env=env)
+        receipts.append(rec)
+        require(rec['exit_code'] == 0, 'native_preparation_failed')
+        report['native_binary'] = hash_file(tool)
         report['native_sources'] = {name: identity(small(directory / name)) for name in SOURCES}
         for name in ('prod.keys', 'title.keys'):
             # Metadata only: Python never opens, reads, hashes or copies keys.
             info = regular(stage / name)
-            require(info.st_size > 0 and info.st_mode & 0o077 == 0, 'key_permissions')
-        rec, _ = child([run / 'nxcontrol', '--out', run, '--control-metadata',
+            require(info.st_size > 0 and (WINDOWS or info.st_mode & 0o077 == 0), 'key_permissions')
+        rec, _ = child([tool, '--out', run, '--control-metadata',
                         stage / 'prod.keys', stage / 'title.keys', dump], args.repo, 360, deadline)
         receipts.append(rec)
         require(rec['exit_code'] == 0, 'native_metadata_failed')
@@ -368,8 +402,9 @@ def main():
     p.add_argument('--reference', type=Path, required=True)
     p.add_argument('--import-dir', type=Path, required=True)
     args = p.parse_args()
-    signal.signal(signal.SIGALRM, total_timeout)
-    signal.setitimer(signal.ITIMER_REAL, 600 if args.source_stage else 60)
+    if not WINDOWS:
+        signal.signal(signal.SIGALRM, total_timeout)
+        signal.setitimer(signal.ITIMER_REAL, 600 if args.source_stage else 60)
     try:
         if args.source_stage:
             require(args.cnmt_layout is not None, 'explicit_cnmt_layout_required')
@@ -379,7 +414,8 @@ def main():
         print('{"status":"blocked","diagnostic":"audit_preflight_failed"}')
         return 2
     finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
+        if not WINDOWS:
+            signal.setitimer(signal.ITIMER_REAL, 0)
 
 
 if __name__ == '__main__':

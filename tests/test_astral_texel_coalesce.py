@@ -1,6 +1,6 @@
 """Texel-write coalescing overlay (astral-texel-coalesce.patch, docs/ASTRAL_TEXEL_COALESCE.md).
 
-The overlay is applied last in series.macos, after astral-save-profiles.patch. Its drop_covered_writes() is compiled
+The overlay follows astral-fps-variant.patch and precedes astral-shader-cache.patch. Its drop_covered_writes() is compiled
 from the patch bytes with a stand-in TexelWrite and checked: a write drops the pending writes it covers completely
 (same level, contained box, any depth), keeps partial overlaps, other levels and larger writes, and keeps the order of
 what remains; a texture written every frame keeps one pending write. The change is inside NX_ASTRAL_STRICT, and on
@@ -23,9 +23,12 @@ import prepare_runtime as runtime  # noqa: E402
 import test_astral_fps_variant as profiles  # noqa: E402
 from test_astral_touch import added_file  # noqa: E402
 
-# The native macOS overlay order (runtime/patches/series.macos): the fps-variant overlay's, then this overlay last.
+# Compose the earlier tests' order, inserting the audio fix at its dump dependency.
+# The shader-cache test extends this prefix through shader-cache and render-fix.
 OVERLAY = 'astral-texel-coalesce.patch'
-ORDER = (*profiles.ORDER, OVERLAY)
+_AUDIO_FIX_AT = profiles.ORDER.index('astral-audio-dump.patch') + 1
+ORDER = (*profiles.ORDER[:_AUDIO_FIX_AT], 'astral-audio-fix.patch',
+         *profiles.ORDER[_AUDIO_FIX_AT:], OVERLAY)
 PATCH = ROOT / 'runtime/patches' / OVERLAY
 OBJECTS = 'runtime/src/nvn/nvn_objects.cpp'
 
@@ -77,9 +80,10 @@ int main() {
 
 
 class TexelCoalesceTests(unittest.TestCase):
-    def test_series_ends_with_the_overlay(self):
+    def test_series_prefix_through_the_overlay(self):
         series = [l.split('#')[0].strip() for l in (ROOT / 'runtime/patches/series.macos').read_text().splitlines()]
-        self.assertEqual([s for s in series if s][-1], OVERLAY)
+        series = [s for s in series if s]
+        self.assertEqual(series[:series.index(OVERLAY) + 1], list(ORDER))
 
     def test_patch_is_strict_only_and_public(self):
         text = PATCH.read_text()

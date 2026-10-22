@@ -3,6 +3,7 @@ import argparse
 import copy
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,17 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
-import linux_runtime_startup as r
+# The frozen supervisor predates prepare_runtime's removal of its inventory
+# re-export. Supply that historical import boundary only while loading this
+# offline fixture; do not mutate production modules for other test suites.
+# This is not a repair of the legacy supervisor's standalone entrypoint.
+import prepare_runtime as preparation
+import import_owned_dump as inventory
+supervisor = Path(__file__).resolve().parents[1] / 'tools/linux_runtime_startup.py'
+spec = importlib.util.spec_from_file_location('_linux_startup_fixture', supervisor)
+r = importlib.util.module_from_spec(spec)
+with patch.object(preparation, 'inventory', inventory, create=True):
+    spec.loader.exec_module(r)
 
 
 class FixtureClock(datetime):

@@ -24,7 +24,6 @@ is stable while a contact is held. Implementations:
 
 | Platform | Source |
 | --- | --- |
-| iOS (`ios-astral-parity.patch`, `ports/ios`) | touches that begin on no on-screen control, or any touch while the controls are hidden |
 | macOS, Linux | left mouse button held over the game window = one contact (`SDL_GetMouseState`, window size in points), sampled on the main thread in `sample_input()` with the pad under `g_pad_lock`; `read_touches` returns that cached copy, and each new press gets a new id |
 | Windows, Android | none yet (`return 0`) |
 
@@ -72,9 +71,8 @@ Behaviour:
 
 `tests/test_astral_touch.py` compiles the shipped `hle_hid.cpp` block from the
 patch against stubbed platform calls and checks layout, attributes, finger-id
-reuse, the end report, letterboxing for a wide (iPhone) and a 4:3 (iPad) window,
-the time-based sampling number and the 16-contact limit. It also compiles the iOS bridge's touch-point API and
-checks that every platform implements `read_touches`.
+reuse, the end report, letterboxing for wide and 4:3 windows,
+the time-based sampling number and the 16-contact limit.
 
 ## Relation to `astral-launcher.patch`
 

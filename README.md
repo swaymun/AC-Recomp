@@ -7,26 +7,26 @@
 > AI-written code, you are free to skip it. As with any code from the internet, you build and run it at your own
 > discretion.
 
-**AC-Recomp** is an experimental native static recompilation of *Astral Chain* (Nintendo Switch, 2019) for macOS, with iPhone/iPad, Linux and Windows ports in progress.
+**AC-Recomp** is an experimental native static recompilation of *Astral Chain* (Nintendo Switch, 2019) for macOS, with Linux and Windows ports in progress.
+
+iOS/iPadOS is paused; see the `ios-archive` tag.
 
 > [!NOTE]
 > Platforms:
 > - **macOS** - Apple silicon only, Vulkan on Metal through MoltenVK. The primary target and the only platform in
 >   the current preview release.
-> - **iPhone and iPad** - **experimental, simulator only.** Build it yourself from source on a Mac. No IPA is or will
->   be published. See [iPhone and iPad](#iphone-and-ipad-build-it-yourself).
-> - **Linux** - x86-64, Vulkan. **Early:** boots through character creation (headless-tested); see [Linux](#linux).
-> - **Windows** - x86-64, Vulkan. **Early:** boots through the opening cutscene (headless-tested); see [Windows](#windows).
+> - **Linux** - x86-64, Vulkan. **Early:** reaches the File 01 motorcycle chase (headless-tested); see [Linux](#linux).
+> - **Windows** - x86-64, Vulkan. **Early:** plays through the File 01 motorcycle chase in a desktop window; see [Windows](#windows).
 
 > [!NOTE]
 > **No game files are included.** AC-Recomp needs your own legally dumped copy of *Astral Chain* **1.0.0** (base game,
 > no update) as an NSP, plus your own console's keys. Instructions on how to obtain these will **not** be provided.
-> The build tool imports your dump and recompiles the game's code on your own Mac. No game code, assets, shaders,
+> The build tools import your dump on a Mac and recompile the game's code on your Mac or Windows PC. No game code, assets, shaders,
 > fonts, keys or firmware are included in this repository or in any release.
 
-![The AC-Recomp launcher: Play, Controls, Settings and Quit over original art, with a game-files check](assets/launcher/start_screen.jpg)
+![The macOS AC-Recomp launcher: Play, Controls, Settings and Quit over original art, with a game-files check](assets/launcher/start_screen.jpg)
 
-*The launcher (start screen) after setup. The art is original and AI-generated and depicts no game characters; no game content is shown.*
+*The macOS launcher after setup. The art is original and AI-generated and depicts no game characters; no game content is shown.*
 
 ## Status
 
@@ -50,8 +50,6 @@ translated shaders are byte-identical to the development build's.
 - The first boot cutscene cannot be skipped and lasts about five minutes.
 - Without your firmware's shared fonts, open-licensed replacement fonts (Noto Sans) are used. Their in-game
   appearance is not yet verified, and button icons and Chinese, Japanese and Korean text do not display with them.
-- iOS simulator: loading a save into the 3D scene hangs the simulator GPU (see
-  [iPhone and iPad](#iphone-and-ipad-build-it-yourself)).
 - The first build takes a while (30 to 90 minutes) and needs about 25 GB of free space.
 
 The notes in [`docs/`](docs/) record each runtime change and its evidence. Many are dated working notes and may
@@ -62,7 +60,7 @@ describe states that later changes superseded.
 - **This is not emulation.** The game's Arm code is statically recompiled to C++ ahead of time and compiled into a
   native program. There is no CPU emulator or JIT. The Switch OS services and the NVN graphics API are reimplemented
   on the host: NVN runs on Vulkan, and the game's shaders are translated offline to SPIR-V.
-- **Launcher** (start screen) with Play, Controls and Settings: every controller button and keyboard key can be
+- **macOS launcher** (start screen) with Play, Controls and Settings: every controller button and keyboard key can be
   remapped, and settings are saved between runs. See [docs/ASTRAL_LAUNCHER.md](docs/ASTRAL_LAUNCHER.md).
 - **Performance HUD**, switched on in the launcher's Settings (or `NX_PERF_HUD=1`): Apple's Metal Performance HUD
   on macOS, MangoHud on Linux when installed, and a built-in HUD otherwise (F3 toggles MangoHud and the built-in
@@ -73,8 +71,7 @@ describe states that later changes superseded.
   `2560x1440`, tested through the opening only), and `--fps 60` builds a 60 fps mode (smoke-tested through the
   opening; battle, gameplay timing and audio sync are not yet checked). They can be combined. See
   [docs/ASTRAL_RENDER_RES.md](docs/ASTRAL_RENDER_RES.md) and [docs/ASTRAL_60FPS.md](docs/ASTRAL_60FPS.md).
-- **Touch screen** through the mouse: hold the left button over the window. On iOS, touches that begin outside the
-  on-screen controls are passed to the game.
+- **Touch screen** through the mouse: hold the left button over the window.
 - **Audio**, with optional full-session audio capture.
 
 ## Installation
@@ -156,98 +153,70 @@ The runtime reads them from `NX_SHARED_FONT_DIR`, or `<data root>/shared-fonts`,
 missing or does not decode to a TrueType/OpenType font. See
 [docs/ASTRAL_SHARED_FONT_SWKBD.md](docs/ASTRAL_SHARED_FONT_SWKBD.md).
 
-### iPhone and iPad (build it yourself)
-
-> [!WARNING]
-> **Experimental, simulator only.** No IPA is published, and none will be. The iOS port currently builds and runs
-> **only in the iOS Simulator** on an Apple silicon Mac: the runtime refuses to compile for a physical device. In the
-> simulator it boots, renders the opening and title screens and reaches the Load menu, but **loading a save into the
-> 3D scene hangs the simulator GPU**, so no gameplay has been reached. This section is for developers.
-
-> [!WARNING]
-> **Host safety.** The simulator's GPU work runs on your Mac's real GPU. During development, a stuck GPU submit in
-> the simulator with a raised GPU timeout hard-froze and restarted the host Mac twice. Keep the runtime's GPU fence
-> timeout at its default of 2 s (`NX_GPU_TIMEOUT_S` is clamped to 5 s), run **one game simulator at a time**, and do
-> not leave it running unattended while you need your Mac. `tools/ios_sim_run.py` enforces these rules.
-
-Tested with iOS simulator runtime 26.5 (minimum deployment target 26.0) on iPhone 17 Pro (title at 30 fps, menus at
-15 to 22 fps) and iPad Pro 13-inch (M5) simulators. Semi-transparent Switch-style touch controls are drawn over the
-game; a HIDE/PAD button toggles them.
-
-What you need:
-
-- Everything in the [macOS](#macos-apple-silicon) section, and a finished macOS build: the iOS build reuses its lifted
-  code (`<out>/work/gen`), translated shaders and data root (`<out>/data`).
-- Xcode with an iOS simulator runtime (26.0 or newer).
-- The MoltenVK 1.3.0 static XCFramework (from the MoltenVK or LunarG Vulkan SDK releases); its
-  `ios-arm64_x86_64-simulator` slice is linked.
-- A static `libopus.a` built for the arm64 iOS simulator, and the Opus headers.
-- The Vulkan headers the macOS build used.
-
-Steps:
-
-1. Prepare a patched runtime tree: a clean copy of
-   [SuperMarioWonderRecomp](https://github.com/BelmanteGu/SuperMarioWonderRecomp) at the pinned revision (the one
-   `tools/acr_build.py` clones into `<out>/work/upstream`), with `git apply` of every patch in
-   `runtime/patches/series.macos` in order, then `ios-runtime.patch`, `ios-nvn-compile.patch`, `ios-vulkan.patch` and
-   `ios-astral-parity.patch`.
-
-2. Configure and build for the simulator with CMake and Ninja. The UIKit host is `ports/ios`:
-
-   ```sh
-   cmake -S <patched tree> -B <build> -G Ninja -DCMAKE_SYSTEM_NAME=iOS \
-     -DCMAKE_OSX_SYSROOT=iphonesimulator -DCMAKE_OSX_ARCHITECTURES=arm64 \
-     -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 -DCMAKE_BUILD_TYPE=Release -DNX_GAME=astral \
-     -DNX_GEN_DIR=<out>/work/gen -DNX_VULKAN_INCLUDE=<vulkan headers> \
-     -DNX_IOS_HOST_DIR=<this repository>/ports/ios \
-     -DNX_IOS_MOLTENVK_LIBRARY=<MoltenVK.xcframework>/ios-arm64_x86_64-simulator/libMoltenVK.a \
-     -DNX_HWOPUS=ON -DNX_OPUS_LIBRARY=<simulator libopus.a> -DNX_OPUS_INCLUDE=<opus headers>
-   ninja -C <build>
-   ```
-
-   This compiles all of the generated game code again for the simulator, which takes a while.
-
-3. Run it with `tools/ios_sim_run.py`. It creates a fresh simulator of the device type, installs an ad-hoc-signed
-   copy of the app, launches it with your environment, takes screenshots, stops at the first fatal error, collects
-   the logs into `--out`, and shuts down and deletes the simulator it created. The simulator reads your Mac's files
-   directly, so the data root is used in place:
-
-   ```sh
-   python3 tools/ios_sim_run.py --app <build>/astral.app --device-type "iPhone 17 Pro" \
-     --seconds 300 --data-root <out>/data \
-     --env NX_NVN_REAL=1 --env NX_NVN_FORMAT_PROFILE=<out>/data/astral.profile \
-     --env NX_SHARED_FONT_DIR=<out>/data/shared-fonts --env NX_PERF_HUD=1 --out <log directory>
-   ```
-
-   It refuses to start while another simulator is booted or another game instance runs.
-
-[docs/ASTRAL_IOS_SIM.md](docs/ASTRAL_IOS_SIM.md) describes the patch stack, the touch controls, the measured results
-and the open issues.
-
-**Physical devices (not possible yet).** When device builds are enabled, you will be able to sign the app in Xcode
-with a free Apple ID (a personal team) and install it on your own iPhone or iPad. Apps signed that way expire after
-**7 days** and must be reinstalled from Xcode, a free account can have only a few such apps installed at once, and
-the device needs Developer Mode switched on. AC-Recomp will not distribute signed builds; you build and sign your
-own.
-
 ### Linux
 
 > [!NOTE]
 > **In progress.** Linux is not part of the current release, and its build is not scripted yet.
 
 <!-- LINUX-STATUS -->
-**Early, headless-tested.** On x86-64 Linux with an NVIDIA GPU (Ubuntu 22.04, Vulkan), the game boots through the
-title screen, menus, opening cutscene and character creation at 25 to 30 fps (tested headless with scripted input).
+**Early, headless-tested.** On x86-64 Linux with an NVIDIA GPU (Ubuntu 22.04, Vulkan; tested on a cloud NVIDIA A40
+with scripted input), the game runs through the title screen, opening cutscene, character creation and the File 01
+motorcycle chase. The title runs at about 30 fps and the opening cutscene at 23 to 30 fps; the chase averages about 23 to 26 fps, with frame-time
+spikes while textures load, and still shows some road/bike occlusion and glyph rendering bugs. One test run crashed
+in the chase; the cause is not yet known. Opt-in texture-upload settings (`NX_LINUX_STAGING_CACHED=1`,
+`NX_LINUX_STAGING_POOL=1`) and shader prewarm (`NX_SHADER_PREWARM=1`) are available but not yet on by default.
 A desktop window, audio and gamepad input are not tested yet, and building still needs a Mac to produce the
 recompiled code. Build notes: [docs/ASTRAL_LINUX.md](docs/ASTRAL_LINUX.md) (patch series `runtime/patches/series.linux`).
 
 ### Windows
 
 > [!NOTE]
-> **Early, headless-tested.** On Windows x64 with an NVIDIA GPU, the game boots through the title screen, the save
-> check and the opening cutscene (tested headless with scripted input). A desktop window, audio and gamepad input are
-> not tested yet, and building still needs a Mac to produce the recompiled code. Build notes:
+> **Early.** On Windows x64 with an NVIDIA GPU, the game runs in a desktop window through the title screen, the
+> opening cutscene, character creation and the File 01 motorcycle chase (tested on cloud VMs with scripted input).
+> Audio and real gamepad play are not verified yet. Initial dump import still needs a Mac; recompilation runs on
+> Windows. Build notes:
 > [docs/ASTRAL_WINDOWS.md](docs/ASTRAL_WINDOWS.md) (patch series `runtime/patches/series.windows`).
+
+Performance, measured with the 60 fps frame-rate option on a cloud VM with an NVIDIA RTX PRO 6000:
+
+- Shaders are cached after the first run, so later runs do not compile pipelines during play.
+- With default settings the title runs at 60 fps, the opening cutscene at about 56 fps and the chase at about 52 fps,
+  with displayed 1% lows near 26 to 27 fps in the chase.
+- Eight opt-in settings together reach 60 fps in all three scenes, with displayed 1% lows near 56 fps in the
+  chase. They are off by default until they pass visual, validation and long-session checks; see
+  [docs/ASTRAL_WINDOWS_PERF.md](docs/ASTRAL_WINDOWS_PERF.md).
+- **Known issue:** a long session can reach the runtime's 8 GiB memory guard after about 10 minutes of play, which
+  stops the game. Desktop GPUs cannot read the game's ASTC textures directly, so they are expanded in memory.
+  Opt-in fixes (`NX_WINDOWS_IMAGE_RETIRE_FIX=1`, `NX_WINDOWS_STREAM_UPLOADS=1`, `NX_WINDOWS_IMAGE_CACHE=1`) keep
+  10-minute sessions under the guard in testing but are not yet on by default; see
+  [docs/ASTRAL_WINDOWS_MEM.md](docs/ASTRAL_WINDOWS_MEM.md).
+
+The Windows source zip contains **no game files**. Bring your own *Astral Chain* 1.0.0 dump and keys.
+
+1. On a Mac, follow the prerequisites in [BUILDING.md](docs/BUILDING.md), then import your dump:
+
+   ```sh
+   python3 tools/acr_build.py --nsp "/path/to/Astral Chain.nsp" --keys "/path/to/keys" \
+     --out ~/AC-Recomp-import --to-stage control
+   ```
+
+   Add `--title-keys "/path/to/title-keys"` if your dump needs them.
+2. Copy the `exefs`, `analysis` and `extract` folders from
+   `~/AC-Recomp-import/.local/game-private/astral/` to one folder on Windows, plus
+   `~/AC-Recomp-import/work/control/receipt.json`. **Keep keys on the Mac.**
+   Optionally copy your own completed Mac build's `data/spirv` and `data/shared-fonts` folders.
+3. On a Windows PC with an AVX2-capable x64 CPU, a Vulkan 1.3+ graphics driver and at least 25 GB free, extract
+   `AC-Recomp-<version>-windows.zip` and double-click **AC-Recomp Setup.cmd**.
+   Enter the imported folder, receipt, optional shader/font folders and install location.
+4. Setup checks Python, Git, Visual Studio C++ Build Tools and shader tools, and prompts before installing
+   missing prerequisites. The first build needs internet and can take an hour or more.
+   To translate shaders on Windows, install .NET 10, SPIRV-Tools and `zstd.dll`; reusing your own shaders skips them.
+5. Open **AC-Recomp** from Start or the desktop, choose a frame rate, and click **Play**.
+   Keep the import and install folders in place. Saves are in the install's `data/user` folder.
+
+Setup is unsigned and runs only after you choose to open it. The game and launcher executables, including their
+icons, are built on your PC. If setup stops, fix the printed error and rerun with the same paths to resume.
+See [Windows setup](ports/windows/README.md) for installer details, logs and command-line options.
 
 ## Building from source
 

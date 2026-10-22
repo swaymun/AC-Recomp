@@ -1,4 +1,5 @@
 # Native Linux overlay order: runtime/patches/series.macos unchanged, then astral-linux.patch (docs/ASTRAL_LINUX.md).
+# astral-shader-cache.patch provides opt-in recorded prewarm and a default-on versioned cache on Linux.
 # tests/test_astral_linux.py checks that this list is series.macos plus the overlay, so keep the two in step.
 apple-memory.patch
 astral-bootstrap.patch
@@ -26,6 +27,7 @@ astral-shared-font.patch
 astral-swkbd.patch
 astral-perf-hud.patch
 astral-audio-dump.patch
+astral-audio-fix.patch
 astral-launcher.patch
 astral-touch.patch
 astral-upscale.patch
@@ -33,4 +35,7 @@ astral-save-profiles.patch
 astral-controls-ui.patch
 astral-fps-variant.patch
 astral-texel-coalesce.patch
+astral-shader-cache.patch
+astral-render-fix.patch
+astral-depth-fidelity.patch
 astral-linux.patch

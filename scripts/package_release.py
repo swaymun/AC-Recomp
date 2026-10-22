@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package a macOS source-only release zip: the build tools, runtime patches, launcher assets and docs.
+"""Package a macOS or Windows source-only release zip: build tools, patches, launcher assets and docs.
 
 Usage: scripts/package_release.py [--version v0.1.0-preview] [--out dist] [--repo REPO] [--ref HEAD] [--dmg]
 
@@ -38,6 +38,12 @@ FIXED = ('LICENSE', 'THIRD_PARTY_NOTICES.md', 'dependencies.lock', 'README.md',
          'docs/ASTRAL_60FPS.md', 'docs/ASTRAL_RENDER_RES.md',
          'release/README-FIRST.txt', 'tools/acr_setup_cmd.py', 'docs/SETUP_APP.md')
 FIXED_DIRS = ('assets/launcher/',)
+WINDOWS_FILES = ('ports/windows/Setup.cmd', 'ports/windows/Setup.ps1',
+                 'ports/windows/FinishInstall.ps1', 'ports/windows/Launcher.cs',
+                 'ports/windows/launcher.rc', 'ports/windows/README.md',
+                 'runtime/patches/series.windows', 'docs/ASTRAL_WINDOWS.md')
+# This is original launcher source, never lifted game code. No other C# is admitted.
+ORIGINAL_SOURCE = {'ports/windows/Launcher.cs'}
 NOTICE_GLOB = 'runtime/patches/*.NOTICE'
 BINARY_OK = re.compile(r'^assets/launcher/[^/]+\.(?:ttf|otf|jpg|jpeg|png)$')
 FORBIDDEN_SUFFIXES = {'.nsp', '.xci', '.nca', '.nso', '.nro', '.keys', '.bfttf', '.spv', '.metallib', '.dylib',
@@ -48,6 +54,22 @@ MAX_BYTES = 2 << 20
 
 class PackageError(Exception):
     pass
+
+
+def release_scan(tree):
+    """Keep the original upstream credit in the MIT dependency notice, without relaxing other scans."""
+    import export_public
+    findings = export_public.verify(tree)[0]
+    attribution = ('credits **theboy181** for the original Static 60 FPS patch that located the timer and '
+                   'display-cap code.')
+    kept = []
+    for rel, line, rule, excerpt in findings:
+        if rel == 'THIRD_PARTY_NOTICES.md' and rule == 'denied reference' and excerpt == 'theboy181':
+            lines = (tree / rel).read_text().splitlines()
+            if 0 < line <= len(lines) and lines[line - 1] == attribution:
+                continue
+        kept.append((rel, line, rule, excerpt))
+    return kept
 
 
 def git_tree(repo, ref, out):
@@ -65,14 +87,30 @@ def git_tree(repo, ref, out):
                 target.chmod(0o755 if m.mode & 0o111 else 0o644)
 
 
-def source_tree(repo, ref, scratch):
+def source_tree(repo, ref, scratch, windows=False):
     """The committed tree as the public sees it, and the export's verification findings (if the exporter exists)."""
     tree = scratch / 'tree'
     exporter = repo / 'scripts/export_public.py'
     if exporter.is_file():
         sys.path.insert(0, str(exporter.parent))
         import export_public
-        findings = export_public.export(tree, repo, ref)[0]
+        tree.mkdir(parents=True)
+        export_public.extract(repo, ref, tree)
+        # The public replacements must come from the same commit, not the live worktree.
+        replacements = scratch / 'replacements'
+        for rel in export_public.REPLACE:
+            target = replacements / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(subprocess.run(['git', '-C', str(repo), 'show', f'{ref}:{rel}'],
+                                             check=True, capture_output=True).stdout)
+        export_public.transform(replacements, tree)
+        wanted = set(members(tree, windows))
+        # stage_release also supplies the Swift sources that make_dmg compiles.
+        # Keep those build inputs audited even though the zip itself does not contain them.
+        wanted |= {p.relative_to(tree).as_posix() for p in tree.glob('ports/macos-setup/*.swift')}
+        # Unshipped research notes do not belong to this artifact's audit boundary.
+        # Every selected file is scanned again after staging, including renamed/generated entry points.
+        findings = [f for f in release_scan(tree) if f[0] in wanted]
         if findings:
             raise PackageError('the public export has findings; run scripts/export_public.py first:\n' +
                                '\n'.join(f'{r}:{n}: {rule}' for r, n, rule, _ in findings[:20]))
@@ -109,17 +147,21 @@ def tool_closure(tree, starts=ENTRY):
     return sorted(seen)
 
 
-def series(tree):
+def series(tree, platform='macos'):
     names = []
-    for line in (tree / 'runtime/patches/series.macos').read_text().splitlines():
+    for line in (tree / f'runtime/patches/series.{platform}').read_text().splitlines():
         line = line.split('#', 1)[0].strip()
         if line:
+            if not re.fullmatch(r'[A-Za-z0-9_.-]+\.patch', line) or line.startswith('.'):
+                raise PackageError('unsafe patch series member: ' + line)
             names.append('runtime/patches/' + line)
     return names
 
 
-def members(tree):
+def members(tree, windows=False):
     wanted = set(FIXED) | set(tool_closure(tree)) | set(series(tree))
+    if windows:
+        wanted |= set(WINDOWS_FILES) | set(series(tree, 'windows'))
     wanted |= {p.relative_to(tree).as_posix() for p in tree.glob(NOTICE_GLOB)}
     for d in FIXED_DIRS:
         wanted |= {p.relative_to(tree).as_posix() for p in (tree / d).rglob('*') if p.is_file()}
@@ -134,7 +176,7 @@ def check(stage, names):
     for rel in names:
         path = stage / rel
         suffix = path.suffix.lower()
-        if suffix in FORBIDDEN_SUFFIXES:
+        if suffix in FORBIDDEN_SUFFIXES and rel not in ORIGINAL_SOURCE:
             problems.append(f'{rel}: forbidden file type {suffix}')
         if path.stat().st_size > MAX_BYTES:
             problems.append(f'{rel}: larger than {MAX_BYTES} bytes')
@@ -157,39 +199,45 @@ def check_version(version):
         raise PackageError('version must look like v0.1.0-preview')
 
 
-def stage_release(version, repo, ref, scratch):
+def stage_release(version, repo, ref, scratch, windows=False):
     """Stage and check the release members under scratch/<top>. Returns (stage, source tree)."""
     check_version(version)
-    tree, exported = source_tree(Path(repo), ref, scratch)
-    names = members(tree)
+    tree, exported = source_tree(Path(repo), ref, scratch, windows)
+    names = members(tree, windows)
     stage = scratch / f'{NAME}-{version}'
     for rel in names:
         dest = stage / ('README-FIRST.txt' if rel == 'release/README-FIRST.txt' else rel)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(tree / rel, dest)
     (stage / 'tools/acr_build.py').chmod(0o755)
+    if windows:
+        # A visible entry point at the root, even when Explorer hides extensions.
+        (stage / 'AC-Recomp Setup.cmd').write_bytes(
+            b'@echo off\r\ncall "%~dp0ports\\windows\\Setup.cmd" %*\r\n')
     staged = sorted(p.relative_to(stage).as_posix() for p in stage.rglob('*') if p.is_file())
     check(stage, staged)
     if exported:
         import export_public
-        findings = export_public.verify(stage)[0]
+        findings = release_scan(stage)
         if findings:
             raise PackageError('release scan findings:\n' +
                                '\n'.join(f'{r}:{n}: {rule}: {x}' for r, n, rule, x in findings[:20]))
     return stage, tree
 
 
-def package(version=DEFAULT_VERSION, out=ROOT / 'dist', repo=ROOT, ref='HEAD', dmg=False):
+def package(version=DEFAULT_VERSION, out=ROOT / 'dist', repo=ROOT, ref='HEAD', dmg=False, windows=False):
     """Write <out>/AC-Recomp-<version>-macos.zip, and with dmg=True also the disk image with AC-Recomp Setup.app
     (scripts/make_dmg.py) built from the same staged kit."""
     check_version(version)
+    if windows and dmg:
+        raise PackageError('--windows and --dmg cannot be combined')
     top = f'{NAME}-{version}'
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    target = out / f'{top}-macos.zip'
+    target = out / f'{top}-{"windows" if windows else "macos"}.zip'
     with tempfile.TemporaryDirectory() as scratch:
         scratch = Path(scratch)
-        stage, tree = stage_release(version, repo, ref, scratch)
+        stage, tree = stage_release(version, repo, ref, scratch, windows)
         staged = sorted(p.relative_to(stage).as_posix() for p in stage.rglob('*') if p.is_file())
         tmp = target.with_name(target.name + '.tmp')
         with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as z:
@@ -217,9 +265,10 @@ def main(argv=None):
     p.add_argument('--ref', default='HEAD')
     p.add_argument('--dmg', action='store_true',
                    help='also build AC-Recomp-<version>-macos.dmg with AC-Recomp Setup.app (scripts/make_dmg.py)')
+    p.add_argument('--windows', action='store_true', help='build the Windows source kit with guided setup')
     a = p.parse_args(argv)
     try:
-        target, staged = package(a.version, a.out, a.repo, a.ref, a.dmg)
+        target, staged = package(a.version, a.out, a.repo, a.ref, a.dmg, a.windows)
     except (PackageError, subprocess.CalledProcessError, OSError) as e:
         print('package failed: ' + str(e), file=sys.stderr)
         return 1

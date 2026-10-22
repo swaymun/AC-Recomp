@@ -1,27 +1,17 @@
-"""Profile checks on the fully patched private tree (skipped when the private pinned upstream is absent):
-
-- Default (non-Astral) profile identity: astral-touch.patch and ios-astral-parity.patch change shared runtime files only
-  inside NX_ASTRAL_STRICT conditionals, so resolving NX_ASTRAL_STRICT as undefined gives the original bytes back.
-- Astral profile: no GPU wait or image acquire on the runtime's own Vulkan path is unbounded (UINT64_MAX); a stuck GPU
-  must end in gpu_hung after the clamped GPU timeout (docs/ASTRAL_IOS_SIM.md, host freeze incident)."""
+"""Desktop overlays preserve the non-Astral profile on the private pinned upstream."""
 import re
-import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PATCHES = ['astral-touch', 'ios-runtime', 'ios-nvn-compile', 'ios-vulkan', 'ios-astral-parity']  # after series.macos
 SHARED = ['runtime/src/hle_hid.cpp', 'runtime/src/platform.h', 'runtime/src/platform_mac.cpp',
           'runtime/src/platform_linux.cpp', 'runtime/src/platform_win.cpp', 'runtime/src/platform_android_input.cpp',
           'runtime/src/perf_hud.cpp', 'runtime/src/nvn/nvn_vk.cpp', 'runtime/src/nvn/nvn_vk.h',
           'runtime/src/nvn/nvn_frames.cpp', 'runtime/src/nvn/nvn_debug.cpp', 'runtime/src/nvn/nvn_pipeline.h',
           'runtime/src/nvn/nvn_spirv_patch.cpp', 'runtime/src/nvn/nvn_present.cpp', 'runtime/src/hle_vi.cpp',
           'runtime/src/hle_fs.cpp']
-# Guest-Vulkan pass-throughs: the guest's own vkWaitForFences/vkAcquireNextImageKHR calls forwarded for Vulkan games
-# (Hades). Astral renders through NVN and never reaches them; they keep the guest's timeout semantics.
-GUEST_VULKAN_ALLOWLIST = {'runtime/src/vk_swapchain.cpp', 'runtime/src/vk_gen.cpp', 'runtime/src/vk_bridge.cpp'}
 DIRECTIVE = re.compile(r'^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$')
 WAIT_CALL = re.compile(r'p_vk(WaitForFences|AcquireNextImageKHR|AcquireNextImage2KHR|WaitSemaphores(?:KHR)?)\s*\(')
 
@@ -108,7 +98,7 @@ def git_apply(tree: Path, name: str) -> None:
 
 def patched_tree(test, d: Path) -> tuple[Path, Path]:
     """(base, patched): the Wonder pin with runtime/patches/series.macos up to astral-launcher.patch, and the same plus
-    every overlay after it (astral-touch.patch, astral-upscale.patch, ...) and the iOS stack, all with git apply (skipped
+    every desktop overlay after it (astral-touch.patch, astral-upscale.patch, ...), with git apply (skipped
     without the private pinned reference)."""
     common = subprocess.check_output(['git', '-C', str(ROOT), 'rev-parse', '--path-format=absolute',
                                       '--git-common-dir'], timeout=10).decode().strip()
@@ -120,7 +110,7 @@ def patched_tree(test, d: Path) -> tuple[Path, Path]:
     split = series.index('astral-launcher.patch') + 1  # the overlays after the launcher (touch, upscale, ...)
     test.assertEqual(series[split:split + 2], ['astral-touch.patch', 'astral-upscale.patch'])
     trees = []
-    for name, extra in (('base', []), ('tree', [*series[split:], *[p for p in PATCHES if p != 'astral-touch']])):
+    for name, extra in (('base', []), ('tree', series[split:])):
         tree = d / name
         tree.mkdir()
         archive = subprocess.run(['git', '-C', str(ref), 'archive', PIN], check=True, capture_output=True, timeout=120)
@@ -135,11 +125,11 @@ def patched_tree(test, d: Path) -> tuple[Path, Path]:
 class ProfileTest(unittest.TestCase):
     def test_resolver(self):
         src = ('a\n#if defined(NX_ASTRAL_STRICT)\nb\n#else\nc\n#endif\n#if defined(X)\nd\n#else\nx\n#endif\n'
-               '#if !defined(NX_ASTRAL_STRICT)\ne\n#endif\n#if defined(NX_ASTRAL_STRICT) && defined(NX_IOS_RUNTIME)\nf\n'
+               '#if !defined(NX_ASTRAL_STRICT)\ne\n#endif\n#if defined(NX_ASTRAL_STRICT) && defined(NX_OTHER_FEATURE)\nf\n'
                '#endif\n')
         self.assertEqual(resolve(src, False), 'a\nc\n#if defined(X)\nd\n#else\nx\n#endif\ne\n')
         self.assertEqual(resolve(src, True), 'a\nb\n#if defined(X)\nd\n#else\nx\n#endif\n'
-                                             '#if defined(NX_ASTRAL_STRICT) && defined(NX_IOS_RUNTIME)\nf\n#endif\n')
+                                             '#if defined(NX_ASTRAL_STRICT) && defined(NX_OTHER_FEATURE)\nf\n#endif\n')
         self.assertEqual(unbounded_waits('p_vkWaitForFences(d, 1, &f, VK_TRUE,\n UINT64_MAX);\n'
                                          'p_vkWaitForFences(d, 1, &f, VK_TRUE, gpu_fence_timeout_ns());'),
                          [(1, 'p_vkWaitForFences(d, 1, &f, VK_TRUE, UINT64_MAX)')])
@@ -150,26 +140,6 @@ class ProfileTest(unittest.TestCase):
             for rel in SHARED:
                 self.assertEqual(resolve((tree / rel).read_text(), False), resolve((live / rel).read_text(), False),
                                  rel)
-            cmake = (tree / 'CMakeLists.txt').read_text()
-            sources = cmake.split('set(NX_RUNTIME_SOURCES', 1)[1].split(')', 1)[0]
-            self.assertNotIn('nvn_spirv_subgroup.cpp', sources)  # built for the iOS simulator only
-
-    def test_no_unbounded_gpu_wait_in_the_astral_profile(self):
-        with tempfile.TemporaryDirectory() as d:
-            _, tree = patched_tree(self, Path(d))
-            offenders = []
-            for path in sorted((tree / 'runtime/src').rglob('*')):
-                if path.suffix not in ('.cpp', '.mm', '.h'):
-                    continue
-                rel = str(path.relative_to(tree))
-                if rel in GUEST_VULKAN_ALLOWLIST:
-                    continue
-                for line, call in unbounded_waits(resolve(path.read_text(errors='replace'), True)):
-                    offenders.append(f'{rel}:{line}: {call}')
-            self.assertEqual(offenders, [])
-            # The allowlisted pass-throughs are what the scan would otherwise report (keeps the allowlist honest).
-            guest = unbounded_waits((tree / 'runtime/src/vk_swapchain.cpp').read_text())
-            self.assertTrue(guest)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,28 @@
+--- a/runtime/src/nvn/nvn_objects.cpp
++++ b/runtime/src/nvn/nvn_objects.cpp
+@@ -305,6 +305,17 @@
+         std::lock_guard lk(objects_lock());
+         pool_textures()[t.pool].insert(guest);
+     }
++#if defined(NX_ASTRAL_STRICT)
++    // GetPackagedTextureLayout returns presence, not the layout. Its second argument receives the layout word.
++    // Keep presence separate: a packaged layout of zero means one GOB, not the default inferred from the height.
++    uint64_t packaged = scratch(c, 4);
++    st<uint32_t>(packaged, 0);
++    if (driver(c, "nvnTextureBuilderGetPackagedTextureLayout", {builder, packaged})) {
++        uint32_t log2_height = ld<uint32_t>(packaged) & 0xFu;
++        if (log2_height > 5) fatal("strict NVN texture: invalid packaged block height %u", log2_height);
++        t.block_height_gobs = 1u << log2_height;
++    }
++#else
+     // Packaged (BNTX) textures were tiled offline with a block height often one step below the default
+     // (docs/nvn/TILING.md). The layout the builder returns does not carry it (it reads 1 for every texture in
+     // Wonder), so it only says "packaged", and the block height is the fit that matches every BNTX texture in the
+@@ -318,6 +329,7 @@
+         while (h * 32 < rows * 3 && h < 16) h <<= 1;
+         t.block_height_gobs = h;
+     }
++#endif
+
+     // Swizzle: single-channel textures are often read through it (a font atlas in R8 read as alpha = R); without
+     // it Vulkan returns alpha 1 and the text shaders covered the screen.

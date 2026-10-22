@@ -6,12 +6,13 @@ Game-derived inventories and receipts are confined to ignored .local/game-privat
 """
 import argparse
 from collections import Counter, defaultdict
-import fcntl
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import stat
 import struct
 import subprocess
@@ -34,6 +35,453 @@ def require(condition, code):
         raise ImportFailure(code)
 
 
+WINDOWS = sys.platform == 'win32'
+# The source-only release includes this tool through its fixed allowlist. Keep
+# original host adapters here so checkout and zip builds use identical bytes;
+# generated C++/headers are written only to the private importer source tree.
+WINDOWS_IMPORT_COMPAT = r'''// Original Windows host adapter for the pinned MIT-licensed Wonder importer.
+// Only host I/O changes: encrypted formats and verification stay upstream.
+#pragma once
+#define NOMINMAX
+#include <windows.h>
+#include <io.h>
+#include <direct.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <cstring>
+#include <cstdint>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
+
+using ssize_t = intptr_t;
+constexpr int O_CLOEXEC = _O_NOINHERIT;
+#ifndef S_ISREG
+#define S_ISREG(mode) (((mode) & _S_IFMT) == _S_IFREG)
+#endif
+
+// All native paths arrive as UTF-8. Wide extended paths preserve Unicode and
+// paths beyond MAX_PATH without requiring a machine-wide registry change.
+inline std::wstring acr_path(const std::string& text) {
+    auto p = std::filesystem::absolute(std::filesystem::u8path(text)).lexically_normal().wstring();
+    std::replace(p.begin(), p.end(), L'/', L'\\');
+    if (p.rfind(L"\\\\?\\", 0) == 0) return p;
+    return p.rfind(L"\\\\", 0) == 0 ? L"\\\\?\\UNC\\" + p.substr(2) : L"\\\\?\\" + p;
+}
+inline int acr_open(const char* p, int flags, int mode = 0) {
+    return _wopen(acr_path(p).c_str(), flags | _O_BINARY, mode);
+}
+inline int acr_stat(const char* p, struct _stat64* st) { return _wstat64(acr_path(p).c_str(), st); }
+inline int acr_mkdir(const char* p, int) { return _wmkdir(acr_path(p).c_str()); }
+inline int acr_unlink(const char* p) { return _wunlink(acr_path(p).c_str()); }
+inline int acr_rename(const char* from, const char* to) {
+    // POSIX rename replaces a finished file atomically; CRT rename does not.
+    if (MoveFileExW(acr_path(from).c_str(), acr_path(to).c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 0;
+    errno = EIO;
+    return -1;
+}
+inline FILE* acr_fopen(const char* p, const char* mode) {
+    std::wstring wide_mode(mode, mode + strlen(mode));
+    // Receipts/journals use LF on every host; binary game I/O is always binary.
+    wide_mode += L"b";
+    return _wfopen(acr_path(p).c_str(), wide_mode.c_str());
+}
+inline ssize_t acr_pread(int fd, void* data, size_t count, int64_t offset) {
+    // The importer reads on a single thread. Always seek explicitly, including
+    // >4 GiB offsets; Windows long/off_t and plain fstat truncate large NSPs.
+    if (_lseeki64(fd, offset, SEEK_SET) < 0) return -1;
+    return _read(fd, data, unsigned(std::min<size_t>(count, INT_MAX)));
+}
+struct acr_statvfs { uint64_t f_bavail = 0, f_frsize = 1; };
+inline int acr_space(const char* p, acr_statvfs* st) {
+    ULARGE_INTEGER available;
+    if (!GetDiskFreeSpaceExW(acr_path(p).c_str(), &available, nullptr, nullptr)) return -1;
+    st->f_bavail = available.QuadPart;
+    return 0;
+}
+
+inline bool acr_safe_name(const std::string& name) {
+    if (name.empty() || name == "." || name == ".." || name.back() == '.' || name.back() == ' ') return false;
+    for (unsigned char c : name) if (c < 32 || strchr("\\/:<>\"|?*", c)) return false;
+    auto base = name.substr(0, name.find('.'));
+    for (auto& c : base) if (c >= 'a' && c <= 'z') c -= 'a' - 'A';
+    if (base == "CON" || base == "PRN" || base == "AUX" || base == "NUL") return false;
+    return !(base.size() == 4 && (base.substr(0,3) == "COM" || base.substr(0,3) == "LPT") &&
+             base[3] >= '1' && base[3] <= '9');
+}
+'''
+
+WINDOWS_IMPORT_PATCH = r'''--- a/android/wonder/importer/nximport.cpp
++++ b/android/wonder/importer/nximport.cpp
+@@ -21,10 +21,7 @@
+ //   NSO     "NSO0", three LZ4 segments (text, ro, data) with SHA-256 of each decompressed segment.
+ #include "nximport.h"
+
+-#include <fcntl.h>
+-#include <sys/stat.h>
+-#include <sys/statvfs.h>
+-#include <unistd.h>
++#include "import_compat.h"
+
+ #include <algorithm>
+ #include <array>
+@@ -106,15 +103,15 @@
+     int fd;
+     std::string name;
+     FdStorage(int f, std::string n) : fd(f), name(std::move(n)) {
+-        struct stat st{};
+-        if (fstat(fd, &st) != 0) fail("%s: cannot stat (%s)", name.c_str(), strerror(errno));
++        struct _stat64 st{};
++        if (_fstat64(fd, &st) != 0) fail("%s: cannot stat (%s)", name.c_str(), strerror(errno));
+         size = uint64_t(st.st_size);
+     }
+     void read(uint64_t off, void* dst, size_t n) override {
+         if (off + n > size) fail("%s: read past the end (offset %llu)", name.c_str(), (unsigned long long)off);
+         uint8_t* p = static_cast<uint8_t*>(dst);
+         while (n) {
+-            ssize_t r = pread(fd, p, n, off_t(off));
++            ssize_t r = acr_pread(fd, p, n, int64_t(off));
+             if (r < 0 && errno == EINTR) continue;
+             if (r <= 0) fail("%s: read error at %llu (%s)", name.c_str(), (unsigned long long)off, r < 0 ? strerror(errno) : "end of file");
+             p += r, off += uint64_t(r), n -= size_t(r);
+@@ -871,15 +868,11 @@
+ // ---- output ----
+
+ void mkdirs(const std::string& path) {
+-    std::string cur;
+-    size_t pos = 0;
+-    while (pos != std::string::npos) {
+-        pos = path.find('/', pos + 1);
+-        cur = path.substr(0, pos);
+-        if (cur.empty()) continue;
+-        if (mkdir(cur.c_str(), 0775) != 0 && errno != EEXIST) fail("cannot create folder %s (%s)", cur.c_str(), strerror(errno));
+-    }
+-}
++    std::error_code error;
++    std::filesystem::create_directories(std::filesystem::path(acr_path(path)), error);
++    if (error) fail("cannot create output folder");
++}
++
+
+ struct Writer {
+     std::string final_path, part;
+@@ -887,36 +880,36 @@
+     uint32_t crc = 0;
+     uint64_t written = 0;
+     explicit Writer(const std::string& path) : final_path(path), part(path + ".part") {
+-        fd = ::open(part.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0664);
++        fd = ::acr_open(part.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0664);
+         if (fd < 0) fail("cannot write %s (%s)", part.c_str(), strerror(errno));
+     }
+     void write(const void* data, size_t n) {
+         crc = crc32_update(crc, data, n);
+         const uint8_t* p = static_cast<const uint8_t*>(data);
+         while (n) {
+-            ssize_t w = ::write(fd, p, n);
++            ssize_t w = ::_write(fd, p, unsigned(std::min<size_t>(n, INT_MAX)));
+             if (w < 0 && errno == EINTR) continue;
+             if (w <= 0) fail("write error on %s (%s)", final_path.c_str(), w < 0 ? strerror(errno) : "disk full?");
+             p += w, n -= size_t(w), written += uint64_t(w);
+         }
+     }
+     void commit() {
+-        if (fdatasync(fd) != 0 && errno != EINVAL && errno != EROFS) fail("sync of %s failed (%s)", final_path.c_str(), strerror(errno));
+-        ::close(fd);
++        if (_commit(fd) != 0 && errno != EINVAL && errno != EROFS) fail("sync of %s failed (%s)", final_path.c_str(), strerror(errno));
++        ::_close(fd);
+         fd = -1;
+-        if (rename(part.c_str(), final_path.c_str()) != 0) fail("cannot rename %s (%s)", part.c_str(), strerror(errno));
++        if (acr_rename(part.c_str(), final_path.c_str()) != 0) fail("cannot rename %s (%s)", part.c_str(), strerror(errno));
+     }
+     ~Writer() {
+         if (fd >= 0) {
+-            ::close(fd);
+-            unlink(part.c_str());
++            ::_close(fd);
++            acr_unlink(part.c_str());
+         }
+     }
+ };
+
+ uint64_t file_size(const std::string& p) {
+-    struct stat st{};
+-    return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode) ? uint64_t(st.st_size) : ~0ull;
++    struct _stat64 st{};
++    return acr_stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode) ? uint64_t(st.st_size) : ~0ull;
+ }
+
+ std::string read_small(Storage& s, uint64_t max) {
+@@ -933,7 +926,7 @@
+     void open(const std::string& p, bool reset) {
+         path = p;
+         if (!reset) {
+-            std::ifstream in(p);
++            std::ifstream in(std::filesystem::path(acr_path(p)), std::ios::binary);
+             std::string line;
+             while (std::getline(in, line)) {
+                 std::istringstream ls(line);
+@@ -942,7 +935,7 @@
+                     done[rel] = {strtoull(size.c_str(), nullptr, 10), uint32_t(strtoul(crc.c_str(), nullptr, 16))};
+             }
+         }
+-        f = fopen(p.c_str(), reset ? "w" : "a");
++        f = acr_fopen(p.c_str(), reset ? "w" : "a");
+         if (!f) fail("cannot write %s (%s)", p.c_str(), strerror(errno));
+     }
+     void add(const char* kind, const std::string& rel, uint64_t size, uint32_t crc) {
+@@ -972,7 +965,7 @@
+         uint32_t nlen = rd32(f + 0x1C);
+         if (size_t(file) + 0x20 + nlen > files.size()) fail("RomFS: bad file name");
+         std::string name(reinterpret_cast<const char*>(f + 0x20), nlen);
+-        if (name.empty() || name == "." || name == ".." || name.find('/') != std::string::npos) fail("RomFS: unsafe file name");
++        if (name.empty() || name == "." || name == ".." || name.find('/') != std::string::npos || !acr_safe_name(name)) fail("RomFS: unsafe file name");
+         out.push_back({prefix + name, rd64(f + 8), rd64(f + 16)});
+         file = rd32(f + 4);
+     }
+@@ -982,7 +975,7 @@
+         uint32_t nlen = rd32(c + 0x14);
+         if (size_t(child) + 0x18 + nlen > dirs.size()) fail("RomFS: bad directory name");
+         std::string name(reinterpret_cast<const char*>(c + 0x18), nlen);
+-        if (name.empty() || name == "." || name == ".." || name.find('/') != std::string::npos) fail("RomFS: unsafe folder name");
++        if (name.empty() || name == "." || name == ".." || name.find('/') != std::string::npos || !acr_safe_name(name)) fail("RomFS: unsafe folder name");
+         out_dirs.push_back(prefix + name);
+         walk_romfs(dirs, files, child, prefix + name + "/", out, out_dirs, depth + 1);
+         child = rd32(c + 4);
+@@ -1017,8 +1010,8 @@
+ };
+
+ void check_space(const std::string& dir, uint64_t need) {
+-    struct statvfs vs{};
+-    if (statvfs(dir.c_str(), &vs) != 0) return;
++    struct acr_statvfs vs{};
++    if (acr_space(dir.c_str(), &vs) != 0) return;
+     uint64_t free_b = uint64_t(vs.f_bavail) * vs.f_frsize;
+     uint64_t margin = 64ull << 20;
+     if (free_b < need + margin)
+@@ -1027,7 +1020,7 @@
+ }
+
+ int verify_outputs(Run& run, const std::string& out, std::string& error) {
+-    std::ifstream in(out + "/.import/index.tsv");
++    std::ifstream in(std::filesystem::path(acr_path(out + "/.import/index.tsv")), std::ios::binary);
+     if (!in) {
+         error = "nothing to verify: no finished import in " + out;
+         return 2;
+@@ -1056,18 +1049,18 @@
+         run.pr.item = e.rel;
+         run.report();
+         std::string p = out + "/" + e.rel;
+-        int fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
++        int fd = ::acr_open(p.c_str(), O_RDONLY | O_CLOEXEC);
+         uint32_t crc = 0;
+         uint64_t got = 0;
+         if (fd >= 0) {
+             ssize_t r;
+-            while ((r = ::read(fd, buf.data(), buf.size())) > 0) {
++            while ((r = ::_read(fd, buf.data(), unsigned(buf.size()))) > 0) {
+                 crc = crc32_update(crc, buf.data(), size_t(r));
+                 got += uint64_t(r);
+                 run.pr.done += uint64_t(r);
+                 run.report();
+             }
+-            ::close(fd);
++            ::_close(fd);
+         }
+         if (fd < 0 || got != e.size || crc != e.crc) {
+             if (!bad++) first_bad = e.rel;
+@@ -1252,14 +1245,14 @@
+     std::string root = opt.out_dir;
+     std::string old_ident;
+     {
+-        std::ifstream f(root + "/.import/source.txt");
++        std::ifstream f(std::filesystem::path(acr_path(root + "/.import/source.txt")), std::ios::binary);
+         std::getline(f, old_ident);
+     }
+     bool reset = old_ident != ident;
+     if (reset) {
+-        unlink((root + "/.import/index.tsv").c_str());
+-        unlink((root + "/.import/complete").c_str());
+-        std::ofstream f(root + "/.import/source.txt", std::ios::trunc);
++        acr_unlink((root + "/.import/index.tsv").c_str());
++        acr_unlink((root + "/.import/complete").c_str());
++        std::ofstream f(std::filesystem::path(acr_path(root + "/.import/source.txt")), std::ios::binary | std::ios::trunc);
+         f << ident << "\n";
+     }
+     Journal journal;
+@@ -1316,7 +1309,7 @@
+             if (off + size > pfs.size() || so >= strsz) fail("ExeFS entry %u out of range", i);
+             const char* nm = reinterpret_cast<const char*>(pfs.data() + 16 + count * 0x18 + so);
+             std::string name(nm, strnlen(nm, strsz - so));
+-            if (name.empty() || name.find('/') != std::string::npos || name[0] == '.') fail("ExeFS: unsafe file name");
++            if (name.empty() || name.find('/') != std::string::npos || !acr_safe_name(name) || name[0] == '.') fail("ExeFS: unsafe file name");
+             run.pr.item = name;
+             run.report(true);
+             std::vector<uint8_t> blob(pfs.begin() + long(off), pfs.begin() + long(off + size));
+@@ -1421,7 +1414,7 @@
+
+     // ---- index + completion marker ----
+     {
+-        std::ofstream idx(root + "/.import/index.tsv.part", std::ios::trunc);
++        std::ofstream idx(std::filesystem::path(acr_path(root + "/.import/index.tsv.part")), std::ios::binary | std::ios::trunc);
+         for (auto& [rel, sc] : journal.done) {
+             bool keep = rel.rfind("analysis/", 0) == 0;
+             idx << (keep ? "exefs" : "romfs") << "\t" << sc.first << "\t" << std::hex;
+@@ -1430,9 +1423,9 @@
+             idx << c << std::dec << "\t" << rel << "\n";
+         }
+         idx.close();
+-        if (!idx || rename((root + "/.import/index.tsv.part").c_str(), (root + "/.import/index.tsv").c_str()) != 0)
++        if (!idx || acr_rename((root + "/.import/index.tsv.part").c_str(), (root + "/.import/index.tsv").c_str()) != 0)
+             fail("cannot write the import index");
+-        std::ofstream mark(root + "/.import/complete", std::ios::trunc);
++        std::ofstream mark(std::filesystem::path(acr_path(root + "/.import/complete")), std::ios::binary | std::ios::trunc);
+         mark << ident << "\n" << list.size() << " romfs files, " << total << " bytes\n";
+     }
+     run.pr.phase = "done";
+--- a/android/wonder/importer/nximport_cli.cpp
++++ b/android/wonder/importer/nximport_cli.cpp
+@@ -1,8 +1,7 @@
+ // PC test harness of the on-device importer: the same code the APK runs, fed with files from the command line.
+ //   nximport --out <data folder> [--title 010015100B514000] [--verify] [--exefs] <prod.keys> [title.keys] <x.nsp|x.xci> ...
+ // Prints progress and log lines (never key values).
+-#include <fcntl.h>
+-#include <unistd.h>
++#include "import_compat.h"
+
+ #include <atomic>
+ #include <chrono>
+@@ -14,7 +13,20 @@
+
+ #include "nximport.h"
+
+-int main(int argc, char** argv) {
++int wmain(int argc, wchar_t** wide_argv) {
++    std::vector<std::string> utf8;
++    for (int i = 0; i < argc; ++i) {
++        int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide_argv[i], -1, nullptr, 0, nullptr, nullptr);
++        if (!n) return 2;
++        std::string s(n, '\0');
++        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide_argv[i], -1, s.data(), n, nullptr, nullptr);
++        s.pop_back();
++        std::replace(s.begin(), s.end(), '\\', '/');
++        utf8.push_back(std::move(s));
++    }
++    std::vector<char*> args;
++    for (auto& s : utf8) args.push_back(s.data());
++    char** argv = args.data();
+     nxi::Options opt;
+     std::vector<nxi::InputFile> inputs;
+     for (int i = 1; i < argc; i++) {
+@@ -28,7 +40,7 @@
+         } else if (a == "--verify") {
+             opt.verify_only = true;
+         } else {
+-            int fd = open(argv[i], O_RDONLY | O_CLOEXEC);
++            int fd = acr_open(argv[i], O_RDONLY | O_CLOEXEC);
+             if (fd < 0) {
+                 fprintf(stderr, "cannot open %s\n", argv[i]);
+                 return 2;
+@@ -54,6 +66,6 @@
+     int rc = nxi::run_import(inputs, opt, err);
+     double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+     fprintf(stderr, "\n%s after %.1f s%s%s\n", rc ? "FAILED" : "OK", s, rc ? ": " : "", err.c_str());
+-    for (auto& in : inputs) close(in.fd);
++    for (auto& in : inputs) _close(in.fd);
+     return rc;
+ }
+'''
+
+WINDOWS_CONTROL_PATCH = r'''--- a/android/wonder/importer/nximport.cpp
++++ b/android/wonder/importer/nximport.cpp
+@@ -1274,7 +1274,7 @@
+
+     if (opt.control_metadata) {
+         if(ncas.size()>64) fail("metadata: too many contents");
+-        std::ofstream report(opt.out_dir+"/native.json");
++        std::ofstream report(std::filesystem::path(acr_path(opt.out_dir+"/native.json")), std::ios::binary);
+         report << "{\"schema\":1,\"contents\":[";
+         for(size_t i=0;i<ncas.size();++i) {if(i) report << ",";control_extract(*ncas[i],opt.out_dir,unsigned(i),report);}
+         report << "]}\n";report.close();if(!report) fail("metadata: receipt write failed");return 0;
+'''
+
+
+# Unified-diff context lines for blank source lines need one leading space.
+# Add them at runtime so the Python source itself has no trailing whitespace.
+WINDOWS_IMPORT_PATCH = ''.join(' \n' if line == '\n' else line
+                               for line in WINDOWS_IMPORT_PATCH.splitlines(keepends=True))
+WINDOWS_CONTROL_PATCH = ''.join(' \n' if line == '\n' else line
+                                for line in WINDOWS_CONTROL_PATCH.splitlines(keepends=True))
+
+
+def long_path(path):
+    """Use extended Win32 paths for deep extracted trees, without global settings."""
+    if not WINDOWS:
+        return Path(path)
+    value = os.path.abspath(path)
+    if value.startswith('\\\\?\\'):
+        return Path(value)
+    return Path('\\\\?\\UNC\\' + value[2:] if value.startswith('\\\\') else '\\\\?\\' + value)
+
+
+def is_link(path):
+    # Windows directory junctions and other reparse points must not bypass the
+    # private-output boundary. is_symlink alone does not detect junctions.
+    try:
+        return path.is_symlink() or bool(getattr(path.lstat(), 'st_file_attributes', 0) & 0x400)
+    except FileNotFoundError:
+        return False
+
+
+@contextmanager
+def import_lock(path):
+    # A persistent inode/first byte avoids the unlink/recreate lock race.
+    with path.open('a+b') as lock:
+        if WINDOWS:
+            import msvcrt
+            if lock.seek(0, os.SEEK_END) == 0:
+                lock.write(b'\0')
+                lock.flush()
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                raise ImportFailure('wrapper_already_running') from None
+            try:
+                yield
+            finally:
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ImportFailure('wrapper_already_running') from None
+            yield
+
+
+def native_compile_command(source, tool, control=False):
+    """Compile only verified/copied upstream sources; never mutate the reference.
+
+    Windows host adapters are original source, applied after the control patch
+    when requested. Source provenance still records the unmodified pinned files.
+    """
+    if WINDOWS:
+        for patch in (WINDOWS_IMPORT_PATCH, *([WINDOWS_CONTROL_PATCH] if control else [])):
+            result = subprocess.run(['git', '-c', 'core.autocrlf=false', '-C', str(source),
+                                     'apply', '-'], input=patch.encode('utf-8'),
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            require(result.returncode == 0, 'windows_adapter_failed')
+        (source / SOURCE / 'import_compat.h').write_text(WINDOWS_IMPORT_COMPAT, encoding='utf-8', newline='\n')
+    return ['clang++', '-std=c++17', '-O2'] + [str(source / SOURCE / n) for n in SOURCES[:3]] + ['-o', str(tool)]
+
+
 def git(repo, *args):
     p = subprocess.run(['git', '-C', str(repo), *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     require(p.returncode == 0, 'git_check_failed')
@@ -54,7 +502,7 @@ def private_path(repo, path):
     current = repo
     for part in path.relative_to(repo).parts:
         current /= part
-        require(not current.is_symlink(), 'private_symlink')
+        require(not is_link(current), 'private_symlink')
     rel = path.relative_to(repo).as_posix()
     require(not git(repo, 'ls-files', '--', rel), 'output_tracked')
     p = subprocess.run(['git', '-C', str(repo), 'check-ignore', '--no-index', '-q', rel], stderr=subprocess.DEVNULL)
@@ -63,12 +511,13 @@ def private_path(repo, path):
 
 
 def secure_tree(root):
-    require(not root.is_symlink(), 'private_symlink')
+    root = long_path(root)
+    require(not is_link(root), 'private_symlink')
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     for directory, dirs, files in os.walk(root, followlinks=False):
         os.chmod(directory, 0o700)
         for name in dirs:
-            require(not (Path(directory) / name).is_symlink(), 'private_symlink')
+            require(not is_link(Path(directory) / name), 'private_symlink')
         for name in files:
             path = Path(directory) / name
             regular(path)
@@ -94,10 +543,10 @@ def event(log, phase, **fields):
         os.fsync(f.fileno())
 
 
-def run_child(command, log, phase):
+def run_child(command, log, phase, env=None):
     start = time.monotonic()
     event(log, phase, state='started')
-    with subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as p:
+    with subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as p:
         try:
             while True:
                 try:
@@ -178,9 +627,14 @@ def parse_index(text, allow_revisions=False):
                 bool(re.fullmatch('[0-9a-fA-F]{8}', crc)), 'malformed_index')
         path = PurePosixPath(rel)
         require(not path.is_absolute() and '..' not in path.parts and '\\' not in rel and
-                path.as_posix() == rel and len(path.parts) > 1 and
+                path.as_posix() == rel and ':' not in rel and '\x00' not in rel and len(path.parts) > 1 and
                 ((kind == 'exefs' and rel.startswith('analysis/')) or
                  (kind == 'romfs' and rel.startswith('extract/romfs/'))), 'unsafe_index_path')
+        if WINDOWS:
+            require(all(part and part[-1] not in ' .' and
+                        not re.fullmatch(r'(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?', part)
+                        for part in path.parts), 'unsafe_index_path')
+            require(not any(p.casefold() == rel.casefold() and p != rel for p in rows), 'duplicate_index_path')
         require(allow_revisions or rel not in rows, 'duplicate_index_path')
         rows[rel] = {'kind': kind, 'size': int(size), 'crc32': crc.lower()}
     require(bool(rows), 'empty_index')
@@ -188,6 +642,7 @@ def parse_index(text, allow_revisions=False):
 
 
 def verify_index(out, rows, log=None):
+    out = long_path(out)
     start = time.monotonic()
     last = start
     for rel, record in rows.items():
@@ -353,18 +808,42 @@ def npdm_inventory(raw):
 
 def build_importer(ref, out, log):
     hashes = validate_reference(ref)
-    tool = out / '.wrapper/nximport'
-    command = ['clang++', '-std=c++17', '-O2'] + [str(ref / SOURCE / n) for n in SOURCES[:3]] + ['-o', str(tool)]
-    require(run_child(command, log, 'compile_importer') == 0, 'importer_compile_failed')
+    tool = out / ('.wrapper/nximport.exe' if WINDOWS else '.wrapper/nximport')
+    source = ref
+    if WINDOWS:
+        import windows_native
+        # Standalone import also works outside a VS developer prompt.
+        env = windows_native.developer_environment()
+        source = out / '.wrapper/source'
+        if source.exists():
+            shutil.rmtree(source)
+        (source / SOURCE).mkdir(parents=True)
+        for name in SOURCES:
+            shutil.copyfile(ref / SOURCE / name, source / SOURCE / name)
+        require(subprocess.run(['git', 'init', '-q', str(source)], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL).returncode == 0, 'git_check_failed')
+    else:
+        env = None
+    command = native_compile_command(source, tool)
+    require(run_child(command, log, 'compile_importer', env=env) == 0, 'importer_compile_failed')
     os.chmod(tool, 0o700)
-    return tool, {'revision': PIN, 'sources_sha256': hashes, 'binary': digest(tool), 'compiler': 'clang++ -std=c++17 -O2'}
+    provenance = {'revision': PIN, 'sources_sha256': hashes, 'binary': digest(tool),
+                  'compiler': 'clang++ -std=c++17 -O2'}
+    if WINDOWS:
+        provenance['host'] = 'windows-x64'
+        provenance['adapters_sha256'] = {n: hashlib.sha256(raw.encode('utf-8')).hexdigest()
+                                        for n, raw in (('native-import.patch', WINDOWS_IMPORT_PATCH),
+                                                       ('import_compat.h', WINDOWS_IMPORT_COMPAT))}
+        provenance['compiled_sources_sha256'] = {n: digest(source / SOURCE / n)['sha256'] for n in SOURCES}
+    return tool, provenance
 
 
 def make_inventory(out, rows):
-    source = (out / '.import/source.txt').read_text().strip()
+    out = long_path(out)
+    source = (out / '.import/source.txt').read_text(encoding='utf-8').strip()
     require(bool(re.match(r'^[0-9A-F]{16} ', source)), 'invalid_source_identity')
     title = source.split(' ', 1)[0]
-    complete = (out / '.import/complete').read_text().splitlines()
+    complete = (out / '.import/complete').read_text(encoding='utf-8').splitlines()
     require(len(complete) == 2 and complete[0] == source, 'completion_identity_mismatch')
     match = re.fullmatch(r'(\d+) romfs files, (\d+) bytes', complete[1])
     romrows = {k: v for k, v in rows.items() if v['kind'] == 'romfs'}
@@ -458,11 +937,7 @@ def execute(args):
     control = out / '.wrapper'
     control.mkdir(mode=0o700, exist_ok=True)
     lock_path = control / 'lock'
-    with lock_path.open('a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise ImportFailure('wrapper_already_running')
+    with import_lock(lock_path):
         log = control / 'progress.jsonl'
         start = time.monotonic()
         try:
@@ -478,32 +953,32 @@ def execute(args):
             receipt = control / 'input.json'
             owned = receipt.exists()
             if owned:
-                check_identity(json.loads(receipt.read_text()), identity)
+                check_identity(json.loads(receipt.read_text(encoding='utf-8')), identity)
             if not owned and not (out / '.import').exists():
                 require(all(p.name == '.wrapper' for p in out.iterdir()), 'unowned_outputs_refused')
             completed = (out / '.import/complete').is_file()
             adoption = control / 'adoption.json'
-            saved_adoption = json.loads(adoption.read_text()) if adoption.exists() else None
+            saved_adoption = json.loads(adoption.read_text(encoding='utf-8')) if adoption.exists() else None
             provenance = saved_adoption['provenance'] if saved_adoption else 'wrapper_import'
             parent = saved_adoption['parent'] if saved_adoption else None
             prior_manifest = control / 'manifest.json'
             if owned and not saved_adoption and prior_manifest.exists():
-                previous = json.loads(prior_manifest.read_text())
+                previous = json.loads(prior_manifest.read_text(encoding='utf-8'))
                 check_identity(previous['dump'], identity)
                 provenance, parent = previous['provenance'], previous.get('parent')
                 if parent:
                     atomic_json(adoption, {'provenance': provenance, 'parent': parent})
             if not owned and (out / '.import').exists():
                 require(completed and args.adopt_state and args.adopt_tool and args.adopt_log, 'unowned_partial_import_refused')
-                state = json.loads(args.adopt_state.read_text())
+                state = json.loads(args.adopt_state.read_text(encoding='utf-8'))
                 require(state.get('state') == 'complete' and state.get('exit_code') == 0 and
                         state.get('reference_revision') == PIN and state.get('output') == str(out) and
                         state.get('tool_sha256') == digest(args.adopt_tool)['sha256'], 'adoption_receipt_mismatch')
-                source = (out / '.import/source.txt').read_text().strip()
+                source = (out / '.import/source.txt').read_text(encoding='utf-8').strip()
                 require((' ' + args.dump.name + '/') in source, 'adoption_dump_name_mismatch')
                 provenance = 'adopted_parent_import_filename_and_size_then_current_hash_bound'
                 # Only extract a fixed allowlisted observation from parent diagnostics.
-                parent_log = args.adopt_log.read_text()
+                parent_log = args.adopt_log.read_text(encoding='utf-8')
                 require('import complete:' in parent_log and 'OK after ' in parent_log, 'parent_log_not_complete')
                 rtld_observed = bool(re.search(r'\bexefs\s+[^\r\n]*\brtld\b', parent_log))
                 parent = {'state_sha256': digest(args.adopt_state)['sha256'],
@@ -529,8 +1004,8 @@ def execute(args):
                 require(run_child(command, log, 'import') == 0, 'importer_failed_resume_same_command')
             # Check safe paths before invoking upstream verification, which trusts its index.
             secure_tree(out)
-            rows = parse_index((out / '.import/index.tsv').read_text())
-            journal = parse_index((out / '.import/journal.tsv').read_text(), allow_revisions=True)
+            rows = parse_index((out / '.import/index.tsv').read_text(encoding='utf-8'))
+            journal = parse_index((out / '.import/journal.tsv').read_text(encoding='utf-8'), allow_revisions=True)
             require(rows == journal, 'journal_index_mismatch')
             verification = verify_index(out, rows, log)
             os.chmod(tool, 0o700)

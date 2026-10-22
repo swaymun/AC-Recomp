@@ -313,6 +313,129 @@ def discover():
     return result
 
 
+# Native player build helpers. The older bounded package CLI below remains unchanged.
+OPUS_URL = 'https://github.com/xiph/opus.git'
+OPUS_PIN = 'ddbe48383984d56acd9e1ab6a090c54ca6b735a6'  # v1.5.2
+
+
+def parse_environment(text):
+    """cmd's `set` output can contain banner lines and drive pseudo-variables."""
+    env = {}
+    for line in text.splitlines():
+        if '=' in line and not line.startswith('='):
+            key, value = line.split('=', 1)
+            env[key.upper()] = value
+    return env
+
+
+def developer_environment():
+    """Discover VS Build Tools without requiring an interactive developer prompt."""
+    vswhere = Path(os.environ.get('ProgramFiles(x86)', 'C:/Program Files (x86)')) / \
+        'Microsoft Visual Studio/Installer/vswhere.exe'
+    require(vswhere.is_file(), 'vswhere missing; install Visual Studio 2022 C++ Build Tools')
+    installation = subprocess.check_output([str(vswhere), '-latest', '-products', '*', '-requires',
+        'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath'],
+        text=True, timeout=30).strip()
+    require(installation and '\n' not in installation, 'Visual Studio C++ tools not installed')
+    bat = Path(installation) / 'Common7/Tools/VsDevCmd.bat'
+    require(bat.is_file(), 'VsDevCmd.bat missing')
+    # A single command line is intentional: cmd /s /c strips its outer quote pair.
+    command = f'cmd.exe /d /s /c ""{bat}" -no_logo -arch=x64 -host_arch=x64 >nul && set"'
+    env = parse_environment(subprocess.check_output(command, text=True, timeout=60))
+    require(env.get('INCLUDE') and env.get('LIB') and env.get('PATH'), 'VsDevCmd did not set INCLUDE/LIB/PATH')
+    llvm = Path(installation) / 'VC/Tools/Llvm/x64/bin'
+    cmake = Path(installation) / 'Common7/IDE/CommonExtensions/Microsoft/CMake'
+    env['PATH'] = os.pathsep.join(map(str, (llvm, cmake / 'CMake/bin', cmake / 'Ninja'))) + os.pathsep + env['PATH']
+    require(shutil.which('clang-cl', path=env['PATH']), 'clang-cl missing; install VS C++ Clang tools')
+    return env
+
+
+def available_memory():
+    import ctypes
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [('length', ctypes.c_ulong), ('load', ctypes.c_ulong)] + [
+            (n, ctypes.c_ulonglong) for n in ('total_phys', 'avail_phys', 'total_page', 'avail_page',
+                                             'total_virtual', 'avail_virtual', 'extended')]
+    status = MemoryStatus()
+    status.length = ctypes.sizeof(status)
+    require(ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)), 'GlobalMemoryStatusEx failed')
+    return status.avail_phys
+
+
+def is_junction(path):
+    """Path.is_junction was added in Python 3.12; support Python 3.11 too."""
+    try:
+        return path.lstat().st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+    except (OSError, AttributeError):
+        return False
+
+
+def terminate_tree(process):
+    """Only terminate the compiler tree created by this build invocation."""
+    subprocess.run(['taskkill.exe', '/PID', str(process.pid), '/T', '/F'],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+    process.wait(timeout=30)
+
+
+def windows_regular_open(path):
+    """Binary archive input without Unix-only O_NOFOLLOW/O_NONBLOCK flags.
+
+    Refuse reparse paths and hard links, then bind the opened handle to the same
+    regular file checked before and after open. Never accept a redirected path.
+    """
+    path = Path(path).absolute()
+    for part in (path, *path.parents):
+        require(not part.is_symlink() and not is_junction(part), 'symbolic archive path refused')
+    before = path.lstat()
+    require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and
+            not getattr(before, 'st_reparse_tag', 0), 'archive must be a single-link regular file')
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_BINARY', 0))
+    try:
+        opened, after = os.fstat(fd), path.lstat()
+        require(stat.S_ISREG(opened.st_mode) and opened.st_nlink == 1 and
+                not getattr(after, 'st_reparse_tag', 0) and
+                os.path.samestat(before, opened) and os.path.samestat(opened, after) and
+                before.st_size == opened.st_size == after.st_size,
+                'archive changed while opening')
+        return os.fdopen(fd, 'rb')
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def install_windows_archive_reader():
+    # Also called in every spawned worker: patching only the parent would leave
+    # the Unix reader active in Windows multiprocessing's fresh interpreters.
+    directory = str(Path(__file__).resolve().parent)
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
+    import inventory_astral_pkz as pkz
+    pkz.regular_open = windows_regular_open
+
+
+def extract_shader_inventory(input_root, out, jobs):
+    """Reuse the shared extractor with a Windows file reader in spawned workers."""
+    import concurrent.futures
+    from functools import partial
+    import multiprocessing
+    from types import SimpleNamespace
+    install_windows_archive_reader()
+    import astral_shader_full_inventory as inventory
+    require(1 <= jobs <= 8, 'shader jobs must be 1..8')
+    original = inventory.concurrent
+    # Only shadow this module's executor namespace, not the global futures API.
+    inventory.concurrent = SimpleNamespace(futures=SimpleNamespace(
+        ProcessPoolExecutor=partial(concurrent.futures.ProcessPoolExecutor,
+            mp_context=multiprocessing.get_context('spawn'), initializer=install_windows_archive_reader),
+        as_completed=concurrent.futures.as_completed))
+    try:
+        return inventory.extract(input_root, out, jobs=jobs)
+    except inventory.Invalid as e:
+        raise ValueError(str(e)) from e
+    finally:
+        inventory.concurrent = original
+
+
 def compile_objects(commands, build, package):
     require(commands, 'empty compile graph')
     objects = []
@@ -436,6 +559,10 @@ def main():
     s.add_argument('--profile', choices=tuple(PROFILES), default=DEFAULT_PROFILE)
     s.add_argument('--generated-receipt', type=Path)
     sub.add_parser('probe')
+    x = sub.add_parser('extract-shaders')
+    x.add_argument('--input', type=Path, required=True)
+    x.add_argument('--out', type=Path, required=True)
+    x.add_argument('--jobs', type=int, default=4)
     w = sub.add_parser('run')
     for n in ('package', 'out'):
         w.add_argument('--' + n, type=Path, required=True)
@@ -447,6 +574,12 @@ def main():
     try:
         if a.mode == 'stage': stage(a)
         elif a.mode == 'probe': print(json.dumps(discover(), indent=2))
+        elif a.mode == 'extract-shaders':
+            require(os.name == 'nt', 'native shader extraction must execute on Windows')
+            report = extract_shader_inventory(a.input, a.out, a.jobs)
+            print(json.dumps({k: report[k] for k in
+                ('archives', 'members', 'decoded_bytes', 'distinct_code_blocks', 'variant_batches')} |
+                {'inventory': str(a.out / 'inventory.json')}))
         else: native(a)
     except (ValueError, OSError, subprocess.SubprocessError, KeyError) as e:
         p.exit(1, 'windows native blocked: ' + str(e) + '\n')

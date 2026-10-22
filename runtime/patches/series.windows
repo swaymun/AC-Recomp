@@ -1,6 +1,9 @@
 # Native Windows x64 overlay order: runtime/patches/series.linux unchanged, then windows-native.patch (clang-cl
-# policy) and astral-windows.patch (docs/ASTRAL_WINDOWS.md). tests/test_astral_windows.py checks that this list is
-# series.linux plus these two, so keep them in step.
+# policy), astral-windows.patch, astral-windows-desktop.patch, astral-windows-mem.patch, then
+# astral-windows-perf.patch,
+# astral-windows-resident.patch, astral-windows-writeback.patch and astral-windows-replay.patch
+# (docs/ASTRAL_WINDOWS_PERF.md).
+# Keep the overlay-order tests in step.
 apple-memory.patch
 astral-bootstrap.patch
 astral-control-import.patch
@@ -27,6 +30,7 @@ astral-shared-font.patch
 astral-swkbd.patch
 astral-perf-hud.patch
 astral-audio-dump.patch
+astral-audio-fix.patch
 astral-launcher.patch
 astral-touch.patch
 astral-upscale.patch
@@ -34,6 +38,20 @@ astral-save-profiles.patch
 astral-controls-ui.patch
 astral-fps-variant.patch
 astral-texel-coalesce.patch
+astral-shader-cache.patch
+astral-render-fix.patch
+astral-depth-fidelity.patch
 astral-linux.patch
 windows-native.patch
 astral-windows.patch
+astral-windows-desktop.patch
+# Opt-in memory repairs and NX_MEM_TRACE accounting; guard remains 8 GiB.
+astral-windows-mem.patch
+astral-windows-perf.patch
+astral-windows-resident.patch
+astral-windows-writeback.patch
+astral-windows-replay.patch
+
+# QPC diagnostics and opt-in pacing/ASTC experiments; Unicode data-root support.
+# The shared shader-cache overlay defaults to file logging; console mirroring is opt-in.
+astral-windows-stutter.patch

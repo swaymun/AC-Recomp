@@ -31,7 +31,8 @@ import test_astral_shared_font as font  # noqa: E402
 OVERLAY = 'astral-fps-variant.patch'
 ORDER = (*previous.ORDER, OVERLAY)
 MODIFIED = ['CMakeLists.txt', 'runtime/src/input_map.cpp', 'runtime/src/input_map.h', 'runtime/src/launcher.cpp',
-            'runtime/src/launcher.h', 'runtime/src/loader.cpp', 'runtime/src/platform_mac.cpp']
+            'runtime/src/launcher.h', 'runtime/src/loader.cpp', 'runtime/src/platform_mac.cpp',
+            'runtime/src/astral_frame_rate.h', 'runtime/src/nvn/nvn_queue.cpp']
 CMAKE_MARK = '# Astral, SDL3 desktop hosts: a second executable'
 
 FIXTURE = r'''
@@ -62,6 +63,25 @@ Event nav(Nav n) { Event e; e.kind = Event::kNav; e.nav = n; return e; }
 int main(int argc, char** argv) {
     std::string mode = argv[1];
     fs::path dir = argc > 2 ? fs::path(argv[2]) : fs::path(".");
+    if (mode == "dynamic") {
+        CHECK(astral_fps::mode == 2 || astral_fps::mode == 3);
+        CHECK(launcher::fps_variant((dir / "astral").string(), true).empty());
+        CHECK(launcher::fps_variant((dir / "astral-60fps").string(), false).empty());
+        const int rate = astral_fps::mode == 2 ? 60 : 0;
+        CHECK(launcher::running_fps("/x/astral") == rate); // compile mode wins even over NX_SINGLE_FPS=30
+        launcher::Menu one;
+        one.fps_variants = false;
+        one.running_fps = rate;
+        one.handle(nav(Nav::Down), 0);
+        one.handle(nav(Nav::Down), 0);
+        one.handle(nav(Nav::Confirm), 0);
+        for (int i = 0; i < input::kSetFps; i++) one.handle(nav(Nav::Down), 0);
+        CHECK(one.cells()[input::kSetFps][1] == (rate ? "60 (this build)" : "Dynamic (unlocked, this build)"));
+        one.handle(nav(Nav::Right), 0);
+        CHECK(!one.settings_dirty && one.notice == "Frame rate is fixed by this experimental build");
+        std::printf("PASS dynamic launcher: correct build label; legacy settings/siblings cannot change the mode\n");
+        return 0;
+    }
     if (mode == "settings") {
         CHECK(input::Settings().fps == 30);
         CHECK(input::parse_settings("[settings]\nfps = 60\n").fps == 60);
@@ -196,6 +216,158 @@ def run_cmake_block(test, cmake, block, work):
 
 
 class AstralFpsVariantTests(unittest.TestCase):
+    def test_complete_shipped_series_apply_to_the_pinned_runtime(self):
+        common = Path(subprocess.check_output(['git', 'rev-parse', '--git-common-dir'], cwd=ROOT, text=True).strip())
+        common = common if common.is_absolute() else (ROOT / common).resolve()
+        reference = Path(os.environ.get('NVN_REFERENCE', str(
+            common.parent / '.local/orchestrate/2026-10-18/worktrees/PIN-004/.local/references/SuperMarioWonderRecomp')))
+        if not reference.is_dir():
+            self.skipTest('the private pinned upstream is absent')
+        with tempfile.TemporaryDirectory() as tmp:
+            for platform in ('macos', 'linux', 'windows'):
+                with self.subTest(platform=platform):
+                    lines = (ROOT / 'runtime/patches' / f'series.{platform}').read_text().splitlines()
+                    names = [line.split('#', 1)[0].strip() for line in lines]
+                    patches = [ROOT / 'runtime/patches' / name for name in names if name]
+                    source = Path(tmp) / platform
+                    runtime.prepare_source(reference, source, patches)
+                    self.assertTrue((source / 'runtime/src/astral_frame_rate.h').is_file())
+                    # Later audio/cache overlays must compose with the actual present
+                    # implementation, not just with the extracted cap helper fixture.
+                    compiler, vulkan = shutil.which('c++'), vulkan_include()
+                    if platform == 'macos' and compiler:
+                        queue = (source / 'runtime/src/nvn/nvn_queue.cpp').read_text()
+                        start = queue.index('void pace_present(int interval) {')
+                        pacer = queue[start:queue.index('\n}\n', start) + 3]
+                        fixture = source / 'pacer-fixture.cpp'
+                        fixture.write_text(r'''
+#include "astral_frame_rate.h"
+#include <cassert>
+#include <cstdio>
+namespace nx::plat {
+uint64_t tick = 1000000000;
+uint64_t monotonic_ns() { return tick; }
+void sleep_ns(uint64_t ns) { tick += ns; }
+}
+namespace nx::nvn {
+void log(const char*, ...) {}
+uint64_t display_period_ns() { return 16666667; }
+void log_wait_sites() { plat::tick += 30000000; } // slow diagnostic after present 600
+@PACER@
+}
+int main() {
+    uint64_t previous = 0;
+    for (int i = 0; i < 620; ++i) {
+        nx::nvn::pace_present(nx::astral_fps::mode == 0 ? 1 : 0);
+        auto now = nx::plat::tick;
+        if (nx::astral_fps::mode == 0) assert(now == 1000000000);
+        else if (i) {
+            auto delta = now - previous;
+            if (delta < 2083334) {
+                std::fprintf(stderr, "unsafe return spacing after present %d: %llu ns\n", i,
+                             (unsigned long long)delta);
+                return 1;
+            }
+            if (i < 599) assert(delta == (nx::astral_fps::mode == 2 ? 16666667 : 2083334));
+        }
+        previous = now;
+    }
+}
+'''.replace('@PACER@', pacer))
+                        for mode in (0, 2, 3):
+                            executable = source / f'pacer{mode}'
+                            build = subprocess.run(
+                                [compiler, '-std=c++20', f'-DNX_ASTRAL_FPS_MODE={mode}',
+                                 '-I', str(source / 'runtime/src'), str(fixture), '-o', str(executable)],
+                                capture_output=True, text=True, timeout=60)
+                            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+                            env = {**os.environ, 'NX_DYNAMIC_FPS_CAP': '480', 'NX_NO_FRAME_LIMIT': '1'}
+                            run = subprocess.run([str(executable)], env=env, capture_output=True, text=True, timeout=10)
+                            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                        print('PASS production pacer: legacy bypass, exact cadence, 480 Hz floor after slow diagnostics')
+                    if platform == 'macos' and sys.platform == 'darwin' and compiler and vulkan:
+                        src = source / 'runtime/src'
+                        for mode in (0, 2, 3):
+                            check = subprocess.run(
+                                [compiler, '-std=c++20', '-DNX_ASTRAL_STRICT=1', '-DNX_APPLE_HIGH_MEMORY=1',
+                                 f'-DNX_ASTRAL_FPS_MODE={mode}', '-I', str(source / 'runtime/include'),
+                                 '-I', str(src), '-I', str(vulkan), '-fsyntax-only', str(src / 'nvn/nvn_queue.cpp')],
+                                capture_output=True, text=True, timeout=120)
+                            self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+                        print('PASS full Mac present implementation syntax: legacy, dynamic 60, unlocked')
+        print('PASS full shipped Mac/Linux/Windows patch series: clean pinned Git checkouts; no game/GPU')
+
+    def test_dynamic_cmake_selection_and_mixed_build_refusal(self):
+        cmake = shutil.which('cmake')
+        if not cmake:
+            self.skipTest('cmake is absent')
+        patch = (ROOT / 'runtime/patches' / OVERLAY).read_text().split('+++ b/CMakeLists.txt')[1]
+        hunk = patch.split('\ndiff --git')[0]
+        block = '\n'.join(line[1:] for line in hunk.splitlines() if line.startswith('+'))
+        block = block.split(CMAKE_MARK)[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / 'runtime/src/nvn').mkdir(parents=True)
+            (work / 'runtime/src/nvn/nvn_queue.cpp').write_text('int main() { return 0; }\n')
+            (work / 'CMakeLists.txt').write_text(
+                'cmake_minimum_required(VERSION 3.20)\nproject(fps CXX)\nset(NX_GAME astral)\n' + block +
+                '\nget_source_file_property(def runtime/src/nvn/nvn_queue.cpp COMPILE_DEFINITIONS)\n'
+                'file(WRITE "${CMAKE_BINARY_DIR}/mode.txt" "${def}")\n')
+            for mode, expected in [('legacy', 'NOTFOUND'), ('30', 'NOTFOUND'), ('60-fixed', 'NOTFOUND'),
+                                   ('dynamic-60-cap', 'NX_ASTRAL_FPS_MODE=2'),
+                                   ('dynamic-unlocked', 'NX_ASTRAL_FPS_MODE=3')]:
+                build = work / mode
+                run = subprocess.run([cmake, '-S', str(work), '-B', str(build), f'-DNX_ASTRAL_FPS_MODE={mode}'],
+                                     capture_output=True, text=True, timeout=60)
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                self.assertEqual((build / 'mode.txt').read_text(), expected)
+            for mode, extra, message in [('120', [], 'Invalid NX_ASTRAL_FPS_MODE'),
+                                          ('dynamic-unlocked', ['-DNX_MAIN_VARIANT_LIST=anything'], 'single-mode')]:
+                run = subprocess.run([cmake, '-S', str(work), '-B', str(work / 'bad'),
+                                      f'-DNX_ASTRAL_FPS_MODE={mode}', *extra],
+                                     capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertIn(message, run.stdout + run.stderr)
+        print('PASS cmake dynamic selection: exact pacing definition; invalid/mixed modes refused')
+
+    def test_dynamic_present_cap_cpu(self):
+        compiler = shutil.which('c++')
+        self.assertIsNotNone(compiler)
+        patch = (ROOT / 'runtime/patches' / OVERLAY).read_text()
+        header = patch.split('+++ b/runtime/src/astral_frame_rate.h\n', 1)[1].split('\ndiff --git', 1)[0]
+        source = '\n'.join(line[1:] for line in header.splitlines() if line.startswith('+'))
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / 'astral_frame_rate.h').write_text(source + '\n')
+            (work / 'test.cpp').write_text(r'''
+#include "astral_frame_rate.h"
+#include <cassert>
+using namespace nx::astral_fps;
+int main() {
+    const unsigned ceiling = mode == 2 ? 60 : 480;
+    assert(cap(nullptr) == ceiling && cap("") == ceiling && cap("0") == ceiling);
+    assert(cap("40") == 40 && cap("120") == (mode == 2 ? 60 : 120));
+    for (const char* bad : {"-1", "NaN", "481", "14", "60Hz", "999999999999999999999"})
+        assert(cap(bad) == ceiling);
+    assert(period(0, 16666667, 60) == 16666667);
+    assert(period(1, 8333333, 60) == 16666667); // a 120 Hz display cannot evade the 60 cap
+    assert(period(2, 16666667, 60) == 33333334);
+    assert(period(0, 16666667, 120) == 8333334);
+    assert(period(0, 16666667, 480) == 2083334);
+    assert(period(0, 16666667, 40) == 25000000); // forced-drop measurement
+    assert(present_period(0, 16666667) == (1000000000ull + ceiling - 1) / ceiling);
+}
+''')
+            for mode in (2, 3):
+                build = subprocess.run([compiler, '-std=c++20', '-Wall', '-Wextra', '-Werror',
+                                        f'-DNX_ASTRAL_FPS_MODE={mode}', str(work / 'test.cpp'), '-o', str(work / 'test')],
+                                       capture_output=True, text=True, timeout=60)
+                self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+                clean = {k:v for k,v in os.environ.items() if k != 'NX_DYNAMIC_FPS_CAP'}
+                run = subprocess.run([str(work / 'test')], capture_output=True, text=True, env=clean, timeout=10)
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        print('PASS dynamic pacing: 60 cap, 120/480 unlock, 40 drop, invalid overrides; no game/GPU')
+
     def test_cmake_block_in_a_small_project(self):
         cmake = os.environ.get('CMAKE') or shutil.which('cmake')
         if not cmake:
@@ -288,6 +460,17 @@ class AstralFpsVariantTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         print('PASS one-rate build: the Frame rate row shows the running rate (NX_SINGLE_FPS); nx.log appended '
               'after a re-exec')
+        for mode in (2, 3):
+            dynamic = work / f'dynamic{mode}'
+            build = subprocess.run([compiler, '-std=c++20', '-DNX_ASTRAL_STRICT=1', '-DNX_SINGLE_FPS=30',
+                                    f'-DNX_ASTRAL_FPS_MODE={mode}', *includes, '-I', sdl,
+                                    str(work / 'fixture.cpp'), '-L', lib, '-lSDL3', '-Wl,-rpath,' + lib,
+                                    '-o', str(dynamic)], capture_output=True, text=True, timeout=240)
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+            result = subprocess.run([str(dynamic), 'dynamic', str(bins)], env=clean,
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            print(result.stdout.strip())
         for flags in (['-DNX_ASTRAL_STRICT=1', '-DNX_APPLE_HIGH_MEMORY=1'], []):
             for name in ('input_map.cpp', 'launcher.cpp'):
                 check = subprocess.run([compiler, '-std=c++20', *flags, *includes, '-I', sdl, '-fsyntax-only',

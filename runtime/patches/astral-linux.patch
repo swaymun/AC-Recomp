@@ -236,3 +236,156 @@ diff --git a/runtime/src/nvn/nvn_vk.cpp b/runtime/src/nvn/nvn_vk.cpp
          if ((families[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present) {
              g_family = k;
              break;
+diff --git a/runtime/src/nvn/nvn_frames.cpp b/runtime/src/nvn/nvn_frames.cpp
+--- a/runtime/src/nvn/nvn_frames.cpp
++++ b/runtime/src/nvn/nvn_frames.cpp
+@@ -4,6 +4,9 @@
+ // of a few slots (command buffers, fences, descriptor pool, the stretch of the upload ring its replay filled, the
+ // compute results to copy back) and returns once queued. A slot is retired (its fences waited, 2 s at most, as the
+ // synchronous path) when it is reused, when the ring needs its memory back, or when something waits for it.
++#if defined(__linux__) && !defined(__ANDROID__)
++#include "nvn_linux_staging.h"
++#endif
+ //
+ // Replays copy everything the GPU reads from guest memory into the ring at submit time, so the game may change its
+ // memory while a submit runs. Only compute results flow back (write-backs). Two modes use the slots:
+@@ -111,6 +114,73 @@
+ std::mutex g_grave_lock;
+ std::vector<std::pair<uint64_t, std::shared_ptr<GpuImage>>> g_grave;
+ std::vector<std::tuple<uint64_t, VkBuffer, VkDeviceMemory>> g_staging;  // staging_alloc's, freed like the grave's
++#if defined(__linux__) && !defined(__ANDROID__)
++// All access is under the existing GPU lock, including retirement. Serial ownership
++// is the same as the old dedicated-buffer graveyard, including split/chunk submits.
++struct LinuxStaging {
++    VkBuffer buffer = VK_NULL_HANDLE;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    uint8_t* ptr = nullptr;
++    uint64_t capacity = 0, allocation_bytes = 0;
++};
++RetiredStaging<LinuxStaging> g_linux_staging;
++bool linux_staging_option(const char* name) {
++    // Opt-in until the per-item byte and stage gates have passed.
++    const char* value = std::getenv(name);
++    return value && value[0] == '1' && !value[1];
++}
++void linux_staging_dispose(LinuxStaging a) {
++    if (a.ptr) p_vkUnmapMemory(vk_device(), a.memory);
++    if (a.buffer) p_vkDestroyBuffer(vk_device(), a.buffer, nullptr);
++    if (a.memory) p_vkFreeMemory(vk_device(), a.memory, nullptr);
++}
++Upload linux_staging_alloc(uint64_t size) {
++    const bool pool = linux_staging_option("NX_LINUX_STAGING_POOL");
++    LinuxStaging a;
++    if (pool && g_linux_staging.acquire(size, a)) {
++        g_linux_staging.submit(g_submitted + 1, a.capacity, a.allocation_bytes, a);
++        return {a.buffer, 0, a.ptr};
++    }
++    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++    bi.size = size; bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++    if (p_vkCreateBuffer(vk_device(), &bi, nullptr, &a.buffer) != VK_SUCCESS) return upload_alloc(size, 16);
++    VkMemoryRequirements req{};
++    p_vkGetBufferMemoryRequirements(vk_device(), a.buffer, &req);
++    const auto plain = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++    const uint32_t fallback = memory_type(req.memoryTypeBits, plain);
++    uint32_t selected = fallback;
++    if (linux_staging_option("NX_LINUX_STAGING_CACHED")) {
++        VkPhysicalDeviceMemoryProperties mp{};
++        p_vkGetPhysicalDeviceMemoryProperties(vk_physical(), &mp);
++        for (uint32_t k = 0; k < mp.memoryTypeCount; ++k)
++            if ((req.memoryTypeBits & (1u << k)) &&
++                (mp.memoryTypes[k].propertyFlags & (plain | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) ==
++                (plain | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) { selected = k; break; }
++    }
++    // A preferred type can be exhausted independently of the plain heap. Retry the
++    // old type after allocation/bind/map failure; never return a partially bound buffer.
++    for (unsigned attempt = 0; attempt < 2; ++attempt) {
++        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++        ai.allocationSize = req.size; ai.memoryTypeIndex = selected;
++        void* ptr = nullptr;
++        const bool allocated = p_vkAllocateMemory(vk_device(), &ai, nullptr, &a.memory) == VK_SUCCESS;
++        if (!allocated) a.memory = VK_NULL_HANDLE;  // an error output does not transfer ownership
++        if (allocated && p_vkBindBufferMemory(vk_device(), a.buffer, a.memory, 0) == VK_SUCCESS &&
++            p_vkMapMemory(vk_device(), a.memory, 0, VK_WHOLE_SIZE, 0, &ptr) == VK_SUCCESS) {
++            a.ptr = static_cast<uint8_t*>(ptr); a.capacity = size; a.allocation_bytes = req.size;
++            if (pool) g_linux_staging.submit(g_submitted + 1, size, req.size, a);
++            else { std::lock_guard lk(g_grave_lock); g_staging.push_back({g_submitted + 1, a.buffer, a.memory}); }
++            return {a.buffer, 0, a.ptr};
++        }
++        linux_staging_dispose(a); a = {};
++        if (selected == fallback || attempt) break;
++        selected = fallback;
++        if (p_vkCreateBuffer(vk_device(), &bi, nullptr, &a.buffer) != VK_SUCCESS) break;
++    }
++    return upload_alloc(size, 16);
++}
++#endif
++
+
+ // GPU-written images of destroyed textures, kept a few submits for a new texture over the same memory with the same
+ // shape. Wonder re-creates ~180 NVNtexture objects per frame over the same render-target memory: each got a new
+@@ -608,6 +678,9 @@
+         g_staging.erase(done, g_staging.end());
+     }
+     for (auto& [b, m] : staging) p_vkDestroyBuffer(vk_device(), b, nullptr), p_vkFreeMemory(vk_device(), m, nullptr);
++#if defined(__linux__) && !defined(__ANDROID__)
++    g_linux_staging.retire(completed, linux_staging_dispose);
++#endif
+     for (auto& img : dead) {
+         if (!img || !img->image) continue;
+         if (img.use_count() > 1) continue;  // another live texture shares it (image_of): freed with the last one
+@@ -642,6 +715,10 @@
+     g_staging_count++, g_staging_bytes += size;
+     VkDevice d = vk_device();
+     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++#if defined(__linux__) && !defined(__ANDROID__)
++    if (linux_staging_option("NX_LINUX_STAGING_CACHED") || linux_staging_option("NX_LINUX_STAGING_POOL"))
++        return linux_staging_alloc(size);
++#endif
+     bi.size = size;
+     bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+     VkBuffer buffer = VK_NULL_HANDLE;
+diff --git a/runtime/src/nvn/nvn_linux_staging.h b/runtime/src/nvn/nvn_linux_staging.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/nvn/nvn_linux_staging.h
+@@ -0,0 +1,40 @@
++// Linux upload staging: free storage is bounded; in-flight storage is never reused.
++#pragma once
++#include <algorithm>
++#include <cstdint>
++#include <cstddef>
++#include <vector>
++namespace nx::nvn {
++template<class T> class RetiredStaging {
++    struct Entry { uint64_t serial, size, bytes; T allocation; };
++    std::vector<Entry> pending_, free_;
++    uint64_t bytes_ = 0;
++public:
++    static constexpr uint64_t max_bytes = 256ull << 20;
++    static constexpr std::size_t max_buffers = 32;
++    uint64_t reused = 0, released = 0, peak_bytes = 0;
++    bool acquire(uint64_t size, T& allocation) {
++        auto best = free_.end();
++        for (auto it = free_.begin(); it != free_.end(); ++it)
++            if (it->size >= size && it->size - size <= size &&
++                (best == free_.end() || it->size < best->size)) best = it;
++        if (best == free_.end()) return false;
++        bytes_ -= best->bytes; allocation = best->allocation; free_.erase(best); ++reused;
++        return true;
++    }
++    void submit(uint64_t serial, uint64_t size, uint64_t bytes, T allocation) {
++        pending_.push_back({serial, size, bytes, allocation});
++    }
++    template<class Dispose> void retire(uint64_t completed, Dispose dispose) {
++        for (auto it = pending_.begin(); it != pending_.end();) {
++            if (it->serial > completed) { ++it; continue; }
++            if (free_.size() < max_buffers && it->bytes <= max_bytes - bytes_) {
++                bytes_ += it->bytes; free_.push_back(*it); peak_bytes = std::max(peak_bytes, bytes_);
++            } else { dispose(it->allocation); ++released; }
++            it = pending_.erase(it);
++        }
++    }
++    uint64_t retained_bytes() const { return bytes_; }
++    std::size_t pending_count() const { return pending_.size(); }
++};
++} // namespace nx::nvn

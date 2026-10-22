@@ -1,0 +1,280 @@
+diff --git a/runtime/src/nvn/nvn_depth_fidelity.h b/runtime/src/nvn/nvn_depth_fidelity.h
+new file mode 100644
+index 0000000..5034258
+--- /dev/null
++++ b/runtime/src/nvn/nvn_depth_fidelity.h
+@@ -0,0 +1,44 @@
++// Astral depth/MRT fidelity. Original implementation informed by Puddz/AstralChain-PC
++// d627f49 (MIT), vulkan/exec.c:3289-3293,3330-3338 and maxwell/translate.c:1758-1766.
++// No game instructions, assets or third-party implementation are embedded here.
++#pragma once
++#include <cstdlib>
++#include "nvn_shaders.h"
++
++namespace nx::nvn {
++inline bool depth_fidelity_option(const char* name, bool default_on = false) {
++#if defined(NX_ASTRAL_STRICT) && defined(_WIN32)
++    const char* e = std::getenv(name);
++    return e ? e[0] == '1' : default_on;
++#else
++    (void)name; (void)default_on;
++    return false;  // preserve Metal and other profiles pending hardware evidence
++#endif
++}
++inline bool exact_equal_enabled() {
++    static const bool on = depth_fidelity_option("NX_EXACT_EQUAL", true);
++    return on;
++}
++// Guest 3 is EQUAL. The old no-write relaxation applies only when exact mode is disabled.
++inline uint32_t fidelity_depth_func(uint32_t func, bool write, bool exact) {
++    return !exact && func == 3 && !write ? 4 : func;
++}
++// Location coverage, rather than channel coverage: an unwritten attachment must retain
++// its previous contents. Arrays span locations; component-qualified outputs share one.
++inline uint32_t fragment_output_locations(const ShaderInfo* fs) {
++    uint32_t mask = 0;
++    if (!fs || fs->stage != ShaderStage::Fragment) return mask;
++    for (const ShaderIo& io : fs->refl.fragment_outputs())
++        for (uint32_t n = 0; n < io.array && io.location < 8 && n < 8 - io.location; ++n)
++            mask |= 1u << (io.location + n);
++    return mask;
++}
++inline uint32_t fragment_color_mask(uint32_t guest, uint32_t outputs, uint32_t target) {
++    return target < 8 && ((outputs >> target) & 1u) ? guest & 0xfu : 0u;
++}
++inline uint32_t effective_fragment_outputs(const ShaderInfo* fs) {
++    static const bool on = depth_fidelity_option("NX_FRAG_OUTPUT_MASK");
++    return on ? fragment_output_locations(fs) : 0xffu;
++}
++bool expand_half_unpack(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);
++}  // namespace nx::nvn
+diff --git a/runtime/src/nvn/nvn_pipeline.cpp b/runtime/src/nvn/nvn_pipeline.cpp
+index 1105674..d571cad 100644
+--- a/runtime/src/nvn/nvn_pipeline.cpp
++++ b/runtime/src/nvn/nvn_pipeline.cpp
+@@ -16,6 +16,7 @@
+ #include <unordered_map>
+ 
+ #include "nvn_pipeline.h"
++#include "nvn_depth_fidelity.h"
+ #include "nvn_ultrawide.h"
+ #include "platform.h"
+ #if defined(NX_ASTRAL_STRICT) && defined(__APPLE__)
+@@ -520,7 +521,13 @@ const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages
+ 
+ // ---- graphics pipelines ---------------------------------------------------------------------------------------------
+ 
+-VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout) {
++VkPipeline graphics_pipeline(const PipelineKey& guest_key, const ProgramLayout& layout) {
++    // Canonical effective masks are hashed, including vertex-only and sparse MRT passes.
++    // Puddz/AstralChain-PC (MIT) identified unwritten MRTs as black silhouettes on NVIDIA.
++    PipelineKey key;
++    std::memcpy(&key, &guest_key, sizeof key);  // retain deterministic padding
++    const uint32_t outputs = effective_fragment_outputs(key.fs);
++    for (uint32_t a = 0; a < 8; ++a) key.mask.mask[a] = fragment_color_mask(key.mask.mask[a], outputs, a);
+     // By the key's bytes, as before, but hashed (nvn_pipeline.h) instead of a ~700-byte std::string built and
+     // compared down a tree per draw; and the last entry first: consecutive draws mostly share their state.
+     using Key = ByteKey<sizeof(PipelineKey)>;
+@@ -652,12 +659,12 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
+     bool has_depth = key.depth_format != VK_FORMAT_UNDEFINED;
+     ds.depthTestEnable = has_depth && key.depth.depth_test;
+     ds.depthWriteEnable = has_depth && key.depth.depth_write;
+-    ds.depthCompareOp = vk_compare(key.depth.depth_func);
++    ds.depthCompareOp = vk_compare(fidelity_depth_func(key.depth.depth_func, key.depth.depth_write, exact_equal_enabled()));
+     // EQUAL after a depth pre-pass (the colour pass does not write depth) needs both passes to compute bit-identical
+     // depth; two translated shaders compiled separately by Metal do not, and Wonder's whole course colour pass was
+     // discarded (only the sky showed). LESS_OR_EQUAL keeps what EQUAL keeps for opaque geometry after a pre-pass.
+     if (key.depth.depth_func == 3 && !key.depth.depth_write) {
+-        ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
++        // Exact EQUAL on native Windows; retain the inherited Metal workaround elsewhere.
+         static const bool always = std::getenv("NX_EQUAL_ALWAYS") != nullptr;  // diagnostic: EQUAL passes test nothing
+         if (always) ds.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+     }
+diff --git a/runtime/src/nvn/nvn_raster.cpp b/runtime/src/nvn/nvn_raster.cpp
+index 2404fc0..9ba8696 100644
+--- a/runtime/src/nvn/nvn_raster.cpp
++++ b/runtime/src/nvn/nvn_raster.cpp
+@@ -14,6 +14,7 @@
+ #include <cstdlib>
+ 
+ #include "nvn_draw_state.h"
++#include "nvn_depth_fidelity.h"
+ 
+ namespace nx::nvn {
+ 
+@@ -77,7 +78,8 @@ bool equal_slack_pass(const DepthStencilInfo& d) {
+         return e && e[0] == '1';
+     }();
+     if (d.depth_write || equal_slack_units() == 0.0f) return false;
+-    return d.depth_func == 3 || (d.depth_func == 5 && greater);
++    // Exact depth mode removes only the synthetic EQUAL slack, not guest polygon bias.
++    return (d.depth_func == 3 && !exact_equal_enabled()) || (d.depth_func == 5 && greater);
+ }
+ 
+ namespace replay {
+diff --git a/runtime/src/nvn/nvn_spirv_patch.cpp b/runtime/src/nvn/nvn_spirv_patch.cpp
+index 14c0cf4..65a1293 100644
+--- a/runtime/src/nvn/nvn_spirv_patch.cpp
++++ b/runtime/src/nvn/nvn_spirv_patch.cpp
+@@ -12,6 +12,7 @@
+ #include <mutex>
+ 
+ #include "nvn_pipeline.h"
++#include "nvn_depth_fidelity.h"
+ 
+ namespace nx::nvn {
+ 
+@@ -525,6 +526,142 @@ uint32_t unwritten_inputs(const ShaderInfo* vs, const ShaderInfo* fs) {
+     return mask;
+ }
+ 
++// ---- binary16 expansion -----------------------------------------------------------------------------------------
++// Puddz/AstralChain-PC (MIT), maxwell/translate.c:1758-1766 documents NVIDIA
++// carrying UnpackHalf2x16 provenance into fp16 arithmetic across unequal passes.
++// Replace GLSL.std.450 UnpackHalf2x16 with explicit IEEE binary16 -> binary32 bits.
++// Subnormals use exact uint->float * 2^-24; signs (including -0), Inf and NaNs survive.
++bool expand_half_unpack(const std::vector<uint32_t>& in, std::vector<uint32_t>& out) {
++    if (in.size() < 5 || in[0] != 0x07230203) return false;
++    std::vector<Inst> insts;
++    uint32_t glsl = 0, float_type = 0, vec_type = 0;
++    size_t first_function = in.size();
++    std::map<uint32_t, uint32_t> floats, vectors;
++    for (size_t i = 5; i < in.size();) {
++        uint32_t len = in[i] >> 16, op = in[i] & 0xffff;
++        if (!len || i + len > in.size()) return false;
++        insts.push_back({i, op, len});
++        const uint32_t* w = &in[i];
++        if (op == 11 && len >= 3) {
++            const char expected[] = "GLSL.std.450";
++            if ((len - 2) * 4 >= sizeof expected && !std::memcmp(w + 2, expected, sizeof expected)) glsl = w[1];
++        }
++        if (op == OpTypeFloat && len == 3) floats[w[1]] = w[2];
++        if (op == OpTypeVector && len == 4 && w[3] == 2) vectors[w[1]] = w[2];
++        if (op == OpFunction) first_function = std::min(first_function, i);
++        i += len;
++    }
++    if (!glsl || first_function == in.size()) return false;
++    for (const Inst& n : insts) {
++        const uint32_t* w = &in[n.at];
++        if (n.op == 12 && n.len == 6 && w[3] == glsl && w[4] == 62) {
++            auto v = vectors.find(w[1]);
++            if (v == vectors.end() || floats[v->second] != 32) return false;
++            if (vec_type && vec_type != w[1]) return false;
++            vec_type = w[1], float_type = v->second;
++        }
++    }
++    if (!vec_type) return false;
++    uint32_t bound = in[3];
++    auto id = [&] { return bound++; };
++    std::vector<uint32_t> declarations;
++    auto emit = [](std::vector<uint32_t>& dest, uint32_t op, std::initializer_list<uint32_t> args) {
++        dest.push_back((uint32_t(args.size() + 1) << 16) | op);
++        dest.insert(dest.end(), args.begin(), args.end());
++    };
++    // Reuse existing scalar types: SPIR-V forbids duplicate non-aggregate types.
++    uint32_t u = 0, b = 0;
++    for (const Inst& n : insts) {
++        const uint32_t* w = &in[n.at];
++        if (n.op == OpTypeInt && n.len == 4 && w[2] == 32 && w[3] == 0) u = w[1];
++        if (n.op == 20 && n.len == 2) b = w[1];
++    }
++    if (!u) { u = id(); emit(declarations, OpTypeInt, {u, 32, 0}); }
++    if (!b) { b = id(); emit(declarations, 20, {b}); }
++    std::map<uint32_t, uint32_t> constants;
++    auto constant = [&](uint32_t v) {
++        if (auto it = constants.find(v); it != constants.end()) return it->second;
++        uint32_t result = id();
++        emit(declarations, 43, {u, result, v});
++        constants[v] = result;
++        return result;
++    };
++    for (uint32_t v : {0u, 10u, 13u, 16u, 23u, 31u, 112u, 1023u, 0x8000u, 0x7f800000u}) constant(v);
++    const uint32_t scale = id();
++    emit(declarations, 43, {float_type, scale, 0x33800000u});  // 2^-24
++    out.assign(in.begin(), in.begin() + 5);
++    for (const Inst& n : insts) {
++        if (n.at == first_function) out.insert(out.end(), declarations.begin(), declarations.end());
++        const uint32_t* w = &in[n.at];
++        if (!(n.op == 12 && n.len == 6 && w[3] == glsl && w[4] == 62)) {
++            out.insert(out.end(), w, w + n.len);
++            continue;
++        }
++        auto op = [&](uint32_t code, uint32_t type, std::initializer_list<uint32_t> args) {
++            uint32_t result = id();
++            out.push_back((uint32_t(args.size() + 3) << 16) | code);
++            out.push_back(type); out.push_back(result);
++            out.insert(out.end(), args.begin(), args.end());
++            return result;
++        };
++        uint32_t lanes[2];
++        for (uint32_t lane = 0; lane < 2; ++lane) {
++            const uint32_t h = lane ? op(194, u, {w[5], constant(16)}) : w[5];
++            const uint32_t sign = op(196, u, {op(199, u, {h, constant(0x8000)}), constant(16)});
++            const uint32_t exp = op(199, u, {op(194, u, {h, constant(10)}), constant(31)});
++            const uint32_t mant = op(199, u, {h, constant(1023)});
++            const uint32_t m = op(196, u, {mant, constant(13)});
++            const uint32_t normal = op(197, u, {sign, op(197, u, {m,
++                op(196, u, {op(128, u, {exp, constant(112)}), constant(23)})})});
++            const uint32_t special = op(197, u, {sign, op(197, u, {m, constant(0x7f800000)})});
++            const uint32_t sub = op(197, u, {sign, op(OpBitcast, u,
++                {op(133, float_type, {op(112, float_type, {mant}), scale})})});
++            const uint32_t bits = op(169, u, {op(170, b, {exp, constant(0)}), sub,
++                op(169, u, {op(170, b, {exp, constant(31)}), special, normal})});
++            lanes[lane] = op(OpBitcast, float_type, {bits});
++        }
++        emit(out, 80, {vec_type, w[2], lanes[0], lanes[1]});  // preserve result ID and all its uses
++    }
++    out[3] = bound;
++    return true;
++}
++
++// END_HALF_PASS
++// Puddz/AstralChain-PC (MIT), maxwell/translate.c:1840-1843 also marks
++// gl_Position precise. Invariant alone does not prohibit contraction of separate
++// guest float operations. Preserve explicit FMA instructions, and prohibit fusing
++// the separate arithmetic operations in vertex modules. Existing decorations survive.
++bool precise_vertex_math(const std::vector<uint32_t>& in, std::vector<uint32_t>& out) {
++    if (in.size() < 5 || in[0] != 0x07230203) return false;
++    std::vector<uint32_t> arithmetic, decorated;
++    size_t types = in.size();
++    for (size_t i = 5; i < in.size();) {
++        uint32_t len = in[i] >> 16, op = in[i] & 0xffff;
++        if (!len || i + len > in.size()) return false;
++        if (op >= 19 && op <= 39) types = std::min(types, i);
++        if (op == OpDecorate && len == 3 && in[i + 2] == 42) decorated.push_back(in[i + 1]);
++        switch (op) {
++            case 129: case 131: case 133: case 136: case 140: case 141:
++            case 142: case 143: case 144: case 145: case 146: case 147: case 148:
++                if (len >= 4) arithmetic.push_back(in[i + 2]);
++                break;
++            default: break;
++        }
++        i += len;
++    }
++    if (types == in.size()) return false;
++    std::vector<uint32_t> extra;
++    for (uint32_t result : arithmetic)
++        if (std::find(decorated.begin(), decorated.end(), result) == decorated.end())
++            extra.insert(extra.end(), {(3u << 16) | OpDecorate, result, 42});  // NoContraction
++    if (extra.empty()) return false;
++    out.assign(in.begin(), in.begin() + types);
++    out.insert(out.end(), extra.begin(), extra.end());
++    out.insert(out.end(), in.begin() + types, in.end());
++    return true;
++}
++// END_PRECISE_PASS
++
+ std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, uint32_t unwritten, bool* int_inputs) {
+     std::vector<uint32_t> code = s->spirv, next;  // each pass reads `code` and leaves its result in `next`
+     bool is_int = kinds && patch_int_inputs(code, kinds, next);
+@@ -551,6 +688,10 @@ std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, u
+ #endif
+     }();
+     if (zero_outputs && s->stage == ShaderStage::Vertex && zero_vertex_outputs(code, next)) code.swap(next);
++    static const bool half_bits = depth_fidelity_option("NX_HALF_BITS");
++    if (half_bits && s->stage == ShaderStage::Vertex && expand_half_unpack(code, next)) code.swap(next);
++    static const bool precise = depth_fidelity_option("NX_VERTEX_PRECISE");
++    if (precise && s->stage == ShaderStage::Vertex && precise_vertex_math(code, next)) code.swap(next);
+     static const bool invariant = [] {
+         const char* e = std::getenv("NX_INVARIANT");  // off by default: it did not change the Intel silhouettes
+         return e && std::atoi(e) != 0;

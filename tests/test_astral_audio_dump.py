@@ -6,9 +6,13 @@ child is killed (_exit, no close, no stdio flush) mid-stream and its file must s
 match the last periodic fix-up. The composed hle_audio.cpp then runs on a muted host (no audio device, as NX_MUTE):
 AudioOut buffers and the renderer mix are dumped from the first sound, the 10 s default is kept, NX_AUDIO_DUMP_SECONDS
 limits or (0) lifts it, and only one source owns the file. The default profile's preprocessed hle_audio.cpp must be
-unchanged. Synthetic samples only; no game, audio device or network is used.
+unchanged. The fix overlay's production SDL callback bodies run against a fake stream, exercising exact starvation
+counts, startup classification, unchanged PCM, completions and bounded telemetry overflow. The absolute fallback
+clock is checked for cumulative timing, idle rebasing and reset. Synthetic samples only; no game, audio device or
+network is used.
 """
 import os
+import json
 from pathlib import Path
 import shutil
 import struct
@@ -97,6 +101,85 @@ int main(int argc, char** argv) {
 '''
 
 
+HOST_FIXTURE = r'''
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <vector>
+#include "platform.h"
+#include "audio_probe.h"
+#include "audio_clock.h"
+#define SDLCALL
+constexpr int SDL_AUDIO_S16LE = 1, SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK = 1;
+struct SDL_AudioStream {};
+struct SDL_AudioSpec { int format, channels, freq; };
+SDL_AudioStream stream;
+std::vector<uint8_t> output;
+SDL_AudioStream* SDL_OpenAudioDeviceStream(int, SDL_AudioSpec*, void(*)(void*,SDL_AudioStream*,int,int), void*) {
+    return &stream;
+}
+bool SDL_ResumeAudioStreamDevice(SDL_AudioStream*) { return true; }
+bool SDL_PauseAudioStreamDevice(SDL_AudioStream*) { return true; }
+bool SDL_PutAudioStreamData(SDL_AudioStream*, const void* p, int n) {
+    auto b=static_cast<const uint8_t*>(p); output.insert(output.end(),b,b+n); return true;
+}
+const char* SDL_GetError() { return "fake"; }
+namespace nx { void log(const char*, ...) {} }
+namespace nx::plat {
+uint64_t monotonic_ns() { static uint64_t now=0; return now+=1000000; }
+bool headless() { return false; }
+'''
+HOST_MAIN = r'''
+}
+int completions=0;
+void done(void*) { completions++; }
+int main() {
+    using namespace nx;
+    using namespace nx::plat;
+    using namespace std::chrono;
+    AudioClock clock;
+    AudioClock::Clock::time_point origin{};
+    auto now = origin, deadline = origin;
+    // 1000 contiguous 5 ms buffers with 1 ms of work after each wake still take exactly 5 s.
+    for (int i=0;i<1000;i++) {
+        deadline = clock.advance(now, milliseconds(5));
+        now = deadline + milliseconds(1);
+    }
+    assert(deadline-origin==seconds(5));
+    // An idle period rebases; stop resets even a future deadline.
+    now += seconds(2);
+    assert(clock.advance(now,milliseconds(5))==now+milliseconds(5));
+    clock.reset();
+    assert(clock.advance(origin,milliseconds(5))==origin+milliseconds(5));
+    setenv("NX_AUDIO_DUMP", "synthetic.wav", 1);
+    assert(audio_open(done));
+    audio_cb(nullptr,&stream,16,0);
+    audio_probe::Event e;
+    assert(audio_probe::pop(e) && e.startup && e.frame==0 && e.missing_frames==4);
+    assert(!audio_probe::pop(e));
+    int16_t samples[]={1,2,3,4};
+    assert(audio_submit(samples,sizeof(samples),samples));
+    audio_cb(nullptr,&stream,16,0);
+    assert(completions==1 && audio_queued()==0);
+    assert(audio_probe::callbacks.load()==2 && audio_probe::requested.load()==8);
+    assert(audio_probe::pop(e) && !e.startup && e.frame==4 && e.missing_frames==2);
+    assert(output.size()==32 && output[16]==1 && output[18]==2 && output[20]==3 && output[22]==4);
+    // A delayed callback can have a full application queue: zero-fill counters alone miss this risk.
+    audio_probe::callback(4,0,1000000000);
+    assert(audio_probe::pop(e) && e.missing_frames==0 && e.late_ns>20000000);
+    assert(audio_probe::late_callbacks.load()==1 && audio_probe::underruns.load()==2);
+    for(unsigned i=0;i<audio_probe::kCapacity+5;i++) audio_probe::callback(1,1,100+i);
+    assert(audio_probe::lost.load()==6);
+    uint64_t previous=0; unsigned count=0;
+    while(audio_probe::pop(e)) { assert(e.frame>previous); previous=e.frame; count++; }
+    assert(count==audio_probe::kCapacity-1);
+    puts("PASS production SDL callback: exact missing frames, startup classification, PCM unchanged, completions, bounded telemetry overflow");
+}
+'''
+
 def parse_wav(path):
     data = Path(path).read_bytes()
     assert len(data) >= 44, len(data)
@@ -138,7 +221,7 @@ class AstralAudioDumpTests(unittest.TestCase):
         patch = font.apply(self, source, OVERLAY)
         applied = runtime.source_fingerprint(source)
         self.assertEqual(sorted(k for k in set(applied) | set(stacked) if applied.get(k) != stacked.get(k)),
-                         ['runtime/src/hle_audio.cpp', 'runtime/src/wav_stream.h'])
+                         ['runtime/src/audio_probe.h', 'runtime/src/hle_audio.cpp', 'runtime/src/wav_stream.h'])
         src = source / 'runtime/src'
         includes = ['-I', str(source / 'runtime/include'), '-I', str(src)]
         env = {k: v for k, v in os.environ.items() if not k.startswith('NX_')}
@@ -207,6 +290,15 @@ class AstralAudioDumpTests(unittest.TestCase):
         self.assertEqual((w['size'], w['riff'], w['file']), (len(expect), 36 + len(expect), 44 + len(expect)))
         self.assertEqual(w['pcm'], expect)
         self.assertIn('dumping the AudioOut output to audioout.wav, the whole session', log)
+        timing = [json.loads(line) for line in (session / 'audioout.wav.jsonl').read_text().splitlines()]
+        pcm = [row for row in timing if row['type'] == 'pcm']
+        self.assertEqual([row['frame'] for row in pcm], [0, 1024, 2048])
+        self.assertEqual([row['frames'] for row in pcm], [1024] * 3)
+        self.assertTrue(all(row['source'] == 1 for row in pcm))
+        self.assertTrue(all(row['host_underrun_callbacks'] == 0 for row in pcm))
+        self.assertTrue(all(row['host_callbacks'] == 0 and not row['host_probe_active'] for row in pcm))
+        self.assertEqual([row['monotonic_ns'] for row in pcm], sorted(row['monotonic_ns'] for row in pcm))
+
 
         log = session_run('renderer', {'NX_AUDIO_DUMP': 'renderer.wav'})  # NX_AUDIO_DUMP_SECONDS unset: 10 s
         w = parse_wav(session / 'renderer.wav')
@@ -238,6 +330,34 @@ class AstralAudioDumpTests(unittest.TestCase):
         subprocess.run(['git', '-C', str(source), 'apply', '-R', str(patch)], check=True, capture_output=True)
         self.assertEqual(patched, preprocessed(compiler, includes, name), 'default profile differs')
         print('PASS hle_audio.cpp: strict/default syntax with -Werror; default profile preprocesses identically')
+        # Apply dump again plus the host overlay, then exercise the production Mac and Linux callback bodies.
+        font.apply(self, source, OVERLAY)
+        font.apply(self, source, 'astral-audio-fix.patch')
+        self.assertEqual(patched, preprocessed(compiler, includes, name), 'fix changes default profile')
+        check = subprocess.run([compiler, '-std=c++20', '-Wall', '-Wextra', '-Wno-unused-parameter', '-Werror',
+                                '-DNX_ASTRAL_STRICT=1', '-DNX_APPLE_HIGH_MEMORY=1', *includes,
+                                '-fsyntax-only', str(name)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        build = subprocess.run([compiler, '-std=c++20', '-pthread', '-DNX_ASTRAL_STRICT=1', '-DNX_APPLE_HIGH_MEMORY=1',
+                                *includes, str(ROOT / 'tests/test_astral_audio_dump.cpp'), '-o', str(session / 'run')],
+                               capture_output=True, text=True, timeout=180)
+        self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+        session_run('audioout', {'NX_AUDIO_DUMP': 'fixed.wav', 'NX_AUDIO_DUMP_SECONDS': '0'})
+        self.assertEqual(parse_wav(session / 'fixed.wav')['pcm'], ramp(1, 3072))
+        for host in ('mac', 'linux'):
+            text = (src / ('platform_' + host + '.cpp')).read_text()
+            section = text[text.index('// ---- audio: SDL3 stream'):]
+            section = section[:section.index('// ---- Vulkan')]
+            fixture = out / ('host_' + host + '.cpp')
+            fixture.write_text(HOST_FIXTURE + section + HOST_MAIN)
+            binary = out / ('host_' + host)
+            build = subprocess.run([compiler, '-std=c++20', '-pthread', '-DNX_ASTRAL_STRICT=1', *includes,
+                                    str(fixture), '-o', str(binary)], capture_output=True, text=True, timeout=120)
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+            result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30, env=env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            print(result.stdout, end='')
+
         shutil.rmtree(out)  # reached only when every assertion passed; a failure keeps the copy as evidence
 
 

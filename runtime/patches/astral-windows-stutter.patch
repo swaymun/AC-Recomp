@@ -1,0 +1,1827 @@
+diff --git a/runtime/src/frame_stats.cpp b/runtime/src/frame_stats.cpp
+--- a/runtime/src/frame_stats.cpp
++++ b/runtime/src/frame_stats.cpp
+@@ -1,3 +1,4 @@
++#include "win_stutter.h"
+ // Where a frame's threads run, and how evenly frames reach the display (docs/nvn/android-perf/PLAN.md, phase 0 and
+ // R2). Every 600 ticks each frame thread logs which kind of core it was found on (Android: clusters by their highest
+ // clock, little/mid/prime on a Snapdragon 8 Gen 2) and how much of the wall clock it spent on a CPU; the presenting
+@@ -234,6 +235,7 @@
+ }
+
+ void frame_presented() {
++    stutter::Span frame_stats_span(stutter::FrameStats);
+     frame_thread_tick(0);
+     static uint64_t last = 0, n = 0, bins[7] = {};
+     uint64_t now = monotonic_ns();
+diff --git a/runtime/src/hle_vi.cpp b/runtime/src/hle_vi.cpp
+--- a/runtime/src/hle_vi.cpp
++++ b/runtime/src/hle_vi.cpp
+@@ -1,3 +1,4 @@
++#include "win_stutter.h"
+ // nn::vi (display/layers) and nv:: (graphics driver setup) at the API level. The layer is the platform's window
+ // (Win32 window / Android surface); its handle is the "native window" the game hands to vkCreateViSurfaceNN, which
+ // the Vulkan bridge turns into the platform's surface.
+@@ -181,6 +182,7 @@
+         next += display_period_ns();
+         int64_t wait = int64_t(next - plat::monotonic_ns());
+         if (wait > 0) plat::sleep_ns(wait);
++        stutter::mark(stutter::Vsync, next);
+         event_signal(g_vsync);
+     }
+ }
+diff --git a/runtime/src/kernel.cpp b/runtime/src/kernel.cpp
+--- a/runtime/src/kernel.cpp
++++ b/runtime/src/kernel.cpp
+@@ -1,3 +1,4 @@
++#include "win_stutter.h"
+ // A small Horizon kernel: handles, threads, synchronization (mutex/condvar/address arbitration), events,
+ // memory and GetInfo. Services (IPC) live in ipc.cpp.
+ #include <algorithm>
+@@ -204,6 +205,7 @@
+
+ // Wait (with g_k held) until `self->wake` or timeout (ns, <0 = forever). Returns false on timeout.
+ static bool block(std::unique_lock<std::recursive_mutex>& lk, KThread* self, int64_t timeout_ns) {
++    stutter::Span block_span(stutter::Block, uint64_t(timeout_ns));
+     if (timeout_ns < 0) {
+         self->cv.wait(lk, [&] { return self->wake; });
+         return true;
+@@ -844,6 +846,8 @@
+ }
+
+ void svc(CPU& c, uint32_t imm, uint64_t pc) {
++    stutter::Span svc_span(stutter::Svc, imm,
++        imm==0x0b || imm==0x18 || imm==0x1a || imm==0x1c || imm==0x34);
+     if (!t_svc_role || !svc_profile_on()) return svc_impl(c, imm, pc);
+     uint64_t t0 = plat::monotonic_ns();
+     svc_impl(c, imm, pc);
+diff --git a/runtime/src/loader.cpp b/runtime/src/loader.cpp
+--- a/runtime/src/loader.cpp
++++ b/runtime/src/loader.cpp
+@@ -1,3 +1,4 @@
++#include "win_stutter.h"
+ // Module loader and dynamic linker (what rtld does on Horizon), indirect-call dispatch and HLE thunks.
+ #include <algorithm>
+ #include <cstdarg>
+@@ -44,6 +45,7 @@
+ // ---- logging --------------------------------------------------------------------------------------------------
+
+ void log(const char* fmt, ...) {
++    stutter::Span log_span(stutter::Log);
+     char buf[2048];
+     va_list ap;
+     va_start(ap, fmt);
+@@ -94,14 +96,16 @@
+     }();
+     bool file_ok = false;
+     if (g_log_file) {
++        stutter::Span file_span(stutter::LogFile);
+         file_ok = std::fprintf(g_log_file, "%s\n", buf) >= 0;
+         file_ok = std::fflush(g_log_file) == 0 && file_ok;
+     }
+     // Keep owner-visible diagnostics when the file cannot be opened or written.
+-    if (!file_ok || mirror) plat::log_line(buf);
++    if (!file_ok || mirror) stutter::call(stutter::LogConsole,[&] { plat::log_line(buf); });
+ #else
+-    plat::log_line(buf);
++    stutter::call(stutter::LogConsole,[&] { plat::log_line(buf); });
+     if (g_log_file) {
++        stutter::Span file_span(stutter::LogFile);
+         std::fprintf(g_log_file, "%s\n", buf);
+         std::fflush(g_log_file);
+     }
+diff --git a/runtime/src/nvn/nvn_draw.cpp b/runtime/src/nvn/nvn_draw.cpp
+--- a/runtime/src/nvn/nvn_draw.cpp
++++ b/runtime/src/nvn/nvn_draw.cpp
+@@ -1,3 +1,4 @@
++#include "win_stutter.h"
+ // Draws (docs/NVN.md, N6): replays the bind, state and draw commands of nvn_state.cpp into Vulkan. Everything a draw
+ // reads from guest memory (vertices, indices, uniform and storage buffers, textures) is copied at replay time into
+ // the submit's upload buffer: the replay runs right when the game submits and is waited for, so the memory holds
+@@ -599,6 +600,7 @@
+ uint64_t recorded_draws();
+
+ void draw_log_stats() {
++    stutter::Span stats_span(stutter::Stats);
+     if (replay_options().pool) log("replay storage created=%llu reused=%llu released=%llu",
+         (unsigned long long)g_replay_created.load(), (unsigned long long)g_replay_reused.load(),
+         (unsigned long long)g_replay_released.load());
+diff --git a/runtime/src/nvn/nvn_frames.cpp b/runtime/src/nvn/nvn_frames.cpp
+--- a/runtime/src/nvn/nvn_frames.cpp
++++ b/runtime/src/nvn/nvn_frames.cpp
+@@ -1,38 +1,39 @@
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+ #include "win_mem_account.h"
+ #endif
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+ #include "nvn_retire.h"
+ #endif
++#include "win_stutter.h"
+ // Submits that are not waited for (the design, and what stays synchronous and why:
+ // private/wonder/patches/async_submit.md). The synchronous path waits for every submit's fence before returning to
+ // the game, so the submitting thread stalls for the whole GPU time of each frame. Here a submit or a present takes one
+ // of a few slots (command buffers, fences, descriptor pool, the stretch of the upload ring its replay filled, the
+ // compute results to copy back) and returns once queued. A slot is retired (its fences waited, 2 s at most, as the
+ // synchronous path) when it is reused, when the ring needs its memory back, or when something waits for it.
+ #if defined(__linux__) && !defined(__ANDROID__)
+ #include "nvn_linux_staging.h"
+ #endif
+ //
+ // Replays copy everything the GPU reads from guest memory into the ring at submit time, so the game may change its
+ // memory while a submit runs. Only compute results flow back (write-backs). Two modes use the slots:
+ //
+ // NX_PIPELINED (the default since DEBUG.md #61; docs/nvn/PERF-PLAN.md step 3): "pipelined fences". The
+ // replay and vkQueueSubmit stay on the submitting thread; the fence of the frame's work is not waited for. A submit
+ // with dispatches is split after its last DispatchCompute into two command buffers: the first part is queued at the
+ // split, while the rest is still being replayed, and only its fence is waited for, after the rest is queued. Its
+ // write-backs are copied before gpu_submit returns, so guest memory holds the compute results exactly when it does
+ // synchronously, and nothing the game waits on (nvnSyncWait, nvnQueueFinish, pool invalidation and finalization) has
+ // anything left to wait for: gpu_serial() is 0, as synchronously, and those calls never take the GPU lock. At most
+ // g_max_replays submits are in flight (the oldest is waited for before another is queued).
+ // NX_PIPELINED_NO_SPLIT=1: no split (a submit with write-backs is waited for whole).
+ //
+ // Chunks (docs/nvn/android-perf/PLAN.md R1): a submit's replay is also queued in parts while it is recorded, at the
+ // first point with no render pass open after NX_SUBMIT_CHUNK_DRAWS draws (at twice that, a pass is ended for it), so
+ // the GPU starts on a frame a few milliseconds into its replay instead of at its end (or at the split). At most
+ // kMaxParts command buffers per submit; each begins with the barrier that orders it after everything queued before.
+ // Default 150 on Android, 0 (off) elsewhere: MoltenVK encodes Metal inside each vkQueueSubmit.
+ //
+ // NX_ASYNC_GPU=<frames in flight> (the older experiment): a submit that has write-backs is retired before the next
+ // replay begins (it may read them) and before a wait on it returns; the game's waits retire slots under the GPU lock.
+ //
+@@ -188,65 +189,65 @@
+         if (p_vkCreateBuffer(vk_device(), &bi, nullptr, &a.buffer) != VK_SUCCESS) break;
+     }
+     return upload_alloc(size, 16);
+ }
+ #endif
+
+
+ // GPU-written images of destroyed textures, kept a few submits for a new texture over the same memory with the same
+ // shape. Wonder re-creates ~180 NVNtexture objects per frame over the same render-target memory: each got a new
+ // image, and its first draw ended the render pass to set it up (most of the ~300 passes per frame, each reloading
+ // and storing its targets; docs/nvn/DEBUG.md #34).
+ struct ReuseKey {
+     uint64_t memory = 0;
+     uint32_t format = 0, width = 0, height = 0, depth = 0, levels = 0, target = 0, samples = 0, swizzle = 0;
+     bool operator<(const ReuseKey& o) const {
+         return std::tie(memory, format, width, height, depth, levels, target, samples, swizzle) <
+                std::tie(o.memory, o.format, o.width, o.height, o.depth, o.levels, o.target, o.samples, o.swizzle);
+     }
+ };
+ ReuseKey reuse_key(const Texture& t) {
+     uint32_t swizzle = uint32_t(t.swizzle[0]) | uint32_t(t.swizzle[1]) << 8 | uint32_t(t.swizzle[2]) << 16 |
+                   uint32_t(t.swizzle[3]) << 24;
+     static const bool key_swizzle = std::getenv("NX_KEY_SWIZZLE") != nullptr;  // as image_of's key (#46)
+     if (!key_swizzle) swizzle = 0;
+     return {t.memory, t.format, t.width, t.height, t.depth, t.levels, t.target, t.samples, swizzle};
+ }
+ std::map<ReuseKey, std::pair<uint64_t, std::shared_ptr<GpuImage>>> g_reusable;  // key -> (kept at, image)
+ uint64_t g_reuse_clock = 0, g_reused = 0;
+
+ void wait_fences(const VkFence* fences, uint32_t n) {
+     if (!n) return;
+     uint64_t t0 = plat::monotonic_ns();
+-    VkResult r = p_vkWaitForFences(vk_device(), n, fences, VK_TRUE, kFenceTimeout);
++    VkResult r = stutter::call(stutter::Fence,[&] { return p_vkWaitForFences(vk_device(), n, fences, VK_TRUE, kFenceTimeout); });
+     if (r == VK_TIMEOUT) gpu_hung("a submit did not finish in 2 s");
+     if (r == VK_ERROR_DEVICE_LOST) gpu_hung("vkWaitForFences");
+     if (r != VK_SUCCESS) log("nvn/vk: vkWaitForFences failed (%d)", int(r));
+     const auto elapsed=plat::monotonic_ns()-t0;
+     g_times.fence_ns+=elapsed; replay::resident_stats().fence_ns+=elapsed;
+ }
+
+ // Compute results to guest memory: after the fence of the part that holds the submit's dispatches.
+ void apply_write_backs(Slot& s) {
+     for (const WriteBack& w : s.write_backs) {
+         replay::trace_nan_write_back(w.from, w.to, w.size);
+         apply_write_back(w);
+     }
+     s.write_backs.clear();
+ }
+
+ // Waits for the oldest submit in flight and finishes it: compute results to guest memory (if not there yet), its
+ // descriptor pool and ring stretch free again, images destroyed before it freed. False when nothing is in flight.
+ // Fences complete in submission order on the one queue, so retiring oldest first keeps write-backs in order.
+ // The fences of the queued parts below `upto`.
+ uint32_t queued_fences(const Slot& s, uint32_t upto, VkFence* out) {
+     uint32_t n = 0;
+     for (uint32_t k = 0; k < upto && k < kMaxParts; k++)
+         if (s.queued >> k & 1) out[n++] = s.fences[k];
+     return n;
+ }
+
+ bool retire_oldest() {
+     Slot* s = nullptr;
+     for (uint32_t k = 0; k < g_slot_count; k++)
+         if (g_slots[k].serial && (!s || g_slots[k].serial < s->serial)) s = &g_slots[k];
+     if (!s) return false;
+@@ -300,65 +301,65 @@
+     mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+     p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+                            nullptr, 0, nullptr);
+     return true;
+ }
+
+ // Ends `cb` and queues it (Metal encoding happens inside vkQueueSubmit: MoltenVK's synchronous submits). False:
+ // nothing was queued, `fence` will not signal.
+ bool submit_part(VkCommandBuffer cb, VkFence fence, VkSemaphore wait, VkSemaphore signal) {
+     uint64_t t0 = plat::monotonic_ns();
+     // The host reads compute results after the fence.
+     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+     mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+     p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0,
+                            nullptr);
+     p_vkEndCommandBuffer(cb);
+     VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+     si.commandBufferCount = 1;
+     si.pCommandBuffers = &cb;
+     if (wait) {
+         si.waitSemaphoreCount = 1;
+         si.pWaitSemaphores = &wait;
+         si.pWaitDstStageMask = &stage;
+     }
+     if (signal) {
+         si.signalSemaphoreCount = 1;
+         si.pSignalSemaphores = &signal;
+     }
+     p_vkResetFences(vk_device(), 1, &fence);
+-    VkResult r = p_vkQueueSubmit(vk_queue(), 1, &si, fence);
++    VkResult r = stutter::call(stutter::QueueSubmit,[&] { return p_vkQueueSubmit(vk_queue(), 1, &si, fence); });
+     g_times.encode_ns += plat::monotonic_ns() - t0;
+     if (r == VK_ERROR_DEVICE_LOST) gpu_hung("vkQueueSubmit");
+     if (r != VK_SUCCESS) log("nvn/vk: vkQueueSubmit failed (%d)", int(r));
+     return r == VK_SUCCESS;
+ }
+
+ // As replay_list walks it. A list's own commands are scanned once (a recorded list does not change): the walk over
+ // every command of the frame took ~4% of the replay thread on the S23.
+ uint32_t count_dispatches(const CmdList& list, int depth) {
+     auto& l = const_cast<CmdList&>(list);
+     if (l.scanned_size != l.cmds.size()) {
+         l.own_dispatches = 0, l.calls.clear();
+         for (const Cmd& c : l.cmds) {
+             if (c.op == Cmd::DispatchCompute) l.own_dispatches++;
+             if (c.op == Cmd::CallList) l.calls.push_back(c.a[0]);
+         }
+         l.scanned_size = l.cmds.size();
+     }
+     uint32_t n = l.own_dispatches;
+     if (depth < 8)
+         for (uint64_t h : l.calls)
+             if (auto called = submit_command_list(h)) n += count_dispatches(*called, depth + 1);
+     return n;
+ }
+
+ int env_int(const char* name) {
+     const char* e = std::getenv(name);
+     return e ? std::atoi(e) : 0;
+ }
+
+ // Ends the part being recorded (and its render pass; pending clears stay pending, as they are not tied to a command
+ // buffer: the next pass on their targets takes them as load operations), queues it, and begins the next one.
+@@ -509,64 +510,65 @@
+ VkCommandBuffer frame_chunk(VkCommandBuffer cb, uint64_t draws, bool pass_open) {
+     Slot* s = g_current;
+     // Two parts are kept for the split and the last one.
+     if (!g_chunking || !s || cb != s->cbs[s->part] || s->part + 2 >= kMaxParts) return cb;
+     if (g_chunk_from == UINT64_MAX) g_chunk_from = draws;
+     uint64_t since = draws - g_chunk_from;
+     if (since < g_chunk_draws || (pass_open && since < 2 * g_chunk_draws)) return cb;
+     g_stats.chunks++;
+     return next_part(*s);
+ }
+
+ VkCommandBuffer frame_after_dispatch(VkCommandBuffer cb) {
+     if (!g_plan_dispatches || ++g_seen_dispatches != g_plan_dispatches) return frame_cb(cb);
+     return frame_split(cb);
+ }
+
+ VkSemaphore frame_acquire_semaphore() {  // the next slot's (frame_begin takes that slot)
+     Slot& s = g_slots[g_next];
+     if (s.serial) retire_through(s.serial);  // its last present waited on it
+     return s.acquired;
+ }
+
+ VkSemaphore frame_rendered_semaphore(uint32_t image) {
+     if (image >= kMaxSlots) image = kMaxSlots - 1;
+     if (!g_rendered[image]) {
+         VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+         p_vkCreateSemaphore(vk_device(), &sci, nullptr, &g_rendered[image]);
+     }
+     return g_rendered[image];
+ }
+
+ void frame_submit(VkSemaphore wait, VkSemaphore signal, std::vector<WriteBack> write_backs, bool wait_done) {
++    stutter::Span frame_submit_span(stutter::FrameSubmit);
+     if (!g_current) return;
+     Slot& s = *g_current;
+     const bool same=FlightPolicy::same_ranges(write_backs,s.early_write_backs);
+     const bool early_ready=resident_flights_on() && s.early_prepared && !replay::g_resident_graphics_writer &&
+         FlightPolicy::early(s.split_part>=0 && (s.queued>>s.split_part&1),s.ok,wait_done,same,
+                             s.binds_at_split,replay::written_bind_count());
+     if (early_ready) write_backs=std::move(s.early_write_backs);
+     else if (s.ok) prepare_write_backs(s.cbs[s.part],write_backs);
+     s.early_write_backs.clear();
+     g_current = nullptr;
+     if ((pipelined() || resident_flights_on()) && s.replay) {
+         g_stats.submits++;
+         if (s.split_part >= 0) g_stats.replay_ns += plat::monotonic_ns() - s.begin_ns;
+     }
+     if (s.ok) gpu_busy_part_end(uint32_t(&s - g_slots), s.part, s.cbs[s.part]);
+     const bool has_last = s.ok && submit_part(s.cbs[s.part], s.fences[s.part], wait, signal);
+     if (has_last) s.queued |= 1u << s.part;
+     if (!s.queued) return;  // nothing ran: no results to copy back, the slot stays free
+     s.serial = ++g_submitted;
+     s.ring_end = g_head;
+     s.write_backs = std::move(write_backs);
+     // The dispatches were in a part that never ran: the buffers hold no results, and copying them back would put the
+     // inputs (or older data) over guest memory.
+     const bool has_first = s.split_part >= 0 && (s.queued >> s.split_part & 1);
+     if (s.split_part >= 0 && !has_first) s.write_backs.clear();
+     if (resident_flights_on()) {
+         if (!s.write_backs.empty() && early_ready && has_first && has_last) {
+             VkFence fences[kMaxParts];
+             wait_fences(fences,queued_fences(s,uint32_t(s.split_part)+1,fences));
+             apply_write_backs(s); ++g_stats.waited_first;
+             ++replay::resident_stats().flight_eager; ++replay::resident_stats().flight_deferred;
+             // Whole-submit/NVN completion stays unpublished until ALL parts retire. The only
+@@ -771,64 +773,65 @@
+ // Dropping the last shared_ptr alone does not destroy Vulkan handles. Expiring snapshots
+ // keep the existing last-possible-submit serial, just like Texture::~Texture.
+ void retire_image(std::shared_ptr<GpuImage> image) {
+     if (!image) return;
+     std::lock_guard lk(g_grave_lock);
+     g_grave.push_back({g_submitted + 1, std::move(image)});
+ }
+ #endif
+
+ // Images of destroyed textures are freed once no submit can use them: the one being recorded now included (a replay
+ // on another thread may hold it), hence the serial after the last submitted. Before the graveyard no image was ever
+ // freed: the opening creates textures continuously and the process reached 85 GB (the machine froze).
+ Texture::~Texture() {
+     if (watched) plat::write_watch_remove(memory);
+     if (!image) return;
+     std::lock_guard lk(g_grave_lock);
+     if (image->rendered && image->image && memory) {
+         auto& slot = g_reusable[reuse_key(*this)];
+         if (slot.second) g_grave.push_back({g_submitted + 1, std::move(slot.second)});
+         slot = {g_reuse_clock, std::move(image)};
+         return;
+     }
+     g_grave.push_back({g_submitted + 1, std::move(image)});
+ }
+
+ // A host-visible buffer of its own for one big texture upload: the ring is 256 MB, and a scene load with ASTC decoded
+ // to RGBA8 staged 312 MB in one submit, wrapping over its own data before the GPU had copied it (DEBUG-2 #72). Freed
+ // once the submit being recorded is retired (as images in the grave). Falls back to the ring if allocation fails.
+ Upload staging_alloc(uint64_t size) {
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+     memtrace::Tag memory_category(memtrace::Pool::Staging);
+ #endif
++    stutter::Span upload_span(stutter::Upload,size);
+     g_staging_count++, g_staging_bytes += size;
+     VkDevice d = vk_device();
+     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+ #if defined(__linux__) && !defined(__ANDROID__)
+     if (linux_staging_option("NX_LINUX_STAGING_CACHED") || linux_staging_option("NX_LINUX_STAGING_POOL"))
+         return linux_staging_alloc(size);
+ #endif
+     bi.size = size;
+     bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+     VkBuffer buffer = VK_NULL_HANDLE;
+     if (p_vkCreateBuffer(d, &bi, nullptr, &buffer) != VK_SUCCESS) return upload_alloc(size, 16);
+     VkMemoryRequirements req{};
+     p_vkGetBufferMemoryRequirements(d, buffer, &req);
+     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+     ai.allocationSize = req.size;
+     ai.memoryTypeIndex =
+         memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+     VkDeviceMemory memory = VK_NULL_HANDLE;
+     void* p = nullptr;
+     if (p_vkAllocateMemory(d, &ai, nullptr, &memory) != VK_SUCCESS || p_vkBindBufferMemory(d, buffer, memory, 0) ||
+         p_vkMapMemory(d, memory, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) {
+         p_vkDestroyBuffer(d, buffer, nullptr);
+         if (memory) p_vkFreeMemory(d, memory, nullptr);
+         return upload_alloc(size, 16);
+     }
+     std::lock_guard lk(g_grave_lock);
+     g_staging.push_back({g_submitted + 1, buffer, memory});
+     return {buffer, 0, static_cast<uint8_t*>(p)};
+ }
+
+ std::shared_ptr<GpuImage> reuse_image(const Texture& t) {
+     // Off unless NX_IMAGE_REUSE=1: a CPU-written texture placed over a freed render target's memory would sample the
+diff --git a/runtime/src/nvn/nvn_pipeline.cpp b/runtime/src/nvn/nvn_pipeline.cpp
+--- a/runtime/src/nvn/nvn_pipeline.cpp
++++ b/runtime/src/nvn/nvn_pipeline.cpp
+@@ -1,3 +1,4 @@
++#include "win_stutter.h"
+ // Pipelines and sampled resources (nvn_pipeline.h). Everything is cached for the life of the process: layouts by
+ // their bindings, pipelines by their full state, samplers by their state, views by (image, type).
+ #include <algorithm>
+@@ -134,7 +135,7 @@
+ #if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
+         const uint64_t module_start = plat::monotonic_ns();
+ #endif
+-        if (p_vkCreateShaderModule(vk_device(), &ci, nullptr, &m) != VK_SUCCESS) log("nvn/vk: shader %s rejected", s->hash.c_str());
++        if (stutter::call(stutter::Module,[&] { return p_vkCreateShaderModule(vk_device(), &ci, nullptr, &m); }) != VK_SUCCESS) log("nvn/vk: shader %s rejected", s->hash.c_str());
+ #if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
+         if (std::getenv("NX_FRAME_LOG")) log("shader-cache compile kind=module start_ns=%llu end_ns=%llu phase=%s",
+             (unsigned long long)module_start, (unsigned long long)plat::monotonic_ns(),
+@@ -744,7 +745,7 @@
+     ci.layout = layout.layout;
+     VkPipeline p = VK_NULL_HANDLE;
+     const uint64_t t0 = plat::monotonic_ns();
+-    VkResult made = p_vkCreateGraphicsPipelines(vk_device(), pipeline_cache(), 1, &ci, nullptr, &p);
++    VkResult made = stutter::call(stutter::Graphics,[&] { return p_vkCreateGraphicsPipelines(vk_device(), pipeline_cache(), 1, &ci, nullptr, &p); });
+     note_pipeline_created(plat::monotonic_ns() - t0);
+ #if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
+     if (std::getenv("NX_FRAME_LOG")) log("shader-cache compile kind=graphics start_ns=%llu end_ns=%llu phase=%s",
+@@ -953,7 +954,7 @@
+ #if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
+         const uint64_t compute_start = plat::monotonic_ns();
+ #endif
+-        if (p_vkCreateComputePipelines(vk_device(), pipeline_cache(), 1, &ci, nullptr, &p) != VK_SUCCESS) {
++        if (stutter::call(stutter::Compute,[&] { return p_vkCreateComputePipelines(vk_device(), pipeline_cache(), 1, &ci, nullptr, &p); }) != VK_SUCCESS) {
+             log("nvn/vk: compute pipeline for %s failed", cs->hash.c_str());
+             p = VK_NULL_HANDLE;
+         }
+diff --git a/runtime/src/nvn/nvn_pipeline_cache.cpp b/runtime/src/nvn/nvn_pipeline_cache.cpp
+--- a/runtime/src/nvn/nvn_pipeline_cache.cpp
++++ b/runtime/src/nvn/nvn_pipeline_cache.cpp
+@@ -1,3 +1,5 @@
++#include "win_astc_store.h"
++#include "win_stutter.h"
+ // A VkPipelineCache kept on disk (<data root>/pipelines_<vendor>_<device>.bin), and the cost of what the replay
+ // creates on the fly. Pipelines are compiled the first time a draw needs them, inside the replay: the course's
+ // stutters when new objects come in (16-42 ms replays on the RTX 3050). The driver checks the cache header itself
+@@ -173,6 +175,7 @@
+ }
+
+ void pipeline_cache_save() {
++    stutter::Span save_span(stutter::CacheSave);
+     if (!g_cache) return;
+ #if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
+     if (shader_cache_enabled() && !g_cache_dirty) return;
+@@ -219,6 +222,20 @@
+
+ // One line per timing window (nvn_vk.cpp log_timing): what the replay created, and the time it took.
+ void creation_log(uint64_t frames) {
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    const auto c=astc_cache::stats;
++    if(c.hits || c.misses || c.bypasses || c.verified || c.mismatches)
++        log("ASTC cache over %llu frames: hits=%llu misses=%llu bypasses=%llu verified=%llu mismatches=%llu ready=%llu",
++            (unsigned long long)frames,(unsigned long long)c.hits,(unsigned long long)c.misses,
++            (unsigned long long)c.bypasses,(unsigned long long)c.verified,(unsigned long long)c.mismatches,(unsigned long long)c.ready);
++    astc_cache::stats={};
++    if(auto* store=astc_cache::active_store) {
++        const auto counts=store->snapshot();
++        log("ASTC store cumulative: queued=%llu skipped=%llu saved=%llu failed=%llu",
++            (unsigned long long)counts.queued,(unsigned long long)counts.skipped,
++            (unsigned long long)counts.saved,(unsigned long long)counts.failed);
++    }
++#endif
+     if (g_pipelines || g_astc)
+         log("nvn/vk: created over %llu frames: %llu pipelines (%.1f ms), %llu ASTC textures decoded (%.1f ms)",
+             (unsigned long long)frames, (unsigned long long)g_pipelines, double(g_pipeline_ns) / 1e6,
+diff --git a/runtime/src/nvn/nvn_queue.cpp b/runtime/src/nvn/nvn_queue.cpp
+--- a/runtime/src/nvn/nvn_queue.cpp
++++ b/runtime/src/nvn/nvn_queue.cpp
+@@ -1,3 +1,4 @@
++#include "win_stutter.h"
+ #include "astral_frame_rate.h"
+ // NVN queues, command buffers, windows and syncs (docs/NVN.md, N3). Synchronously every command completes at
+ // submit: fences are signaled right away, the window hands out its textures in turn, and presents are counted. With
+@@ -494,6 +495,7 @@
+ // it the game runs as fast as it can once it is faster than 60 fps. A late frame is not snapped to the next vsync
+ // (an 18 ms frame stays 18 ms, not 33). NX_NO_FRAME_LIMIT=1: unpaced.
+ void pace_present(int interval) {
++    stutter::Span pace_span(stutter::Pace, uint64_t(interval));
+     static const bool off = std::getenv("NX_NO_FRAME_LIMIT") != nullptr;
+     static uint64_t next = 0;
+     static uint64_t last_return = 0;
+@@ -536,13 +538,15 @@
+         static uint64_t queued[2] = {};
+         static int next_slot = 0;
+         worker_wait(queued[next_slot]);
++        const bool before=stutter::pace_before_present();
++        if (before) pace_present(w->interval);
+         if (int(c.x[2]) >= 0 && size_t(c.x[2]) < w->textures.size()) {
+             uint64_t texture = w->textures[size_t(c.x[2])];
+             std::array<int32_t, 4> crop{w->crop[0], w->crop[1], w->crop[2], w->crop[3]};
+             queued[next_slot] = worker_run([texture, crop] { gpu_present(texture, crop.data()); });
+             next_slot ^= 1;
+         }
+-        pace_present(w->interval);
++        if (!before) pace_present(w->interval);
+ #if defined(NX_ASTRAL_STRICT)
+         hud::note_interval(w->interval);  // NX_PERF_HUD's game speed (perf_hud.cpp)
+ #endif
+diff --git a/runtime/src/nvn/nvn_tiling.cpp b/runtime/src/nvn/nvn_tiling.cpp
+--- a/runtime/src/nvn/nvn_tiling.cpp
++++ b/runtime/src/nvn/nvn_tiling.cpp
+@@ -1,3 +1,4 @@
++#include "win_stutter.h"
+ // Maxwell block-linear -> linear (docs/nvn/TILING.md).
+ //
+ // Inside a GOB (64 bytes x 8 rows) the byte at (x, y) sits at
+@@ -151,6 +152,7 @@
+                                            uint32_t depth_or_layers, uint32_t levels, uint32_t block_w,
+                                            uint32_t block_h, uint32_t bytes_per_block,
+                                            std::vector<uint8_t>& linear_out, uint32_t block_height_gobs0) {
++    stutter::Span untile_span(stutter::Untile);
+     TextureLayout t = block_linear_layout(width, height, depth_or_layers, levels, block_w, block_h, bytes_per_block,
+                                           block_height_gobs0);
+     if (!tiled || t.levels.empty() || t.tiled_size > tiled_size) return {};
+diff --git a/runtime/src/nvn/nvn_upload.cpp b/runtime/src/nvn/nvn_upload.cpp
+--- a/runtime/src/nvn/nvn_upload.cpp
++++ b/runtime/src/nvn/nvn_upload.cpp
+@@ -1,35 +1,38 @@
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+ #include "win_mem_account.h"
+ #endif
++#include "win_astc_cache.h"
++#include "win_astc_store.h"
++#include "win_stutter.h"
+ // Texture uploads (nvn_pipeline.h): guest pool memory into the host image, untiled, widened where the host stores a
+ // format wider than NVN does, and checked against what the copies read (docs/nvn/DEBUG.md #50).
+ #include <algorithm>
+ #include <cstdlib>
+ #include <cstring>
+ #include <set>
+ #include <vector>
+
+ #include "nvn_astc.h"
+ #include "nvn_pipeline.h"
+ #include "nvn_tiling.h"
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+ #include "nvn_retire.h"
+ #endif
+ #include "platform.h"
+
+ namespace nx::nvn {
+
+ using namespace nx::vk;
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+ VkQueue vk_queue();
+ uint32_t vk_queue_family();
+ #endif
+
+ namespace {
+
+ // R11G11B10F (NVN 0x3f) is stored as RGBA16F (nvn_format.cpp). Its channels are unsigned floats with half's 5-bit
+ // exponent and bias 15, and 6 (R, G) or 5 (B) mantissa bits: each is a half with the low mantissa bits zero and no
+ // sign, so shifting it into place is exact (Inf and NaN included). Alpha is 1. Copying the 4-byte texels as they are
+ // read twice the data: rows side by side, bits reinterpreted, the bottom half from other uploads (the garbage band).
+ void widen_r11g11b10(const uint8_t* src, uint8_t* dst, uint64_t texels) {
+     for (uint64_t k = 0; k < texels; k++) {
+@@ -44,89 +47,159 @@
+ // NX_FULL_UPLOAD=1: a pitch-linear texture the CPU wrote part of is uploaded whole again (bisecting).
+ bool full_upload() {
+     static const bool on = std::getenv("NX_FULL_UPLOAD") != nullptr;
+     return on;
+ }
+
+ // Bytes from `base` to the end of what vkCmdCopyBufferToImage reads for `r`, at `bytes` per bw x bh block.
+ uint64_t copy_end(const VkBufferImageCopy& r, uint64_t base, uint32_t bw, uint32_t bh, uint32_t bytes) {
+     uint64_t row_blocks = ((r.bufferRowLength ? r.bufferRowLength : r.imageExtent.width) + bw - 1) / bw;
+     uint64_t image_rows = ((r.bufferImageHeight ? r.bufferImageHeight : r.imageExtent.height) + bh - 1) / bh;
+     uint64_t w = (r.imageExtent.width + bw - 1) / bw, h = (r.imageExtent.height + bh - 1) / bh;
+     uint64_t slices = uint64_t(r.imageExtent.depth) * r.imageSubresource.layerCount;
+     if (!w || !h || !slices) return r.bufferOffset - base;
+     return r.bufferOffset - base + ((slices - 1) * image_rows + (h - 1)) * row_blocks * bytes + w * bytes;
+ }
+
+ // The copies read at most `staged` bytes from `base`, counted at the host format's size. A copy past it reads other
+ // uploads of the submit (or past the buffer): garbage, so the image is cleared instead. NX_NO_UPLOAD_GUARD=1: the old
+ // way (bisecting).
+ bool copies_fit(const Texture& t, const VkBufferImageCopy* r, uint32_t n, uint64_t base, uint64_t staged, uint32_t bw,
+                 uint32_t bh, uint32_t bytes) {
+     static const bool off = std::getenv("NX_NO_UPLOAD_GUARD") != nullptr;
+     uint64_t need = 0;
+     for (uint32_t k = 0; k < n; k++) need = std::max(need, copy_end(r[k], base, bw, bh, bytes));
+     if (off || need <= staged) return true;
+     static std::set<uint32_t> logged;  // once per format
+     if (logged.insert(t.format).second)
+         log("nvn/vk: upload short: texture %ux%u format %#x reads %llu bytes, %llu staged: cleared instead", t.width,
+             t.height, t.format, (unsigned long long)need, (unsigned long long)staged);
+     return false;
+ }
+
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++astc_cache::Cache* decoded_cache() {
++    static astc_cache::Cache* cache=[]() -> astc_cache::Cache* {
++        const char* e=std::getenv("NX_WIN_ASTC_CACHE");if(!e || e[0]!='1' || e[1])return nullptr;
++        const char* root=std::getenv("NX_WIN_ASTC_CACHE_ROOT");
++        std::string path=root && *root ? root : plat::data_root()+"/decoded_astc_v1";
++        const char* prepare=std::getenv("NX_WIN_ASTC_PREPARE");
++        uint64_t limit=prepare && prepare[0]=='1' && !prepare[1] ? astc_cache::Cache::prepare_budget : 0;
++        stutter::Span preparation(stutter::CachePrepare);
++        auto* value = new astc_cache::Cache(std::filesystem::u8path(path),astc_cache::sha256,astc_cache::executable_identity(),limit);
++        if (memtrace::enabled()) memtrace::ledger().payload_add(memtrace::Pool::DecodedPrepared, value->prepared_bytes());
++        return value;
++    }();
++    return cache;
++}
++astc_cache::Store* decoded_store(astc_cache::Cache* cache) {
++    static astc_cache::Store* store=[cache]() -> astc_cache::Store* {
++        const char* e=std::getenv("NX_WIN_ASTC_ASYNC_STORE");
++        if(!cache || !e || e[0]!='1' || e[1])return nullptr;
++        // Cache construction/preparation has finished. Only this worker calls save;
++        // loads use atomic published files or immutable prepared snapshots. No GPU
++        // or guest pointers escape. ExitProcess can discard optional pending writes.
++        try { return astc_cache::active_store=new astc_cache::Store([cache](const auto& key,const auto& bytes,uint64_t bad) {
++            stutter::Span store_span(stutter::CacheStore);
++            return cache->save(key,bytes,bad);
++        }); } catch (...) { return nullptr; }
++    }();
++    return store;
++}
++#endif
++
+ // ASTC on a GPU without it (nvn_format.cpp): the untiled blocks of every level become RGBA8 texels, and the levels
+ // are re-laid out for them (each level's layers back to back, 16-byte aligned). Logged every 200 textures: count,
+ // bytes and CPU time, the cost of the decoder at load.
+ void decode_astc(uint32_t format, std::vector<uint8_t>& linear, std::vector<LinearLevel>& levels, uint32_t layers,
+                  uint32_t bw, uint32_t bh) {
++    stutter::Span astc_span(stutter::Astc);
+     static uint64_t textures = 0, bytes = 0, ns = 0, invalid = 0;
+     const uint64_t t0 = plat::monotonic_ns();
+     const bool srgb = format >= 0x87;
+     std::vector<LinearLevel> out = levels;
+     uint64_t at = 0;
+     for (LinearLevel& l : out) {
+         l.offset = at;
+         l.layer_size = uint64_t(l.width) * l.height * 4;
+         l.width_blocks = l.width, l.height_blocks = l.height;
+         at += (l.layer_size * layers + 15) & ~15ull;
+     }
+     std::vector<uint8_t> rgba(at);
+-    for (size_t k = 0; k < levels.size(); k++)
+-        if (levels[k].offset + levels[k].layer_size * layers <= linear.size())
+-            invalid += astc_decode_image(linear.data() + levels[k].offset, levels[k].width, levels[k].height, layers,
++    uint64_t bad=0;
++    bool hit=false,verify=false,have_key=false;
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    auto* cache=decoded_cache();astc_cache::Digest key{};
++    if(cache) {
++        std::string metadata="ASTC-LDR-RGBA8-v1";
++        auto add=[&](uint64_t n) { uint8_t b[8];astc_cache::put64(b,n);metadata.append(reinterpret_cast<char*>(b),8); };
++        add(format);add(layers);add(bw);add(bh);add(at);add(levels.size());
++        for(const auto& l:levels) { add(l.offset);add(l.layer_size);add(l.width);add(l.height);add(l.width_blocks);add(l.height_blocks); }
++        have_key=stutter::call(stutter::CacheKey,[&] { return cache->key(metadata,linear,key); });
++        bool ready=false;
++        if(have_key)hit=stutter::call(stutter::CacheLoad,[&] { return cache->load(key,rgba,bad,&ready); });
++        stutter::mark(hit?stutter::AstcCacheHit:stutter::AstcCacheMiss,at);
++        static const bool check=[] {auto e=std::getenv("NX_WIN_ASTC_CACHE_VERIFY");return e && e[0]=='1';}();
++        verify=hit && check;
++        if(!have_key)++astc_cache::stats.bypasses;
++        else if(hit)++astc_cache::stats.hits;
++        else ++astc_cache::stats.misses;
++        astc_cache::stats.verified+=verify;
++        astc_cache::stats.ready+=ready;
++    }
++#endif
++    std::vector<uint8_t> expected;
++    uint64_t expected_bad=bad;
++    if(verify) { expected=rgba;std::fill(rgba.begin(),rgba.end(),0);bad=0; }
++    if(!hit || verify) {
++        stutter::Span decode_span(stutter::AstcDecode);
++        for (size_t k = 0; k < levels.size(); k++)
++            if (levels[k].offset + levels[k].layer_size * layers <= linear.size())
++                bad += astc_decode_image(linear.data() + levels[k].offset, levels[k].width, levels[k].height, layers,
+                                          bw, bh, srgb, rgba.data() + out[k].offset);
++    }
++    bool mismatch=verify && (expected!=rgba || expected_bad!=bad);
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    if(mismatch) { ++astc_cache::stats.mismatches;stutter::mark(stutter::CacheMismatch);log("ASTC_CACHE_MISMATCH: decoded output differs; using fresh decoder result"); }
++    if(have_key && (!hit || mismatch)) {
++        if(auto* store=decoded_store(cache))
++            stutter::call(stutter::CacheEnqueue,[&] { store->submit(key,rgba,bad); },rgba.size());
++        else stutter::call(stutter::CacheStore,[&] { cache->save(key,rgba,bad); });
++    }
++#endif
++    invalid+=bad;
+     linear.swap(rgba);
+     levels.swap(out);
+     const uint64_t spent = plat::monotonic_ns() - t0;
+-    note_astc_decoded(spent);  // per timing window (nvn_pipeline_cache.cpp)
++    if (!hit || verify) note_astc_decoded(spent);  // per timing window (nvn_pipeline_cache.cpp)
+     bytes += at, ns += spent;
+     if (++textures % 200 == 1)
+         log("nvn/vk: ASTC decoded on the CPU: %llu textures, %.1f MB, %.0f ms, %llu invalid blocks",
+             (unsigned long long)textures, double(bytes) / 1e6, double(ns) / 1e6, (unsigned long long)invalid);
+ }
+
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+ // New ASTC images have no commands referring to them yet. Complete their uploads separately:
+ // otherwise every decoded texture in a scene-load submit keeps a second, host-visible copy until
+ // that entire submit finishes. On WDDM both the images and these staging allocations consume commit.
+ bool upload_fresh_astc(GpuImage& img, const std::vector<uint8_t>& bytes,
+                        const std::vector<VkBufferImageCopy>& copies) {
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+     memtrace::Tag memory_category(memtrace::Pool::FreshStaging);
+ #endif
+     static const bool enabled = [] {
+         const char* e = std::getenv("NX_WINDOWS_STREAM_UPLOADS");
+         return e && e[0] == '1' && !e[1];
+     }();
+     if (!enabled) return false;
+     static VkCommandPool pool = VK_NULL_HANDLE;
+     static VkCommandBuffer cb = VK_NULL_HANDLE;
+     static VkFence fence = VK_NULL_HANDLE;
+     VkDevice device = vk_device();
+     if (!pool) {
+         VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+         pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+         pi.queueFamilyIndex = vk_queue_family();
+         if (p_vkCreateCommandPool(device, &pi, nullptr, &pool) != VK_SUCCESS) {
+             pool = VK_NULL_HANDLE; return false;  // failed API output does not transfer ownership
+         }
+         VkCommandBufferAllocateInfo ci{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+@@ -269,64 +342,65 @@
+                    : upload_alloc(total, 16);
+     std::memset(u.ptr, 0, total);
+     for (VkBufferImageCopy& c : regions) c.bufferOffset += u.offset;
+     p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
+                              regions.data());
+     return true;
+ }
+ #endif
+
+ void clear_image(VkCommandBuffer cb, GpuImage& img, bool magenta) {
+     transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+     VkImageSubresourceRange r{img.aspect, 0, img.levels, 0, img.layers};
+ #if defined(NX_ASTRAL_STRICT)
+     if (img.aspect == VK_IMAGE_ASPECT_COLOR_BIT && zero_fill_compressed(cb, img, r)) {
+         static bool logged = false;  // the magenta debug colour cannot be written into BC blocks
+         if (magenta && !logged)
+             log("nvn/vk: magenta clear of a BC image (Vulkan format %d): zero-filled instead", int(img.format)),
+                 logged = true;
+         return;
+     }
+ #endif
+     if (img.aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+         VkClearColorValue v{};
+         if (magenta) v = {{1.0f, 0.0f, 1.0f, 1.0f}};
+         p_vkCmdClearColorImage(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
+     } else {
+         VkClearDepthStencilValue v{1.0f, 0};  // far: the course passes test LESS
+         p_vkCmdClearDepthStencilImage(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
+     }
+ }
+
+ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img, uint64_t lo, uint64_t hi) {
++    stutter::Span texture_span(stutter::Texture);
+     const bool was_uploaded = img.uploaded;
+     img.uploaded = true;
+     if (gpu_profile_on()) gpu_profile_mark(cb, "texture uploads");
+     if (!t.memory || !t.storage_size) return;
+     if (std::getenv("NX_TRACE_UPLOADS") && t.storage_size >= (1u << 20)) {
+         const uint8_t* m = reinterpret_cast<const uint8_t*>(t.memory);
+         size_t nz = 0;
+         for (uint64_t k = 0; k < t.storage_size; k += 64) nz += m[k] != 0;
+         log("nvn: upload %ux%u fmt %#x stride %u: %zu of %llu sampled bytes non-zero", t.width, t.height, t.format,
+             t.stride, nz, (unsigned long long)(t.storage_size / 64));
+     }
+     uint32_t bw = 1, bh = 1, bytes = 4;
+     format_block(t.format, bw, bh, bytes);
+     // What the copies read per block: the host format's size (RGBA16F for R11G11B10F), else the NVN one.
+     uint32_t host_bytes = vk_block_bytes(img.format) ? vk_block_bytes(img.format) : bytes;
+     // NX_R11G11B10_NARROW=1: R11G11B10F copied at 4 bytes per texel, as before (the guard then clears it unless
+     // NX_NO_UPLOAD_GUARD=1 too; bisecting).
+     static const bool narrow = std::getenv("NX_R11G11B10_NARROW") != nullptr;
+     bool widen = !narrow && t.format == 0x3f && img.format == VK_FORMAT_R16G16B16A16_SFLOAT && !img.alpha_from_r;
+     std::vector<uint8_t> linear;
+     std::vector<VkBufferImageCopy> copies;
+     uint32_t layers = img.view_type == VK_IMAGE_VIEW_TYPE_3D ? std::max(1u, t.depth) : img.layers;
+     if (img.alpha_from_r && t.stride) {  // R8 pitch-linear -> RGBA8 (255, 255, 255, R), level 0
+         const uint8_t* src = reinterpret_cast<const uint8_t*>(t.memory);
+         uint64_t rows = uint64_t(img.height) * layers;
+         if (uint64_t(t.stride) * rows > t.storage_size) rows = t.storage_size / t.stride;
+         // Only the rows the CPU wrote (a single layer), when the texture is already there (NX_FULL_UPLOAD=1: all).
+         uint64_t y0 = 0, y1 = rows;
+         if (was_uploaded && layers == 1 && !full_upload() && hi != UINT64_MAX)
+             y0 = std::min(rows, lo / t.stride), y1 = std::min(rows, (hi + t.stride - 1) / t.stride);
+         if (y1 <= y0) return;
+         Upload u = upload_alloc((y1 - y0) * img.width * 4, 16);
+@@ -405,60 +479,61 @@
+             VkBufferImageCopy r{};
+             r.bufferOffset = u.offset + at;
+             r.imageSubresource = {img.aspect, k, 0, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? 1u : img.layers};
+             r.imageExtent = {levels[k].width, levels[k].height, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? layers : 1u};
+             copies.push_back(r);
+             at += uint64_t(levels[k].width) * levels[k].height * slices * tb;
+         }
+         transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+         p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(copies.size()),
+                                  copies.data());
+         return;
+     }
+     if (astc_decoded(t.format)) {  // RGBA8 texels from here on
+         decode_astc(t.format, linear, levels, layers, bw, bh);
+         bw = bh = 1, bytes = host_bytes = 4;
+     }
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+     if (!widen && detail::fresh_upload_candidate(was_uploaded, img.layout != VK_IMAGE_LAYOUT_UNDEFINED,
+                                                  img.rendered, img.texels, astc_decoded(t.format), linear.size())) {
+         std::vector<VkBufferImageCopy> fresh;
+         for (uint32_t k = 0; k < levels.size(); k++) {
+             VkBufferImageCopy r{};
+             r.bufferOffset = levels[k].offset;
+             r.imageSubresource = {img.aspect, k, 0, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? 1u : img.layers};
+             r.imageExtent = {levels[k].width, levels[k].height, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? layers : 1u};
+             fresh.push_back(r);
+         }
+         if (copies_fit(t, fresh.data(), uint32_t(fresh.size()), 0, linear.size(), bw, bh, host_bytes) &&
+             upload_fresh_astc(img, linear, fresh)) return;
+     }
+ #endif
+     // Widened, every offset in the linear buffer doubles (level offsets are multiples of the 4-byte texel).
++    stutter::Span upload_span(stutter::Upload,linear.size());
+     uint64_t scale = widen ? 2 : 1;
+     Upload u;
+     if (widen) {
+         u = upload_alloc(linear.size() * 2, 16);
+         widen_r11g11b10(linear.data(), u.ptr, linear.size() / 4);
+     } else if (linear.size() >= (1u << 20) && !std::getenv("NX_STAGING_RING") && staging_wanted(linear.size())) {
+         // 1 MB and up: a staging buffer of its own, so a scene load cannot wrap the ring over itself (DEBUG-2 #72).
+         // NX_STAGING_RING=1: through the ring, as before (bisecting).
+         u = staging_alloc(linear.size());
+         std::memcpy(u.ptr, linear.data(), linear.size());
+     } else {
+         u = upload(linear.data(), linear.size(), 16);
+     }
+     for (uint32_t k = 0; k < levels.size(); k++) {
+         VkBufferImageCopy r{};
+         r.bufferOffset = u.offset + levels[k].offset * scale;
+         r.imageSubresource = {img.aspect, k, 0, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? 1u : img.layers};
+         r.imageExtent = {levels[k].width, levels[k].height, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? layers : 1u};
+         copies.push_back(r);
+     }
+     if (!copies_fit(t, copies.data(), uint32_t(copies.size()), u.offset, linear.size() * scale, bw, bh, host_bytes))
+         return clear_image(cb, img);
+     transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+     p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(copies.size()),
+                              copies.data());
+ }
+
+ }  // namespace nx::nvn
+diff --git a/runtime/src/nvn/nvn_vk.cpp b/runtime/src/nvn/nvn_vk.cpp
+--- a/runtime/src/nvn/nvn_vk.cpp
++++ b/runtime/src/nvn/nvn_vk.cpp
+@@ -1,36 +1,37 @@
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+ #include "win_mem_vk.h"
+ #include "nvn_retire.h"
+ #endif
++#include "win_stutter.h"
+ #if defined(NX_ASTRAL_STRICT) && (defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
+ #include "nvn_shader_cache.h"
+ #endif
+ // NVN's GPU side on Vulkan (docs/NVN.md, N3): the host device, a VkImage per NVN texture the GPU touches, the
+ // replay of recorded command lists, and presenting a window texture on the host swapchain.
+ //
+ // First version: every submit is recorded into one Vulkan command buffer and waited for (NX_PIPELINED, NX_ASYNC_GPU:
+ // into a slot's, not waited for, nvn_frames.cpp); image layouts are tracked per image, in submission order. The image
+ // behind a texture is nvn_image.cpp. On macOS this is MoltenVK: the instance enumerates portability drivers and the
+ // device enables VK_KHR_portability_subset.
+ #if !defined(_WIN32)
+ #include <unistd.h>  // _exit (stdlib.h on Windows)
+ #endif
+
+ #include <algorithm>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <map>
+ #include <set>
+ #include <string>
+ #include <tuple>
+ #include <vector>
+
+ #include "nvn_vk.h"
+ #include "nvn_resident.h"
+ #include "platform.h"
+ #if defined(NX_ASTRAL_STRICT) && defined(__APPLE__)
+ #include "nvn_shader_cache.h"
+ #endif
+ #if defined(NX_ASTRAL_STRICT)
+ #include "perf_hud.h"
+@@ -460,209 +461,214 @@
+
+ }  // namespace
+
+ std::recursive_mutex& gpu_lock() { return g_gpu; }
+ VkDevice vk_device() { return g_device; }
+ VkPhysicalDevice vk_physical() { return g_physical; }
+ VkQueue vk_queue() { return g_queue; }
+ uint32_t vk_queue_family() { return g_family; }
+ bool vk_depth_clip_control() { return g_depth_clip_control; }
+ const VkPhysicalDeviceFeatures& vk_features() { return g_features; }
+ bool gpu_is_integrated() { return g_integrated; }
+ bool gpu_require_subgroup32() { return g_require_sg32; }
+
+ uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
+     for (uint32_t k = 0; k < g_memory.memoryTypeCount; k++)
+         if ((bits >> k) & 1 && (g_memory.memoryTypes[k].propertyFlags & want) == want) return k;
+     return 0;
+ }
+
+ Upload upload_alloc(uint64_t size, uint64_t align) {
+     if (async_gpu()) return frame_upload_alloc(size, align);
+     uint64_t at = (g_upload_used + align - 1) & ~(align - 1);
+     if (at + size > g_upload_size) {
+         log("nvn/vk: upload buffer full (%llu + %llu bytes)", (unsigned long long)at, (unsigned long long)size);
+         at = 0;  // wraps: this submit's earlier data may be overwritten (grow the buffer when this shows)
+         replay::dedup_reset();  // shared copies may be among them
+     }
+     g_upload_used = at + size;
+     return {g_upload, at, g_upload_ptr + at};
+ }
+
+ Upload upload(const void* data, uint64_t size, uint64_t align) {
++    stutter::Span upload_span(stutter::Upload,size);
+     Upload u = upload_alloc(size, align);
+     if (data && size) std::memcpy(u.ptr, data, size);
+     return u;
+ }
+
+ Upload writeback_flags_alloc(uint64_t size) {
+     if (async_gpu()) {
+         if (!frame_writeback_flags_fit(size)) return {};
+     } else if (!writeback_flags_fit(g_upload_used,0,g_upload_size,size,256,false)) return {};
+     return upload_alloc(size,256);
+ }
+
+ VkDescriptorSet descriptor_set(VkDescriptorSetLayout layout) {
+     if (async_gpu()) return frame_descriptor_set(layout);
+     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+     ai.descriptorPool = g_descriptors;
+     ai.descriptorSetCount = 1;
+     ai.pSetLayouts = &layout;
+     VkDescriptorSet set = VK_NULL_HANDLE;
+     if (p_vkAllocateDescriptorSets(g_device, &ai, &set) != VK_SUCCESS) log("nvn/vk: descriptor pool exhausted");
+     return set;
+ }
+
+ VkDescriptorPool make_descriptor_pool() {
+     VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 65536}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16384},
+                                     {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 65536}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4096},
+                                     {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024},
+                                     {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 65536}};
+     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+     dpi.maxSets = 32768;
+     dpi.poolSizeCount = uint32_t(sizeof sizes / sizeof sizes[0]);
+     dpi.pPoolSizes = sizes;
+     VkDescriptorPool pool = VK_NULL_HANDLE;
+     p_vkCreateDescriptorPool(g_device, &dpi, nullptr, &pool);
+     return pool;
+ }
+
+ namespace {
+
+ void make_upload_buffer(uint64_t size) {
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+     memtrace::Tag memory_category(memtrace::Pool::UploadRing);
+ #endif
+     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+     bi.size = size;
+     bi.usage = kUploadUsage;
+     p_vkCreateBuffer(g_device, &bi, nullptr, &g_upload);
+     VkMemoryRequirements req{};
+     p_vkGetBufferMemoryRequirements(g_device, g_upload, &req);
+     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+     ai.allocationSize = req.size;
+     ai.memoryTypeIndex = upload_memory_type(req.memoryTypeBits);  // nvn_caps.cpp (NX_RING_CACHED)
+     p_vkAllocateMemory(g_device, &ai, nullptr, &g_upload_memory);
+     p_vkBindBufferMemory(g_device, g_upload, g_upload_memory, 0);
+     void* p = nullptr;
+     p_vkMapMemory(g_device, g_upload_memory, 0, VK_WHOLE_SIZE, 0, &p);
+     g_upload_ptr = static_cast<uint8_t*>(p);
+     g_upload_size = size;
+ }
+
+ bool begin(bool replay = false) {
++    stutter::Span begin_span(stutter::Begin,replay);
+     if (async_gpu()) return (g_cb = frame_begin(replay)) != VK_NULL_HANDLE;
+     p_vkResetCommandBuffer(g_cb, 0);
+     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+     const bool ok = check(p_vkBeginCommandBuffer(g_cb, &bi), "vkBeginCommandBuffer");
+     if (ok) gpu_busy_part_begin(7,0,g_cb);
+     return ok;
+ }
+
+ // Where the submitting thread's time goes, logged with the draw stats, per presented frame: the replay (recording
+ // into Vulkan), vkQueueSubmit (Metal encoding happens inside it), fences waited for, the rest of gpu_submit (object
+ // drain, image frees, write-backs), and gpu_present as a whole; bytes through the upload buffer.
+ struct Timing {
+     uint64_t submits = 0, replay_ns = 0, encode_ns = 0, fence_ns = 0, submit_ns = 0, present_ns = 0, upload_bytes = 0;
+ } g_timing;
+
+ void end_and_wait(VkSemaphore wait, VkSemaphore signal) {
+     uint64_t t0 = plat::monotonic_ns();
+     gpu_busy_part_end(7,0,g_cb);
+     p_vkEndCommandBuffer(g_cb);
+     VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+     si.commandBufferCount = 1;
+     si.pCommandBuffers = &g_cb;
+     if (wait) {
+         si.waitSemaphoreCount = 1;
+         si.pWaitSemaphores = &wait;
+         si.pWaitDstStageMask = &stage;
+     }
+     if (signal) {
+         si.signalSemaphoreCount = 1;
+         si.pSignalSemaphores = &signal;
+     }
+     p_vkResetFences(g_device, 1, &g_fence);
+-    bool queued = check(p_vkQueueSubmit(g_queue, 1, &si, g_fence), "vkQueueSubmit");
++    bool queued = check(stutter::call(stutter::QueueSubmit,[&] { return p_vkQueueSubmit(g_queue, 1, &si, g_fence); }), "vkQueueSubmit");
+     uint64_t t1 = plat::monotonic_ns();
+     // 2 s at most: a frame's work takes milliseconds; longer is a shader that does not end.
+     if (queued) {
+-        VkResult w = p_vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, 2'000'000'000ull);
++        VkResult w = stutter::call(stutter::Fence,[&] { return p_vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, 2'000'000'000ull); });
+         if (w == VK_TIMEOUT) gpu_hung("a submit did not finish in 2 s");
+         check(w, "vkWaitForFences");
+     }
+     const uint64_t waited = plat::monotonic_ns()-t1;
+     frame_times().encode_ns += t1-t0; frame_times().fence_ns += waited;
+     replay::resident_stats().fence_ns += waited;
+     if (queued) gpu_busy_retired(7,1);
+ }
+
+ void log_timing(uint64_t frames) {
++    stutter::Span stats_span(stutter::Stats);
+     auto ms = [&](uint64_t ns) { return double(ns) / 1e6 / double(frames); };
+     static uint64_t last = 0;  // wall clock: the real frame rate
+     uint64_t now = plat::monotonic_ns();
+     double fps = last ? double(frames) * 1e9 / double(now - last) : 0.0;
+     last = now;
+     const Timing& t = g_timing;
+     uint64_t known = t.replay_ns + t.encode_ns + t.fence_ns;
+     log("nvn/vk: per frame over %llu: %.1f fps, %.1f submits, replay %.2f ms, submit (encode) %.2f ms, fence wait "
+         "%.2f ms, other %.2f ms, present %.2f ms, upload %.2f MB",
+         (unsigned long long)frames, fps, double(t.submits) / double(frames), ms(t.replay_ns), ms(t.encode_ns),
+         ms(t.fence_ns), ms(t.submit_ns > known ? t.submit_ns - known : 0), ms(t.present_ns),
+         double(t.upload_bytes) / 1e6 / double(frames));
+     frame_log(frames);
+     creation_log(frames);  // pipelines and ASTC decodes of the window; saves the pipeline cache now and then
+     g_timing = {};
+ }
+
+ // gpu_present's time, whatever way it returns.
+ struct PresentTimer {
+     uint64_t t0 = plat::monotonic_ns();
+     ~PresentTimer() { g_timing.present_ns += plat::monotonic_ns() - t0; }
+ };
+
+ }  // namespace
+
+ uint64_t draw_take_dump_request();          // nvn_draw.cpp
+
+ namespace {
+ std::shared_ptr<const DeferredValues> g_deferred;  // the submit being replayed (replay thread only)
+ }
+ const DeferredValues* current_deferred() { return g_deferred.get(); }
+
+ void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_ptr<const DeferredValues> deferred) {
++    stutter::Span submit_span(stutter::Submit);
+     g_deferred = std::move(deferred);
+-    std::lock_guard lk(g_gpu);
++    std::unique_lock lk(g_gpu,std::defer_lock);
++    stutter::call(stutter::GpuLock,[&] { lk.lock(); });
+     uint64_t t_in = plat::monotonic_ns();
+     const FrameTimes f_in = frame_times();
+     uint64_t lists_epoch = 0;
+     for (auto& l : lists) lists_epoch = std::max(lists_epoch, l->epoch);
+     ReplayScope replay(lists_epoch);  // the texture mark (#55, #57), then drain_objects (under the GPU lock, #50)
+     if (!init()) return;
+     bool async = async_gpu();
+     if (!async) {  // the previous submit was waited for: all of it is free
+         free_retired_images(UINT64_MAX);
+         p_vkResetDescriptorPool(g_device, g_descriptors, 0);
+         g_upload_used = 0;
+     } else if (pipelined()) {  // what the retired submits were the last to use (they free nothing themselves)
+         free_retired_images(frame_completed());
+     }
+     if (!begin(true)) return;
+     draw_begin_submit();
+     gpu_profile_begin(g_cb);
+     zero_draws_begin_submit(g_cb);
+     // Pipelined: the part up to the last dispatch is queued as soon as it is recorded (nvn_frames.cpp). Not with the
+     // profile or the zero-draw queries: they span the submit, which is then waited for whole.
+     size_t split_after = gpu_profile_on() || zero_draws_on() ? SIZE_MAX : frame_plan_split(lists);
+     uint64_t t0 = plat::monotonic_ns();
+     const FrameTimes f0 = frame_times();
+     Targets st;
+     for (size_t k = 0; k < lists.size(); k++) {
+         replay_list(g_cb, st, *lists[k], 0);
+         // After the last list with a dispatch, unless nothing follows it (replay_list may have split inside a list).
+         g_cb = k == split_after && k + 1 < lists.size() ? frame_split(g_cb) : frame_cb(g_cb);
+     }
+     draw_end_rendering(g_cb);
+     const FrameTimes f1 = frame_times();  // the first part's submit and ring waits are not replay time
+     g_timing.submits++;
+@@ -736,109 +742,110 @@
+ void gpu_present(uint64_t texture, const int32_t* crop) {
+     plat::perf_hint_thread();  // the thread that presents takes part in the frame (perf_hint.cpp)
+     std::lock_guard lk(g_gpu);
+     PresentTimer timer;
+     drain_objects();  // under the GPU lock, as in gpu_submit
+     if (!init()) return;
+ #if defined(NX_ASTRAL_STRICT) && (defined(__linux__) && !defined(__ANDROID__))
+     // Linux headless has no swapchain presentation hook. Keep the same monotonic
+     // frame/compile clock for diagnostic ROI attribution without per-frame defaults.
+     if (plat::headless() && std::getenv("NX_FRAME_LOG")) {
+         static uint64_t last = 0, index = 0;
+         const uint64_t now = plat::monotonic_ns();
+         log("shader-cache frame index=%llu ts_ns=%llu interval_ms=%.6f", (unsigned long long)index++,
+             (unsigned long long)now, last ? double(now - last) / 1e6 : 0.0);
+         last = now;
+     }
+ #endif
+     if (!async_gpu() || pipelined()) free_retired_images(async_gpu() ? frame_completed() : UINT64_MAX);
+     if (plat::headless()) return present_headless(texture);
+     if (plat::window_minimized()) return;
+     if (plat::window_generation() != g_window_gen) {  // Android: a new window after home or the lock screen
+         if (async_gpu()) frame_wait_all();
+         p_vkDeviceWaitIdle(g_device);
+         present_pass_release();
+         if (g_swapchain) p_vkDestroySwapchainKHR(g_device, g_swapchain, nullptr);
+         g_swapchain = VK_NULL_HANDLE;
+         log("nvn/vk: new window: surface and swapchain re-made");
+         if (!make_surface()) return;
+     }
+     if (!g_swapchain && !make_swapchain()) return;
+     uint32_t index = 0;
+     VkSemaphore acquired = async_gpu() ? frame_acquire_semaphore() : g_acquired;
+-    VkResult r = p_vkAcquireNextImageKHR(g_device, g_swapchain, UINT64_MAX, acquired, VK_NULL_HANDLE, &index);
++    VkResult r = stutter::call(stutter::Acquire,[&] { return p_vkAcquireNextImageKHR(g_device, g_swapchain, UINT64_MAX, acquired, VK_NULL_HANDLE, &index); });
+     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+         make_swapchain();
+         return;
+     }
+     if (!check(r, "vkAcquireNextImageKHR") || !begin()) return;
+     GpuImage* src = image_of(texture);
+     GpuImage dst;
+     dst.image = g_sc_images[index];
+     dst.format = g_sc_format;
+     if (src) {
+         if (src->layout == VK_IMAGE_LAYOUT_UNDEFINED) {  // never rendered: dark grey, to tell it from a failure
+             transition(g_cb, *src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+             VkClearColorValue v{{0.08f, 0.08f, 0.1f, 1.0f}};
+             VkImageSubresourceRange rr{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+             p_vkCmdClearColorImage(g_cb, src->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &rr);
+         }
+     }
+     bool drawn = src && present_pass_record(g_cb, *src, crop, index);  // nvn_present.cpp: leaves dst PRESENT_SRC
+     if (src && !drawn) transition(g_cb, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+     if (!drawn) transition(g_cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+     if (src && !drawn) {
+         VkImageBlit blit{};
+         blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+         blit.srcOffsets[1] = {int32_t(src->width), int32_t(src->height), 1};
+         if (crop && crop[2] > 0 && crop[3] > 0 && crop[0] + crop[2] <= int32_t(src->width) &&
+             crop[1] + crop[3] <= int32_t(src->height))  // nvnWindowSetCrop
+             blit.srcOffsets[0] = {crop[0], crop[1], 0}, blit.srcOffsets[1] = {crop[0] + crop[2], crop[1] + crop[3], 1};
+         blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+         blit.dstOffsets[1] = {int32_t(g_sc_extent.width), int32_t(g_sc_extent.height), 1};
+         p_vkCmdBlitImage(g_cb, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.image,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+     }
+     if (!drawn) transition(g_cb, dst, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+ #if defined(NX_ASTRAL_STRICT)
+     hud::on_present(src ? src->width : 0, src ? src->height : 0, g_sc_extent.width, g_sc_extent.height);
+     hud_record(g_cb, dst.image, g_sc_format, g_sc_extent);  // NX_PERF_HUD, top right (nvn_hud.cpp)
+ #endif
+     static uint64_t presents = 0;
+     presents++;
+     if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
+     if (presents % 60 == 0) log_timing(60), gpu_profile_log(60);
+     if (presents % 300 == 0) zero_draws_log();
+     frame_sig_flush(presents);
+     const bool due = frame_dump_due(presents);
+     bool dump = src && due;
+     if (dump) transition(g_cb, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);  // the present pass left it sampled
+     dump = dump && frame_dump_record(g_cb, *src);
+     VkSemaphore rendered = async_gpu() ? frame_rendered_semaphore(index) : g_rendered;
+     if (async_gpu())  // the blit's fence is not waited for (vkQueuePresentKHR waits on `rendered`); a dumped frame is
+         frame_submit(acquired, rendered, {}, dump);
+     else
+         end_and_wait(acquired, rendered);
+     if (dump) frame_dump_write(*src, presents);
+     if (due) debug_dump_textures(presents);
+     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+     pi.waitSemaphoreCount = 1;
+     pi.pWaitSemaphores = &rendered;
+     pi.swapchainCount = 1;
+     pi.pSwapchains = &g_swapchain;
+     pi.pImageIndices = &index;
+-    r = p_vkQueuePresentKHR(g_queue, &pi);
++    r = stutter::call(stutter::Present,[&] { return p_vkQueuePresentKHR(g_queue, &pi); });
++    stutter::mark(stutter::Frame);
+     replay::resident_present();
+     plat::frame_presented();  // cores, CPU time, present intervals (frame_stats.cpp)
+     // SUBOPTIMAL re-makes the swapchain only when the surface size changed: Android returns it for every present when
+     // the swapchain's transform is not the display's (a Galaxy S23 did for Hades), a rebuild per frame.
+     bool remake = r == VK_ERROR_OUT_OF_DATE_KHR;
+     if (r == VK_SUBOPTIMAL_KHR) {  // compared with what the swapchain was made from (its extent may be turned)
+         VkSurfaceCapabilitiesKHR caps{};
+         p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_physical, g_surface, &caps);
+         remake = caps.currentExtent.width != g_sc_current.width || caps.currentExtent.height != g_sc_current.height ||
+                  (present_pass_wanted() && !present_pass_failed() && caps.currentTransform != g_sc_transform);
+     }
+     if (remake) make_swapchain();
+ }
+
+ }  // namespace nx::nvn
+diff --git a/runtime/src/platform_win.cpp b/runtime/src/platform_win.cpp
+--- a/runtime/src/platform_win.cpp
++++ b/runtime/src/platform_win.cpp
+@@ -1,3 +1,5 @@
++#include "win_log_sink.h"
++#include "win_stutter.h"
+ // Windows host: memory, threads, time, files, the game window (F11 / Alt+Enter fullscreen), XInput + keyboard,
+ // XAudio2, the Vulkan loader and win32 surface, crash handler, hardware watchpoints (NX_WATCH) and main().
+ #include <algorithm>
+@@ -35,6 +37,23 @@
+ #include "launcher.h"
+ #endif
+
++
++#if defined(NX_ASTRAL_STRICT)
++namespace nx::plat {
++namespace {
++winlog::Sink* console_sink() {
++    static winlog::Sink* sink=[]() -> winlog::Sink* {
++        const char* e=std::getenv("NX_WIN_ASYNC_CONSOLE");
++        if (!e || e[0]!='1' || e[1]) return nullptr;
++        // Process lifetime: normal/fatal exit drains explicitly; no static destruction race.
++        return new winlog::Sink([](const char* line) { std::fprintf(stderr,"%s\n",line); });
++    }();
++    return sink;
++}
++}
++}
++#endif
++
+ namespace nx {
+ HWND g_window = nullptr;
+ void boot();
+@@ -125,8 +144,14 @@
+ }
+
+ void exit_thread() { ExitThread(0); }
+-void exit_process(int code) { ExitProcess(UINT(code)); }
++void exit_process(int code) {
++#if defined(NX_ASTRAL_STRICT)
++    if (auto* sink=console_sink()) sink->flush();
++#endif
++    ExitProcess(UINT(code));
++}
+ void sleep_ns(int64_t ns) {
++    stutter::Span sleep_span(stutter::Sleep, uint64_t(ns));
+     // A high-resolution waitable timer: sleep_for rounds up to the 15.6 ms system tick, which would make the 60 Hz
+     // vsync thread (hle_vi.cpp) tick about every 31 ms.
+     thread_local HANDLE timer =
+@@ -187,11 +212,30 @@
+     return !ec;
+ }
+
+-void log_line(const char* line) { std::fprintf(stderr, "%s\n", line); }
++void log_line(const char* line) {
++#if defined(NX_ASTRAL_STRICT)
++    if (auto* sink=console_sink()) { sink->submit(line); return; }
++#endif
++    std::fprintf(stderr, "%s\n", line);
++}
+
+ std::string data_root() {
+-    const char* r = std::getenv("NX_DATA_ROOT");
+-    return r ? r : nx::game::kInfo.pc_data_root;
++    // The CRT narrow environment uses the active code page, not necessarily UTF-8.
++    // Read the Windows path in UTF-16 before the cache/asset fopen_utf8 boundary.
++    static const std::string root = [] {
++        DWORD size = GetEnvironmentVariableW(L"NX_DATA_ROOT", nullptr, 0);
++        if (!size) return std::string(nx::game::kInfo.pc_data_root);
++        std::wstring path(size, L'\0');
++        DWORD n = GetEnvironmentVariableW(L"NX_DATA_ROOT", path.data(), size);
++        if (!n || n >= size) return std::string(nx::game::kInfo.pc_data_root);
++        int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path.data(), int(n), nullptr, 0, nullptr, nullptr);
++        if (!bytes) return std::string(nx::game::kInfo.pc_data_root);
++        std::string utf8(size_t(bytes), '\0');
++        if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path.data(), int(n), utf8.data(), bytes, nullptr, nullptr))
++            return std::string(nx::game::kInfo.pc_data_root);
++        return utf8;
++    }();
++    return root;
+ }
+
+ // ---- window ---------------------------------------------------------------------------------------------------
+diff --git a/runtime/src/win_astc_cache.h b/runtime/src/win_astc_cache.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/win_astc_cache.h
+@@ -0,0 +1,191 @@
++// Private decoded ASTC cache. CPU data only; construction/preparation precedes use.
++// One save owner; loads may run concurrently. Prepared snapshots are immutable after boot.
++#pragma once
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <initializer_list>
++#include <map>
++#include <string>
++#include <vector>
++#if defined(_WIN32)
++#include <windows.h>
++#include <bcrypt.h>
++#endif
++namespace nx::astc_cache {
++// GPU owner only; cache preparation and timing-bucket reporting are serialized.
++struct Stats { uint64_t hits=0,misses=0,bypasses=0,verified=0,mismatches=0,ready=0; };
++inline Stats stats;
++using Digest=std::array<uint8_t,32>;
++using Part=std::pair<const void*,size_t>;
++using Hash=bool (*)(std::initializer_list<Part>,Digest&);
++inline void put64(uint8_t* p,uint64_t n) { for(unsigned i=0;i<8;++i)p[i]=uint8_t(n>>(i*8)); }
++inline uint64_t get64(const uint8_t* p) { uint64_t n=0;for(unsigned i=0;i<8;++i)n|=uint64_t(p[i])<<(i*8);return n; }
++inline std::string hex(const Digest& d) {
++    static constexpr char digits[]="0123456789abcdef";std::string out;
++    for(auto b:d) { out+=digits[b>>4];out+=digits[b&15]; }return out;
++}
++class Cache {
++    std::filesystem::path root;
++    Hash hash;
++    std::string identity;
++    std::map<std::string,uint64_t> sizes;
++    struct Prepared { std::vector<uint8_t> bytes;uint64_t invalid; };
++    std::map<Digest,Prepared> prepared;
++    uint64_t used=0;
++    bool valid=false;
++    bool regular(const std::filesystem::path& p) const {
++        std::error_code ec;auto status=std::filesystem::symlink_status(p,ec);
++        return !ec && std::filesystem::is_regular_file(status);
++    }
++public:
++    static constexpr uint64_t max_payload=64ull<<20, budget=4ull<<30;
++    static constexpr size_t max_files=4096, header_size=88;
++    static constexpr uint64_t prepare_budget=192ull<<20;
++    Cache(std::filesystem::path directory,Hash digest,std::string build,uint64_t prepare_bytes=0)
++        :root(std::move(directory)),hash(digest),identity(std::move(build)) {
++        if (!hash || identity.empty()) return;
++        std::error_code ec;std::filesystem::create_directories(root,ec);if(ec)return;
++        std::filesystem::directory_iterator it(root,ec),end;
++        for(;!ec && it!=end;it.increment(ec)) {
++            const auto name=it->path().filename().string();
++            if(name.size()!=68 || name.substr(64)!=".bin" ||
++               !std::all_of(name.begin(),name.begin()+64,[](char c) {return (c>='0'&&c<='9')||(c>='a'&&c<='f');}))continue;
++            if(!regular(it->path()))continue;
++            auto bytes=std::filesystem::file_size(it->path(),ec);if(ec)return;
++            if(bytes>budget-used || sizes.size()>=max_files)return;
++            used+=bytes;sizes[name]=bytes;
++        }
++        valid=!ec;
++        if(valid && prepare_bytes)prepare((std::min)(prepare_bytes,prepare_budget));
++    }
++    bool key(const std::string& metadata,const std::vector<uint8_t>& input,Digest& out) const {
++        return valid && hash({{identity.data(),identity.size()},{metadata.data(),metadata.size()},
++                              {input.data(),input.size()}},out);
++    }
++    bool load(const Digest& key,std::vector<uint8_t>& output,uint64_t& invalid,bool* ready=nullptr) const {
++        if(ready)*ready=false;
++        if(!valid || output.empty() || output.size()>max_payload)return false;
++        auto found=prepared.find(key);
++        if(found!=prepared.end() && found->second.bytes.size()==output.size()) {
++            output=found->second.bytes;invalid=found->second.invalid;
++            if(ready)*ready=true;return true;
++        }
++        auto path=root/(hex(key)+".bin");if(!regular(path))return false;
++        std::error_code ec;
++        if(std::filesystem::file_size(path,ec)!=header_size+output.size() || ec)return false;
++        std::ifstream file(path,std::ios::binary);std::array<uint8_t,header_size> head{};
++        if(!file.read(reinterpret_cast<char*>(head.data()),head.size()) ||
++           std::memcmp(head.data(),"ACASTC01",8) || get64(head.data()+8)!=output.size() ||
++           !std::equal(key.begin(),key.end(),head.begin()+24))return false;
++        // Failed loads never change the caller's zero-initialized decode destination.
++        std::vector<uint8_t> bytes(output.size());Digest check{};
++        if(!file.read(reinterpret_cast<char*>(bytes.data()),bytes.size()) ||
++           !hash({{head.data(),56},{bytes.data(),bytes.size()}},check) ||
++           !std::equal(check.begin(),check.end(),head.begin()+56))return false;
++        invalid=get64(head.data()+16);output.swap(bytes);return true;
++    }
++    // Loading barrier only: own validated snapshots, never guest-memory pointers.
++    // The newest entries are a bounded working-set hint, not a correctness assumption.
++    void prepare(uint64_t limit) {
++        prepared.clear();limit=(std::min)(limit,prepare_budget);uint64_t held=0;
++        using Item=std::pair<std::filesystem::file_time_type,std::string>;
++        std::vector<Item> recent;
++        for(const auto& [name,size]:sizes) {
++            std::error_code ec;auto time=std::filesystem::last_write_time(root/name,ec);
++            if(!ec)recent.emplace_back(time,name);
++        }
++        std::sort(recent.rbegin(),recent.rend());
++        for(const auto& [time,name]:recent) {
++            std::ifstream file(root/name,std::ios::binary);std::array<uint8_t,header_size> head{};
++            if(!file.read(reinterpret_cast<char*>(head.data()),head.size()))continue;
++            auto size=get64(head.data()+8);
++            if(!size || size>max_payload || size>limit-held)continue;
++            Digest key{};std::copy(head.begin()+24,head.begin()+56,key.begin());
++            if(hex(key)+".bin"!=name)continue;
++            std::vector<uint8_t> bytes(size);uint64_t invalid=0;
++            if(!load(key,bytes,invalid))continue;
++            held+=size;prepared.emplace(key,Prepared{std::move(bytes),invalid});
++        }
++    }
++    uint64_t prepared_bytes() const {
++        uint64_t bytes=0;for(const auto& [key,entry]:prepared)bytes+=entry.bytes.size();return bytes;
++    }
++    bool save(const Digest& key,const std::vector<uint8_t>& bytes,uint64_t invalid) {
++        if(!valid || bytes.empty() || bytes.size()>max_payload)return false;
++        auto name=hex(key)+".bin";auto prior=sizes.find(name);
++        uint64_t old=prior==sizes.end()?0:prior->second,needed=header_size+bytes.size();
++        if(needed>budget-(used-old) || (prior==sizes.end() && sizes.size()>=max_files))return false;
++        auto path=root/name,tmp=root/"pending.tmp";
++        std::error_code ec;
++        for(const auto& p:{path,tmp}) {
++            auto st=std::filesystem::symlink_status(p,ec);
++            if(ec && ec!=std::errc::no_such_file_or_directory)return false;
++            if(!ec && std::filesystem::exists(st) && !std::filesystem::is_regular_file(st))return false;
++            ec.clear();
++        }
++        std::array<uint8_t,header_size> head{};Digest check{};
++        std::memcpy(head.data(),"ACASTC01",8);put64(head.data()+8,bytes.size());put64(head.data()+16,invalid);
++        std::copy(key.begin(),key.end(),head.begin()+24);
++        if(!hash({{head.data(),56},{bytes.data(),bytes.size()}},check))return false;
++        std::copy(check.begin(),check.end(),head.begin()+56);
++        {
++            std::ofstream file(tmp,std::ios::binary|std::ios::trunc);
++            if(!file.write(reinterpret_cast<const char*>(head.data()),head.size()) ||
++               !file.write(reinterpret_cast<const char*>(bytes.data()),bytes.size()))return false;
++            file.flush();if(!file)return false;
++            file.close();if(!file)return false;
++        }
++#if defined(_WIN32)
++        if(!MoveFileExW(tmp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))return false;
++#else
++        std::filesystem::rename(tmp,path,ec);if(ec)return false;
++#endif
++        used=used-old+needed;sizes[name]=needed;return true;
++    }
++};
++#if defined(_WIN32)
++// Resolve CNG at runtime: unavailable hashing leaves decoding on the original path.
++inline bool sha256(std::initializer_list<Part> parts,Digest& out) {
++    struct Cng {
++        decltype(&BCryptOpenAlgorithmProvider) open=nullptr;
++        decltype(&BCryptCreateHash) create=nullptr;
++        decltype(&BCryptHashData) data=nullptr;
++        decltype(&BCryptFinishHash) finish=nullptr;
++        decltype(&BCryptDestroyHash) destroy=nullptr;
++        BCRYPT_ALG_HANDLE algorithm=nullptr;
++        Cng() {
++            HMODULE lib=LoadLibraryW(L"bcrypt.dll");if(!lib)return;
++            open=reinterpret_cast<decltype(open)>(GetProcAddress(lib,"BCryptOpenAlgorithmProvider"));
++            create=reinterpret_cast<decltype(create)>(GetProcAddress(lib,"BCryptCreateHash"));
++            data=reinterpret_cast<decltype(data)>(GetProcAddress(lib,"BCryptHashData"));
++            finish=reinterpret_cast<decltype(finish)>(GetProcAddress(lib,"BCryptFinishHash"));
++            destroy=reinterpret_cast<decltype(destroy)>(GetProcAddress(lib,"BCryptDestroyHash"));
++            if(!open || !create || !data || !finish || !destroy)return;
++            if(open(&algorithm,BCRYPT_SHA256_ALGORITHM,nullptr,0)<0)algorithm=nullptr;
++        }
++    };
++    static Cng cng;if(!cng.algorithm)return false;
++    BCRYPT_HASH_HANDLE handle=nullptr;
++    if(cng.create(cng.algorithm,&handle,nullptr,0,nullptr,0,0)<0)return false;
++    bool ok=true;
++    for(auto [p,n]:parts) {
++        if(n>0xffffffffu || (n && cng.data(handle,reinterpret_cast<PUCHAR>(const_cast<void*>(p)),ULONG(n),0)<0))ok=false;
++    }
++    ok=ok && cng.finish(handle,out.data(),ULONG(out.size()),0)>=0;cng.destroy(handle);return ok;
++}
++inline std::string executable_identity() {
++    std::wstring path(32768,L'\0');DWORD n=GetModuleFileNameW(nullptr,path.data(),DWORD(path.size()));
++    if(!n || n>=path.size())return {};path.resize(n);
++    std::ifstream file(std::filesystem::path(path),std::ios::binary|std::ios::ate);
++    auto size=file.tellg();if(size<=0 || size>(512ll<<20))return {};
++    std::vector<uint8_t> bytes(static_cast<size_t>(size));
++    file.seekg(0);Digest digest{};
++    if(!file.read(reinterpret_cast<char*>(bytes.data()),bytes.size()) || !sha256({{bytes.data(),bytes.size()}},digest))return {};
++    return "decoded-astc-v1:"+hex(digest);
++}
++#endif
++} // namespace nx::astc_cache
+diff --git a/runtime/src/win_astc_store.h b/runtime/src/win_astc_store.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/win_astc_store.h
+@@ -0,0 +1,86 @@
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++#include "win_mem_account.h"
++#endif
++// Optional bounded persistence worker. Only owned decoded CPU bytes cross threads.
++#pragma once
++#include "win_astc_cache.h"
++#include <condition_variable>
++#include <deque>
++#include <functional>
++#include <mutex>
++#include <thread>
++namespace nx::astc_cache {
++class Store {
++public:
++    using Write=std::function<bool(const Digest&,const std::vector<uint8_t>&,uint64_t)>;
++    struct Counts { uint64_t queued=0, skipped=0, saved=0, failed=0; };
++    static constexpr uint64_t byte_limit=128ull<<20;
++    static constexpr size_t job_limit=16;
++private:
++    struct Job { Digest key;std::vector<uint8_t> bytes;uint64_t invalid; };
++    std::mutex mutex;
++    std::condition_variable wake, drained;
++    std::deque<Job> queue;
++    uint64_t held=0;
++    size_t jobs=0;
++    Counts counts;
++    const uint64_t capacity;
++    const size_t slots;
++    Write write;
++    bool stopping=false;
++    std::thread worker;
++    void run() {
++        for (;;) {
++            Job job;
++            {
++                std::unique_lock lock(mutex);
++                wake.wait(lock,[&] { return stopping || !queue.empty(); });
++                if(queue.empty())return;
++                job=std::move(queue.front());queue.pop_front();
++            }
++            bool ok=false;
++            try { ok=write(job.key,job.bytes,job.invalid); } catch (...) { /* optional cache failure */ }
++            const auto size=job.bytes.size();
++            // Release the snapshot before returning its capacity to the producer.
++            std::vector<uint8_t>().swap(job.bytes);
++            {
++                std::lock_guard lock(mutex);
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++                if (memtrace::enabled()) memtrace::ledger().payload_free(memtrace::Pool::DecodedStore, size);
++#endif
++                held-=size;--jobs;
++                if(ok)++counts.saved;else ++counts.failed;
++                if(!jobs)drained.notify_all();
++            }
++        }
++    }
++public:
++    explicit Store(Write callback,uint64_t bytes=byte_limit,size_t limit=job_limit)
++        : capacity((std::min)(bytes,byte_limit)),slots((std::min)(limit,job_limit)),
++          write(std::move(callback)),worker([this] { run(); }) {}
++    Store(const Store&)=delete;
++    Store& operator=(const Store&)=delete;
++    bool submit(const Digest& key,const std::vector<uint8_t>& bytes,uint64_t invalid) {
++        std::unique_lock lock(mutex);
++        // The in-flight job counts toward both limits. Saturation skips persistence,
++        // never waits for disk or changes the already decoded/uploaded texture.
++        if(stopping || bytes.empty() || bytes.size()>Cache::max_payload ||
++           bytes.size()>capacity-held || jobs>=slots) { ++counts.skipped;return false; }
++        try { queue.push_back(Job{key,bytes,invalid}); }
++        catch (...) { ++counts.skipped;return false; }
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++        if (memtrace::enabled()) memtrace::ledger().payload_add(memtrace::Pool::DecodedStore, bytes.size());
++#endif
++        held+=bytes.size();++jobs;++counts.queued;
++        lock.unlock();wake.notify_one();return true;
++    }
++    Counts snapshot() { std::lock_guard lock(mutex);return counts; }
++    void flush() { std::unique_lock lock(mutex);drained.wait(lock,[&] { return !jobs; }); }
++    ~Store() {
++        { std::lock_guard lock(mutex);stopping=true; }
++        wake.notify_one();worker.join();
++    }
++};
++// Published/read only by the serialized GPU owner; worker counters use its mutex.
++inline Store* active_store=nullptr;
++} // namespace nx::astc_cache
+diff --git a/runtime/src/win_log_sink.h b/runtime/src/win_log_sink.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/win_log_sink.h
+@@ -0,0 +1,58 @@
++// Bounded console mirror. The primary NX_LOG file remains synchronous.
++#pragma once
++#include <condition_variable>
++#include <cstddef>
++#include <deque>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <utility>
++namespace nx::winlog {
++class Sink {
++    std::mutex lock;
++    std::condition_variable ready, space, drained;
++    std::deque<std::string> queue;
++    const size_t capacity;
++    void (*write)(const char*);
++    bool stopping=false, busy=false;
++    std::thread worker;
++    void run() {
++        for (;;) {
++            std::string line;
++            {
++                std::unique_lock guard(lock);
++                ready.wait(guard,[&] { return stopping || !queue.empty(); });
++                if (queue.empty()) return;
++                line=std::move(queue.front()); queue.pop_front(); busy=true;
++            }
++            space.notify_one();
++            write(line.c_str());
++            {
++                std::lock_guard guard(lock); busy=false;
++                if (queue.empty()) drained.notify_all();
++            }
++        }
++    }
++public:
++    // Production lines are bounded by nx::log's 2048-byte format buffer.
++    explicit Sink(void (*output)(const char*),size_t bound=256)
++        : capacity(bound ? bound : 1),write(output),worker([this] { run(); }) {}
++    Sink(const Sink&)=delete;
++    Sink& operator=(const Sink&)=delete;
++    void submit(std::string line) {
++        std::unique_lock guard(lock);
++        // Backpressure preserves every line and bounds retained input lifetimes.
++        space.wait(guard,[&] { return queue.size()<capacity; });
++        queue.push_back(std::move(line));
++        guard.unlock(); ready.notify_one();
++    }
++    void flush() {
++        std::unique_lock guard(lock);
++        drained.wait(guard,[&] { return queue.empty() && !busy; });
++    }
++    ~Sink() {
++        { std::lock_guard guard(lock); stopping=true; }
++        ready.notify_one(); worker.join(); // drains all queued lines before exit
++    }
++};
++} // namespace nx::winlog
+diff --git a/runtime/src/win_stutter.h b/runtime/src/win_stutter.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/win_stutter.h
+@@ -0,0 +1,86 @@
++// Optional QPC-aligned span trace. No guest bytes, pointers or shader content are written.
++#pragma once
++#include "platform.h"
++#include <cstdint>
++#include <utility>
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <thread>
++#include <vector>
++#endif
++namespace nx::stutter {
++enum Kind : uint32_t { Graphics=1, Module, Compute, Astc, Texture, Upload, Fence, Svc,
++    Acquire, Present, Pace, Sleep, Submit, Block, QueuePresent, Frame, CacheSave, Vsync, QueueSubmit, GpuLock, Begin, Untile, Retire, FrameSubmit, LogConsole, LogFile, Stats, FrameStats, Log, AstcCacheHit, AstcCacheMiss, CacheLoad, CacheStore, CacheMismatch, AstcDecode, CachePrepare, CacheKey, CacheEnqueue };
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++struct Event { uint64_t begin, end, arg; uint32_t tid, kind; };
++static_assert(sizeof(Event)==32);
++// Fixed bound on producer backlog. Overflow is explicit, never a silent incomplete trace.
++struct Trace {
++    std::mutex lock;
++    std::vector<Event> pending;
++    uint64_t lost=0;
++    static constexpr size_t limit=65536;
++    FILE* file=nullptr;
++    explicit Trace(const char* path) {
++        if (!path || !*path) return;
++        file=plat::fopen_utf8(path,"wb");
++        if (!file) return;
++        std::fwrite("ACST0001",1,8,file);
++        pending.reserve(limit);
++        std::thread([this] {
++            std::vector<Event> batch; batch.reserve(limit);
++            for (;;) {
++                std::this_thread::sleep_for(std::chrono::milliseconds(100));
++                uint64_t dropped=0;
++                { std::lock_guard guard(lock); batch.swap(pending); dropped=lost; lost=0; }
++                if (dropped) { Event e{0,0,dropped,0,0}; std::fwrite(&e,sizeof e,1,file); }
++                if (!batch.empty()) std::fwrite(batch.data(),sizeof(Event),batch.size(),file);
++                std::fflush(file); batch.clear();
++            }
++        }).detach();
++    }
++    void append(const Event& e) {
++        std::lock_guard guard(lock);
++        if (pending.size()<limit) pending.push_back(e); else ++lost;
++    }
++};
++inline Trace* trace() {
++    // Intentionally process-lifetime: detached writer and runtime use ExitProcess/_exit.
++    static Trace* t=new Trace(std::getenv("NX_STUTTER_TRACE"));
++    return t->file ? t : nullptr;
++}
++struct Span {
++    Trace* t; Event e{};
++    explicit Span(Kind kind,uint64_t arg=0,bool active=true) : t(active ? trace() : nullptr) {
++        if (t) e={plat::monotonic_ns(),0,arg,uint32_t(plat::current_thread_id()),uint32_t(kind)};
++    }
++    ~Span() { if (t) { e.end=plat::monotonic_ns(); t->append(e); } }
++};
++inline void mark(Kind kind,uint64_t arg=0) {
++    if (auto* t=trace()) { auto n=plat::monotonic_ns(); t->append({n,n,arg,uint32_t(plat::current_thread_id()),uint32_t(kind)}); }
++}
++#else
++struct Span { explicit Span(Kind,uint64_t=0,bool=true) {} };
++inline void mark(Kind,uint64_t=0) {}
++#endif
++inline bool pace_before_present() {
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    static const bool on=[] {
++        const char* e=std::getenv("NX_WIN_PACE_BEFORE");
++        const char* replay=std::getenv("NX_REPLAY_THREAD");
++        // This experiment is for inline replay only. Keep the worker queue's existing pacing.
++        return e && e[0]=='1' && !e[1] && !(replay && replay[0]=='1');
++    }();
++    return on;
++#else
++    return false;
++#endif
++}
++template<class F> decltype(auto) call(Kind k,F&& f,uint64_t arg=0) {
++    Span span(k,arg); return std::forward<F>(f)();
++}
++} // namespace nx::stutter
+diff --git a/runtime/src/nvn/nvn_written.cpp b/runtime/src/nvn/nvn_written.cpp
+--- a/runtime/src/nvn/nvn_written.cpp
++++ b/runtime/src/nvn/nvn_written.cpp
+@@ -419,7 +419,7 @@
+ // rest of those buffers while the submit is replayed. Copying the whole range back put stale bytes over them: meshes
+ // exploded into beams and a band of stretched triangles at the horizon, for the rest of the run (DEBUG.md #56). Only
+ // the words the GPU changed go back. NX_WRITE_BACK_WHOLE=1: the old whole-range copy.
+-void apply_write_back_full(const WriteBack& w) {
++void apply_write_back_full_impl(const WriteBack& w) {
+     auto& metrics = replay::resident_stats(); metrics.wb_scanned += w.size;
+     static const bool whole = std::getenv("NX_WRITE_BACK_WHOLE") != nullptr;
+     if (whole || !w.before || w.before_offset > w.before->size() || w.before->size()-w.before_offset < w.size) {
+@@ -455,6 +455,34 @@
+         if (w.from[k] != was[k]) { ++metrics.wb_changed; w.to[k] = w.from[k]; }
+ }
+
++// Diagnostic route oracle: replay each real range against an independent scalar
++// reference in owned scratch memory. Live guest writes cannot race the oracle's
++// destination; the production merge still runs against the real guest below.
++void apply_write_back_full(const WriteBack& w) {
++    static const bool verify=std::getenv("NX_WIN_WRITEBACK_VERIFY")!=nullptr;
++    if (verify) {
++        static uint64_t calls=0,bytes=0,mismatches=0;
++        std::vector<uint8_t> actual(w.to,w.to+w.size),expected=actual;
++        static const bool whole=std::getenv("NX_WRITE_BACK_WHOLE")!=nullptr;
++        const bool valid=w.before && w.before_offset<=w.before->size() && w.size<=w.before->size()-w.before_offset;
++        if (whole || !valid) std::memcpy(expected.data(),w.from,w.size);
++        else {
++            const uint8_t* before=w.before->data()+w.before_offset;
++            uint64_t at=0;
++            for (;at+8<=w.size;at+=8) for (uint64_t word=at;word<at+8;word+=4)
++                if (std::memcmp(w.from+word,before+word,4)) std::memcpy(expected.data()+word,w.from+word,4);
++            for (;at<w.size;++at) if (w.from[at]!=before[at]) expected[at]=w.from[at];
++        }
++        WriteBack probe=w;probe.to=actual.data();
++        apply_write_back_full_impl(probe);
++        if (actual!=expected) { ++mismatches; log("resident changed-word ORACLE_MISMATCH size=%llu",(unsigned long long)w.size); }
++        ++calls;bytes+=w.size;
++        if (calls==1 || calls%300==0) log("resident changed-word oracle calls=%llu bytes=%llu mismatches=%llu",
++            (unsigned long long)calls,(unsigned long long)bytes,(unsigned long long)mismatches);
++    }
++    apply_write_back_full_impl(w);
++}
++
+ void apply_write_back(const WriteBack& w) {
+     auto& stats=replay::resident_stats(); stats.wb_considered+=w.size;
+     const bool valid=w.before && w.before_offset<=w.before->size() && w.size<=w.before->size()-w.before_offset;
+@@ -462,6 +490,10 @@
+     const uint32_t* flags=valid && !whole ? w.changed : nullptr;
+     static const bool oracle=std::getenv("NX_NARROW_WRITEBACK_ORACLE")!=nullptr;
+     if (flags && oracle) {
++        static uint64_t calls=0,checked_bytes=0;
++        ++calls;checked_bytes+=w.size;
++        if (calls==1 || calls%300==0) log("writeback changed-block oracle calls=%llu bytes=%llu",
++            (unsigned long long)calls,(unsigned long long)checked_bytes);
+         // Diagnostic only: independently check every byte, including partial words, before skipping.
+         for (uint64_t at=0;at<w.size;at+=kWritebackBlock) {
+             const uint64_t checked=(std::min)(kWritebackBlock,w.size-at)&~3ull;

@@ -1,0 +1,610 @@
+diff --git a/runtime/src/platform_mac.cpp b/runtime/src/platform_mac.cpp
+--- a/runtime/src/platform_mac.cpp
++++ b/runtime/src/platform_mac.cpp
+@@ -7,6 +7,9 @@
+ //
+ // Data: NX_DATA_ROOT or games/<game>'s pc_data_root ("private/<game>"): analysis/{main,sdk}.bin, extract/romfs, user/.
+ // Settings: NX_<KEY> environment variables, as on Windows.
++#if defined(NX_ASTRAL_STRICT)
++#include "audio_probe.h"
++#endif
+ #include <dlfcn.h>
+ #include <pthread.h>
+ #include <cstdlib>
+@@ -511,6 +514,11 @@
+
+ void SDLCALL audio_cb(void*, SDL_AudioStream* s, int additional, int) {
+     uint8_t buf[4096];
++#if defined(NX_ASTRAL_STRICT)
++    const uint64_t requested = additional > 0 ? uint64_t(additional) / 4 : 0;
++    const uint64_t callback_ns = monotonic_ns();
++    uint64_t absent = 0;
++#endif
+     while (additional > 0) {
+         int n = std::min<int>(additional, sizeof buf);
+         int filled = 0;
+@@ -529,11 +537,17 @@
+                 }
+             }
+         }
++#if defined(NX_ASTRAL_STRICT)
++        absent += uint64_t(n - filled) / 4;
++#endif
+         if (filled < n) std::memset(buf + filled, 0, size_t(n - filled));  // underrun: silence
+         SDL_PutAudioStreamData(s, buf, n);
+         for (void* ctx : finished) g_done(ctx);
+         additional -= n;
+     }
++#if defined(NX_ASTRAL_STRICT)
++    audio_probe::callback(requested, absent, callback_ns);
++#endif
+ }
+ }  // namespace
+
+@@ -541,6 +555,10 @@
+     g_done = done;
+     // Headless test runs (and NX_MUTE=1) are silent: no device, the callers pace themselves with a timer.
+     if (headless() || std::getenv("NX_MUTE")) return false;
++#if defined(NX_ASTRAL_STRICT)
++    const char* probe_path = std::getenv("NX_AUDIO_DUMP");
++    audio_probe::enabled = probe_path && *probe_path;
++#endif
+     SDL_AudioSpec spec{SDL_AUDIO_S16LE, 2, 48000};
+     g_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, audio_cb, nullptr);
+     if (!g_stream) return false;
+@@ -552,6 +570,9 @@
+     if (!g_stream) return false;
+     std::lock_guard lk(g_audio);
+     g_pending.push_back({static_cast<const uint8_t*>(data), bytes, 0, ctx});
++#if defined(NX_ASTRAL_STRICT)
++    audio_probe::submitted.store(true, std::memory_order_relaxed);
++#endif
+     return true;
+ }
+
+diff --git a/runtime/src/platform_linux.cpp b/runtime/src/platform_linux.cpp
+--- a/runtime/src/platform_linux.cpp
++++ b/runtime/src/platform_linux.cpp
+@@ -7,6 +7,9 @@
+ //
+ // Data: NX_DATA_ROOT or games/<game>'s pc_data_root ("private/<game>"): analysis/{main,sdk}.bin, extract/romfs, user/.
+ // Settings: NX_<KEY> environment variables, as on Windows and macOS.
++#if defined(NX_ASTRAL_STRICT)
++#include "audio_probe.h"
++#endif
+ #include <dlfcn.h>
+ #include <pthread.h>
+ #include <sched.h>
+@@ -412,6 +415,11 @@
+
+ void SDLCALL audio_cb(void*, SDL_AudioStream* s, int additional, int) {
+     uint8_t buf[4096];
++#if defined(NX_ASTRAL_STRICT)
++    const uint64_t requested = additional > 0 ? uint64_t(additional) / 4 : 0;
++    const uint64_t callback_ns = monotonic_ns();
++    uint64_t absent = 0;
++#endif
+     while (additional > 0) {
+         int n = std::min<int>(additional, sizeof buf);
+         int filled = 0;
+@@ -430,11 +438,17 @@
+                 }
+             }
+         }
++#if defined(NX_ASTRAL_STRICT)
++        absent += uint64_t(n - filled) / 4;
++#endif
+         if (filled < n) std::memset(buf + filled, 0, size_t(n - filled));  // underrun: silence
+         SDL_PutAudioStreamData(s, buf, n);
+         for (void* ctx : finished) g_done(ctx);
+         additional -= n;
+     }
++#if defined(NX_ASTRAL_STRICT)
++    audio_probe::callback(requested, absent, callback_ns);
++#endif
+ }
+ }  // namespace
+
+@@ -442,6 +456,10 @@
+     g_done = done;
+     // Headless test runs (and NX_MUTE=1) are silent: no device, the callers pace themselves with a timer.
+     if (headless() || std::getenv("NX_MUTE")) return false;
++#if defined(NX_ASTRAL_STRICT)
++    const char* probe_path = std::getenv("NX_AUDIO_DUMP");
++    audio_probe::enabled = probe_path && *probe_path;
++#endif
+     SDL_AudioSpec spec{SDL_AUDIO_S16LE, 2, 48000};
+     g_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, audio_cb, nullptr);
+     if (!g_stream) {
+@@ -456,6 +474,9 @@
+     if (!g_stream) return false;
+     std::lock_guard lk(g_audio);
+     g_pending.push_back({static_cast<const uint8_t*>(data), bytes, 0, ctx});
++#if defined(NX_ASTRAL_STRICT)
++    audio_probe::submitted.store(true, std::memory_order_relaxed);
++#endif
+     return true;
+ }
+
+diff --git a/runtime/src/hle_audio.cpp b/runtime/src/hle_audio.cpp
+--- a/runtime/src/hle_audio.cpp
++++ b/runtime/src/hle_audio.cpp
+@@ -21,6 +21,7 @@
+ #if defined(NX_ASTRAL_STRICT)
+ #include "wav_stream.h"
+ #include "audio_probe.h"
++#include "audio_clock.h"
+ #endif
+
+ namespace nx {
+@@ -73,10 +74,22 @@
+ }
+ void release_locked(uint64_t guest) {
+     g_out.released.push_back(guest);
++#if defined(NX_ASTRAL_STRICT)
++    const uint64_t begin = audio_probe::enabled ? plat::monotonic_ns() : 0;
++#endif
+     event_signal(g_out.event);
++#if defined(NX_ASTRAL_STRICT)
++    if (begin) audio_probe::maximum(audio_probe::max_release_event_ns, plat::monotonic_ns() - begin);
++#endif
+ }
+ void release(void* ctx) {
++#if defined(NX_ASTRAL_STRICT)
++    const uint64_t begin = audio_probe::enabled ? plat::monotonic_ns() : 0;
++#endif
+     std::lock_guard lk(g_out.lock);
++#if defined(NX_ASTRAL_STRICT)
++    if (begin) audio_probe::maximum(audio_probe::max_release_lock_ns, plat::monotonic_ns() - begin);
++#endif
+     auto it = g_out.inflight.find(ctx);
+     if (it == g_out.inflight.end()) return;
+     auto packet = it->second;
+@@ -146,23 +159,41 @@
+     bool more = d.wav.write(pcm, frames);
+     if (d.timing) {
+         audio_probe::Event e;
+-        while (audio_probe::pop(e))
++        while (audio_probe::pop(e)) {
++            if (e.completion_ns) {
++                std::fprintf(d.timing, "{\"type\":\"completion\",\"monotonic_ns\":%llu,\"duration_ns\":%llu}\n",
++                             (unsigned long long)e.monotonic_ns, (unsigned long long)e.completion_ns);
++                continue;
++            }
++            if (e.device_position) {
++                std::fprintf(d.timing, "{\"type\":\"device\",\"played_frame\":%llu,\"monotonic_ns\":%llu}\n",
++                             (unsigned long long)e.played_frame, (unsigned long long)e.monotonic_ns);
++                continue;
++            }
+             std::fprintf(d.timing, "{\"type\":\"host\",\"frame\":%llu,\"monotonic_ns\":%llu,"
+                          "\"missing_frames\":%llu,\"underrun_callbacks\":%llu,\"late_callback_ns\":%llu,\"startup\":%s}\n",
+                          (unsigned long long)e.frame, (unsigned long long)e.monotonic_ns,
+                          (unsigned long long)e.missing_frames, (unsigned long long)e.underrun_callbacks, (unsigned long long)e.late_ns,
+                          e.startup ? "true" : "false");
++        }
+         std::fprintf(d.timing, "{\"type\":\"pcm\",\"frame\":%llu,\"frames\":%llu,\"monotonic_ns\":%llu,"
+-                     "\"source\":%d,\"host_probe_active\":%s,\"host_underrun_callbacks\":%llu,\"host_missing_frames\":%llu,"
+-                     "\"lost_host_events\":%llu,\"host_callbacks\":%llu,\"host_requested_frames\":%llu,\"host_late_callbacks\":%llu}\n", (unsigned long long)at,
++                     "\"source\":%d,\"host_submitted_frames\":%llu,\"host_submit_failures\":%llu,\"host_backend\":\"%s\",\"host_probe_active\":%s,\"host_underrun_callbacks\":%llu,\"host_missing_frames\":%llu,"
++                     "\"lost_host_events\":%llu,\"host_callbacks\":%llu,\"host_requested_frames\":%llu,\"host_late_callbacks\":%llu,\"host_completed_buffers\":%llu,\"host_max_completion_ns\":%llu,\"host_max_release_ns\":%llu,\"host_max_release_lock_ns\":%llu,\"host_max_release_event_ns\":%llu}\n", (unsigned long long)at,
+                      (unsigned long long)(d.wav.frames() - at), (unsigned long long)now, source,
+-                     audio_probe::enabled ? "true" : "false",
++                     (unsigned long long)audio_probe::submitted_frames.load(std::memory_order_relaxed),
++                     (unsigned long long)audio_probe::submit_failures.load(std::memory_order_relaxed),
++                     audio_probe::backend, audio_probe::enabled ? "true" : "false",
+                      (unsigned long long)audio_probe::underruns.load(std::memory_order_relaxed),
+                      (unsigned long long)audio_probe::missing.load(std::memory_order_relaxed),
+                      (unsigned long long)audio_probe::lost.load(std::memory_order_relaxed),
+                      (unsigned long long)audio_probe::callbacks.load(std::memory_order_relaxed),
+                      (unsigned long long)audio_probe::requested.load(std::memory_order_relaxed),
+-                     (unsigned long long)audio_probe::late_callbacks.load(std::memory_order_relaxed));
++                     (unsigned long long)audio_probe::late_callbacks.load(std::memory_order_relaxed),
++                     (unsigned long long)audio_probe::completed_buffers.load(std::memory_order_relaxed),
++                     (unsigned long long)audio_probe::max_completion_ns.load(std::memory_order_relaxed),
++                     (unsigned long long)audio_probe::max_release_ns.load(std::memory_order_relaxed),
++                     (unsigned long long)audio_probe::max_release_lock_ns.load(std::memory_order_relaxed),
++                     (unsigned long long)audio_probe::max_release_event_ns.load(std::memory_order_relaxed));
+         // Keep the sidecar durable at each WAV-sized quarter-second interval, and at the limit.
+         if (!more || at / 12000 != d.wav.frames() / 12000) std::fflush(d.timing);
+     }
+@@ -185,6 +216,9 @@
+     return ok;
+ }
+ void player() {
++#if defined(NX_ASTRAL_STRICT)
++    AudioClock fallback_clock;
++#endif
+     bool device = device_open();
+     log("audio: %s", device ? "device output (48 kHz stereo s16)" : "no audio device, timer pacing only");
+     for (;;) {
+@@ -196,6 +230,9 @@
+                        (!device || plat::audio_queued() < kMaxInFlight));
+             });
+             if (g_out.closing) return;
++#if defined(NX_ASTRAL_STRICT)
++            if (!g_out.started) fallback_clock.reset();
++#endif
+             if (!g_out.started || g_out.queued.empty() ||
+                 (device && plat::audio_queued() >= kMaxInFlight)) continue;
+             packet = g_out.queued.front();
+@@ -208,8 +245,16 @@
+         if (device && plat::audio_submit(packet->pcm.data(), packet->pcm.size(), packet.get())) continue;
+         // A missing/rejecting sink never establishes audible output. Pace, then release.
+         std::unique_lock lk(g_out.lock);
++#if defined(NX_ASTRAL_STRICT)
++        // Relative sleeps add scheduler/dump/producer overhead to every packet and slow FMOD's clock.
++        // Keep an absolute sample deadline; a real idle gap or stop rebases it rather than bursting a backlog.
++        auto duration = std::chrono::nanoseconds(packet->pcm.size() * 1000000000ull / kBytesPerSecond);
++        auto deadline = fallback_clock.advance(AudioClock::Clock::now(), duration);
++        g_out.cv.wait_until(lk, deadline, [] { return g_out.closing; });
++#else
+         g_out.cv.wait_for(lk, std::chrono::microseconds(packet->pcm.size() * 1000000 / kBytesPerSecond),
+                          [] { return g_out.closing; });
++#endif
+         lk.unlock();
+         release(packet.get());
+     }
+diff --git a/runtime/src/audio_clock.h b/runtime/src/audio_clock.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/audio_clock.h
+@@ -0,0 +1,19 @@
++// A timer fallback paced by cumulative sample duration, with bounded catch-up after a stall.
++#pragma once
++#include <chrono>
++namespace nx {
++class AudioClock {
++public:
++    using Clock = std::chrono::steady_clock;
++    Clock::time_point advance(Clock::time_point now, Clock::duration duration) {
++        if (!active_ || now > next_ + duration) next_ = now;
++        active_ = true;
++        next_ += duration;
++        return next_;
++    }
++    void reset() { active_ = false; }
++private:
++    Clock::time_point next_{};
++    bool active_ = false;
++};
++}  // namespace nx
+diff --git a/runtime/src/platform_win.cpp b/runtime/src/platform_win.cpp
+--- a/runtime/src/platform_win.cpp
++++ b/runtime/src/platform_win.cpp
+@@ -7,36 +7,40 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
+ #include <thread>
+
+ #include <windows.h>
+ #include <xaudio2.h>
+ #include <xinput.h>
+
+ #define VK_NO_PROTOTYPES
+ #define VK_USE_PLATFORM_WIN32_KHR
+ #include <vulkan/vulkan.h>
+
+ #include <nx/game.h>
+ #include <nx/runtime.h>
+
+ #include "kernel.h"
+ #include "platform.h"
++#if defined(NX_ASTRAL_STRICT)
++#include "audio_probe.h"
++#include "audio_completion.h"
++#endif
+ #if defined(NX_ASTRAL_STRICT)
+ #include "perf_hud.h"
+ #endif
+
+ namespace nx {
+ HWND g_window = nullptr;
+ void boot();
+ }  // namespace nx
+
+ namespace nx::plat {
+
+ // ---- memory ---------------------------------------------------------------------------------------------------
+
+ bool reserve(uint64_t addr, uint64_t size) {
+     return VirtualAlloc(reinterpret_cast<void*>(addr), size, MEM_RESERVE, PAGE_NOACCESS) != nullptr;
+ }
+
+ bool commit(uint64_t addr, uint64_t size) {
+@@ -285,88 +289,161 @@
+     if (key(VK_SHIFT)) p.buttons |= kB;
+     if (key('J')) p.buttons |= kX;
+     if (key('K')) p.buttons |= kY;
+     if (key('Q')) p.buttons |= kL;
+     if (key('E')) p.buttons |= kR;
+     if (key('Z')) p.buttons |= kZL;
+     if (key('C')) p.buttons |= kZR;
+     if (key(VK_RETURN)) p.buttons |= kPlus;
+     if (key(VK_ESCAPE)) p.buttons |= kMinus;
+     input_script(p);  // NX_INPUT_SCRIPT (input_script.cpp): unattended runs
+ }
+
+ // ---- audio: XAudio2 -------------------------------------------------------------------------------------------
+
+ namespace {
+
+ std::atomic<uint32_t> g_queued{0};
+ AudioDone g_done = nullptr;
++IXAudio2SourceVoice* g_voice = nullptr;
++#if defined(NX_ASTRAL_STRICT)
++using HostPacket = audio_completion::Packet;
++audio_completion::Queue g_completed;
++#else
++using HostPacket = std::pair<void*, std::vector<uint8_t>>;
++#endif
+
+ struct Voice : IXAudio2VoiceCallback {
+     void STDMETHODCALLTYPE OnBufferEnd(void* ctx) noexcept override {
+-        auto* p = static_cast<std::pair<void*, std::vector<uint8_t>>*>(ctx);
++#if defined(NX_ASTRAL_STRICT)
++        const uint64_t begin = audio_probe::enabled ? monotonic_ns() : 0;
++#endif
++        auto* p = static_cast<HostPacket*>(ctx);
++#if defined(NX_ASTRAL_STRICT)
++        g_completed.push(p);
++#else
+         g_queued--;
+         g_done(p->first);
+         delete p;
+-    }
+-    void STDMETHODCALLTYPE OnVoiceProcessingPassStart(UINT32) noexcept override {}
++#endif
++#if defined(NX_ASTRAL_STRICT)
++        if (begin) audio_probe::completion(monotonic_ns() - begin, begin);
++#endif
++    }
++    void STDMETHODCALLTYPE OnVoiceProcessingPassStart(UINT32 bytes_required) noexcept override {
++#if defined(NX_ASTRAL_STRICT)
++        // XAudio2's default processing quantum is 10 ms (480 frames at 48 kHz).
++        // BytesRequired is the deficit at pass entry, not a count of acoustic zero samples.
++        if (!audio_probe::enabled) return;
++        const uint64_t now = monotonic_ns();
++        audio_probe::callback(480, uint64_t(bytes_required) / 4, now);
++        XAUDIO2_VOICE_STATE state{};
++        g_voice->GetState(&state);
++        audio_probe::position(state.SamplesPlayed, now);
++#endif
++    }
+     void STDMETHODCALLTYPE OnVoiceProcessingPassEnd() noexcept override {}
+     void STDMETHODCALLTYPE OnStreamEnd() noexcept override {}
+     void STDMETHODCALLTYPE OnBufferStart(void*) noexcept override {}
+     void STDMETHODCALLTYPE OnLoopEnd(void*) noexcept override {}
+     void STDMETHODCALLTYPE OnVoiceError(void*, HRESULT) noexcept override {}
+ };
+
+ IXAudio2* g_xa = nullptr;
+-IXAudio2SourceVoice* g_voice = nullptr;
+ Voice g_callback;
+
+ }  // namespace
+
+ bool audio_open(AudioDone done) {
+     g_done = done;
+     // Headless test runs (and NX_MUTE=1) are silent: no device, the callers pace themselves with a timer.
+     if (headless() || std::getenv("NX_MUTE")) return false;
++#if defined(NX_ASTRAL_STRICT)
++    const char* probe_path = std::getenv("NX_AUDIO_DUMP");
++    audio_probe::enabled = probe_path && *probe_path;
++    audio_probe::backend = "xaudio2_processing_pass";
++#endif
+     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+     if (FAILED(XAudio2Create(&g_xa, 0, XAUDIO2_DEFAULT_PROCESSOR))) return false;
+     IXAudio2MasteringVoice* master = nullptr;
+     if (FAILED(g_xa->CreateMasteringVoice(&master))) return false;
+     WAVEFORMATEX wf{};
+     wf.wFormatTag = WAVE_FORMAT_PCM;
+     wf.nChannels = 2;
+     wf.nSamplesPerSec = 48000;
+     wf.wBitsPerSample = 16;
+     wf.nBlockAlign = 4;
+     wf.nAvgBytesPerSec = 48000 * 4;
+     if (FAILED(g_xa->CreateSourceVoice(&g_voice, &wf, 0, 2.0f, &g_callback))) return false;
++#if defined(NX_ASTRAL_STRICT)
++    // The platform has process-lifetime audio ownership (no close/reopen API).
++    // Never acquire guest locks or free host PCM from XAudio2's engine thread.
++    std::thread([] {
++        for (;;) {
++            auto* packet = g_completed.take();
++            if (!packet) { Sleep(1); continue; }
++            while (packet) {
++                auto* next = packet->next;
++                const uint64_t begin = audio_probe::enabled ? monotonic_ns() : 0;
++                void* context = packet->first;
++                delete packet;
++                // Release queue capacity before g_done wakes the producer, as the
++                // original callback did. The host PCM copy has already been freed.
++                g_queued--;
++                g_done(context);
++                if (begin) {
++                    const uint64_t elapsed = monotonic_ns() - begin;
++                    if (elapsed > audio_probe::max_release_ns.load(std::memory_order_relaxed))
++                        audio_probe::max_release_ns.store(elapsed, std::memory_order_relaxed);
++                }
++                packet = next;
++            }
++        }
++    }).detach();
++#endif
+     g_voice->Start();
+     return true;
+ }
+
+ bool audio_submit(const void* data, size_t bytes, void* ctx) {
+     if (!g_voice) return false;
+-    auto* p = new std::pair<void*, std::vector<uint8_t>>(
++    auto* p = new HostPacket(
+         ctx, std::vector<uint8_t>(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + bytes));
+     XAUDIO2_BUFFER xb{};
+     xb.AudioBytes = UINT32(bytes);
+     xb.pAudioData = p->second.data();
+     xb.pContext = p;
+     g_queued++;
++#if defined(NX_ASTRAL_STRICT)
++    if (FAILED(g_voice->SubmitSourceBuffer(&xb))) {
++        audio_probe::submit_failures.fetch_add(1, std::memory_order_relaxed);
++        // No OnBufferEnd will arrive for a rejected buffer. Roll back ownership so the
++        // AudioOut player can timer-pace/release it, rather than filling a phantom queue.
++        g_queued--;
++        delete p;
++        return false;
++    }
++#else
+     g_voice->SubmitSourceBuffer(&xb);
++#endif
++#if defined(NX_ASTRAL_STRICT)
++    audio_probe::submitted_frames.fetch_add(bytes / 4, std::memory_order_relaxed);
++    audio_probe::submitted.store(true, std::memory_order_relaxed);
++#endif
+     return true;
+ }
+
+ uint32_t audio_queued() { return g_queued; }
+
+ // ---- Vulkan ---------------------------------------------------------------------------------------------------
+
+ void* vulkan_get_instance_proc_addr() {
+     HMODULE m = LoadLibraryW(L"vulkan-1.dll");
+     return m ? reinterpret_cast<void*>(GetProcAddress(m, "vkGetInstanceProcAddr")) : nullptr;
+ }
+
+ const char* vulkan_surface_extension() { return VK_KHR_WIN32_SURFACE_EXTENSION_NAME; }
+
+ int vulkan_create_surface(void* instance, void* native_window, uint64_t* surface, void* gipa) {
+     auto create = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
+         reinterpret_cast<PFN_vkGetInstanceProcAddr>(gipa)(static_cast<VkInstance>(instance), "vkCreateWin32SurfaceKHR"));
+     VkWin32SurfaceCreateInfoKHR ci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+diff --git a/runtime/src/audio_probe.h b/runtime/src/audio_probe.h
+--- a/runtime/src/audio_probe.h
++++ b/runtime/src/audio_probe.h
+@@ -7,6 +7,9 @@
+ struct Event {
+     uint64_t frame, monotonic_ns, missing_frames, underrun_callbacks, late_ns;
+     bool startup;
++    uint64_t played_frame = 0;
++    bool device_position = false;
++    uint64_t completion_ns = 0;
+ };
+ inline constexpr unsigned kCapacity = 1024;
+ inline Event events[kCapacity];
+@@ -14,6 +17,14 @@
+ inline std::atomic<uint64_t> callbacks{0}, requested{0}, underruns{0}, missing{0}, lost{0};
+ inline std::atomic<uint64_t> late_callbacks{0};
+ inline std::atomic<bool> submitted{false};
++inline std::atomic<uint64_t> submitted_frames{0}, submit_failures{0};
++inline std::atomic<uint64_t> completed_buffers{0}, max_completion_ns{0}, max_release_ns{0};
++inline std::atomic<uint64_t> max_release_lock_ns{0}, max_release_event_ns{0};
++inline void maximum(std::atomic<uint64_t>& counter, uint64_t value) {
++    uint64_t old = counter.load(std::memory_order_relaxed);
++    while (value > old && !counter.compare_exchange_weak(old, value, std::memory_order_relaxed)) {}
++}
++inline const char* backend = "sdl_callback";
+ inline bool enabled = false;  // set before the device is resumed
+ inline uint64_t previous_ns = 0, previous_frames = 0;
+ inline uint64_t cursor = 0;  // callback thread only
+@@ -43,6 +54,30 @@
+     }
+     cursor += frames;
+ }
++// XAudio2 callback-thread sample cursor; consumed samples, before endpoint latency.
++inline void position(uint64_t played_frame, uint64_t now) {
++    if (!enabled) return;
++    unsigned h = head.load(std::memory_order_relaxed), next = (h + 1) % kCapacity;
++    if (next == tail.load(std::memory_order_acquire)) lost.fetch_add(1, std::memory_order_relaxed);
++    else {
++        events[h] = {cursor, now, 0, 0, 0, false, played_frame, true};
++        head.store(next, std::memory_order_release);
++    }
++}
++// Measure the existing completion handler separately from processing-pass scheduling.
++inline void completion(uint64_t duration, uint64_t begin) {
++    if (!enabled) return;
++    completed_buffers.fetch_add(1, std::memory_order_relaxed);
++    if (duration > max_completion_ns.load(std::memory_order_relaxed))
++        max_completion_ns.store(duration, std::memory_order_relaxed);  // callback thread only
++    if (duration <= 1000000) return;
++    unsigned h = head.load(std::memory_order_relaxed), next = (h + 1) % kCapacity;
++    if (next == tail.load(std::memory_order_acquire)) lost.fetch_add(1, std::memory_order_relaxed);
++    else {
++        events[h] = {cursor, begin, 0, 0, 0, false, 0, false, duration};
++        head.store(next, std::memory_order_release);
++    }
++}
+ inline bool pop(Event& event) {
+     unsigned t = tail.load(std::memory_order_relaxed);
+     if (t == head.load(std::memory_order_acquire)) return false;
+diff --git a/runtime/src/audio_completion.h b/runtime/src/audio_completion.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/audio_completion.h
+@@ -0,0 +1,37 @@
++#pragma once
++#include <atomic>
++#include <cstdint>
++#include <utility>
++#include <vector>
++
++namespace nx::audio_completion {
++struct Packet : std::pair<void*, std::vector<uint8_t>> {
++    using std::pair<void*, std::vector<uint8_t>>::pair;
++    Packet* next = nullptr;
++};
++// One device producer, one release worker. Packets own their queue link: publishing
++// completion neither allocates nor takes a guest/heap lock. Outstanding packets
++// remain included in audio_queued() until the worker frees their host PCM, bounding the
++// backlog by the caller's existing submission limit even if guest release blocks.
++class Queue {
++    std::atomic<Packet*> head_{nullptr};
++public:
++    static_assert(std::atomic<Packet*>::is_always_lock_free);
++    void push(Packet* packet) noexcept {
++        packet->next = head_.load(std::memory_order_relaxed);
++        while (!head_.compare_exchange_weak(packet->next, packet,
++                    std::memory_order_release, std::memory_order_relaxed)) {}
++    }
++    Packet* take() noexcept {
++        Packet* list = head_.exchange(nullptr, std::memory_order_acquire);
++        Packet* ordered = nullptr;
++        while (list) {
++            Packet* next = list->next;
++            list->next = ordered;
++            ordered = list;
++            list = next;
++        }
++        return ordered;
++    }
++};
++}  // namespace nx::audio_completion
+diff --git a/runtime/src/nvn/nvn_debug.cpp b/runtime/src/nvn/nvn_debug.cpp
+--- a/runtime/src/nvn/nvn_debug.cpp
++++ b/runtime/src/nvn/nvn_debug.cpp
+@@ -312,6 +312,9 @@
+ }
+
+ void frame_dump_write(const GpuImage& img, uint64_t frame) {
++#if defined(NX_ASTRAL_STRICT)
++    const uint64_t readback_ns = plat::monotonic_ns();
++#endif
+     void* p = nullptr;
+     if (p_vkMapMemory(vk_device(), g_readback.memory, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) return;
+ #if defined(NX_ASTRAL_STRICT)
+@@ -337,6 +340,14 @@
+             std::fwrite(row.data(), 1, row.size(), f);
+         }
+         std::fclose(f);
++#if defined(NX_ASTRAL_STRICT)
++        // Same monotonic domain as NX_AUDIO_DUMP; fence/readback readiness, not scanout time.
++        if (FILE* timing = plat::fopen_utf8(dir + "/timing.jsonl", "ab")) {
++            std::fprintf(timing, "{\"frame\":%llu,\"readback_ready_ns\":%llu}\n",
++                         (unsigned long long)frame, (unsigned long long)readback_ns);
++            std::fclose(timing);
++        }
++#endif
+     }
+     p_vkUnmapMemory(vk_device(), g_readback.memory);
+ }

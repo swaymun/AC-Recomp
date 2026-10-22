@@ -1,0 +1,326 @@
+# Astral Windows x64: changed-word SIMD, launcher gamepad lifetime and opt-in timing telemetry.
+# Apply after the full Windows series; no game data. See docs/ASTRAL_WINDOWS_PERF.md.
+diff --git a/runtime/src/nvn/nvn_written.cpp b/runtime/src/nvn/nvn_written.cpp
+--- a/runtime/src/nvn/nvn_written.cpp
++++ b/runtime/src/nvn/nvn_written.cpp
+@@ -1,49 +1,53 @@
+ #if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
+ #include "nvn_retire.h"
+ #endif
+ // Compute results within a submit (docs/nvn/GLITCH-PLAN.md G5). A storage buffer a compute shader writes is a copy in
+ // the upload buffer, written back to guest memory once the submit completed. Each binding used to get a copy of its
+ // own: later draws and dispatches of the submit read the guest bytes from before the dispatch, two dispatches writing
+ // one buffer overwrote each other at write-back, and indirect dispatch arguments were read before the GPU wrote them.
+ // Here the submit keeps one copy per written guest range (the ranges are disjoint, keyed by host address). Writers and
+ // readers of a range bind that copy; ranges that meet are merged into a new copy on the GPU (vkCmdCopyBuffer, so in
+ // command order); each range is written back once. NX_COMPUTE_SEPARATE=1: the previous behaviour.
+ #include <algorithm>
+ #include <cstdlib>
+ #include <cstring>
+ #include <iterator>
+ #include <map>
+ #include <string>
+ #include <vector>
++
++#if defined(NX_ASTRAL_STRICT) && defined(_WIN32) && defined(_M_X64)
++#include <immintrin.h>
++#endif
+
+ #include "nvn_draw_state.h"
+
+ namespace nx::nvn::replay {
+
+ using namespace nx::vk;
+
+ namespace {
+
+ constexpr uint64_t kAlign = 256;          // the largest buffer offset alignment Vulkan allows (all descriptor kinds)
+ constexpr uint64_t kTail = 0x10000 + 16;  // zeros after a range: storage bindings are padded to 64 KB (nvn_draw.cpp)
+
+ struct Region {
+     uint64_t size = 0;  // guest bytes from the key
+     uint64_t cap = 0;   // bytes of the copy from up.offset (size, then zeros)
+     Upload up;          // the copy of the key's first byte
+     std::shared_ptr<std::vector<uint8_t>> before;  // the guest bytes copied in (what the GPU did not change)
+ };
+ using Regions = std::map<const uint8_t*, Region>;
+ using It = Regions::iterator;
+ Regions g_regions;
+ bool g_read = false;  // a copy was bound for reading since the last write_after_read
+ uint64_t g_binds = 0;  // written_bind calls, ever (nvn_frames.cpp: did a dispatch write storage after the split)
+ uint64_t g_shared = 0, g_merged = 0, g_composed = 0, g_indirect = 0;  // for written_log
+
+ // The regions overlapping [p, p + size), in address order.
+ std::vector<It> overlapping(const uint8_t* p, uint64_t size) {
+     std::vector<It> v;
+     It it = g_regions.upper_bound(p);
+     if (it != g_regions.begin() && std::prev(it)->first + std::prev(it)->second.size > p) v.push_back(std::prev(it));
+     for (; it != g_regions.end() && it->first < p + size; ++it) v.push_back(it);
+     return v;
+@@ -289,42 +293,58 @@
+     v.reserve(g_regions.size());
+     for (auto& [p, r] : g_regions) v.push_back({r.up.ptr, const_cast<uint8_t*>(p), r.size, r.before});
+     g_regions.clear();
+     return v;
+ }
+
+ void written_reset() { g_regions.clear(), g_read = false; }
+
+ void written_log() {
+     if (g_shared + g_merged + g_composed + g_indirect)
+         log("nvn: compute ranges: %llu bindings of written copies, %llu merged, %llu reads composed on the GPU, %llu indirect",
+             (unsigned long long)g_shared, (unsigned long long)g_merged, (unsigned long long)g_composed,
+             (unsigned long long)g_indirect);
+     g_shared = g_merged = g_composed = g_indirect = 0;
+ }
+
+ }  // namespace nx::nvn::replay
+
+ namespace nx::nvn {
+
+ // A bound storage range is often larger than what the shader writes, and the game's recording thread writes the
+ // rest of those buffers while the submit is replayed. Copying the whole range back put stale bytes over them: meshes
+ // exploded into beams and a band of stretched triangles at the horizon, for the rest of the run (DEBUG.md #56). Only
+ // the words the GPU changed go back. NX_WRITE_BACK_WHOLE=1: the old whole-range copy.
+ void apply_write_back(const WriteBack& w) {
+     static const bool whole = std::getenv("NX_WRITE_BACK_WHOLE") != nullptr;
+     if (whole || !w.before || w.before->size() < w.size) {
+         std::memcpy(w.to, w.from, w.size);
+         return;
+     }
+     const uint8_t* was = w.before->data();
+     uint64_t k = 0;
++#if defined(NX_ASTRAL_STRICT) && defined(_WIN32) && defined(_M_X64)
++    // Windows already requires AVX2. Compare eight words at once, then store only changed lanes: copying an
++    // unchanged word would overwrite concurrent guest writes (DEBUG.md #56). Unaligned buffers are valid here.
++    // Keep the scalar path for same-binary A/B profiling and driver/CPU regression diagnosis.
++    static const bool scalar = std::getenv("NX_WIN_SCALAR_WRITEBACK") != nullptr;
++    if (!scalar) {
++        for (; k + 32 <= w.size; k += 32) {
++            const __m256i now = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w.from + k));
++            const __m256i before = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(was + k));
++            const __m256i equal = _mm256_cmpeq_epi32(now, before);
++            if (unsigned(_mm256_movemask_epi8(equal)) == 0xffffffffu) continue;
++            _mm256_maskstore_epi32(reinterpret_cast<int*>(w.to + k),
++                                  _mm256_xor_si256(equal, _mm256_set1_epi32(-1)), now);
++        }
++    }
++#endif
+     for (; k + 8 <= w.size; k += 8) {
+         if (std::memcmp(w.from + k, was + k, 8) == 0) continue;
+         for (uint64_t b = k; b < k + 8; b += 4)
+             if (std::memcmp(w.from + b, was + b, 4) != 0) std::memcpy(w.to + b, w.from + b, 4);
+     }
+     for (; k < w.size; k++)
+         if (w.from[k] != was[k]) w.to[k] = w.from[k];
+ }
+
+ }  // namespace nx::nvn
+diff --git a/runtime/src/frame_stats.cpp b/runtime/src/frame_stats.cpp
+--- a/runtime/src/frame_stats.cpp
++++ b/runtime/src/frame_stats.cpp
+@@ -1,60 +1,68 @@
+ // Where a frame's threads run, and how evenly frames reach the display (docs/nvn/android-perf/PLAN.md, phase 0 and
+ // R2). Every 600 ticks each frame thread logs which kind of core it was found on (Android: clusters by their highest
+ // clock, little/mid/prime on a Snapdragon 8 Gen 2) and how much of the wall clock it spent on a CPU; the presenting
+ // thread also logs a histogram of the intervals between presents and the thermal headroom.
+ //
+ // NX_AFFINITY (Android): 1 puts the thread that replays and presents on the fastest cluster and the game's main
+ // thread on the middle ones; 2 puts both on everything but the slowest cluster. Re-applied every 60 ticks (Android
+ // moves an app's threads between cpusets). Unset or 0: the scheduler decides, as before.
+ #include <algorithm>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <ctime>
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++#include <windows.h>
++#endif
+ #if !defined(_WIN32)
+ #include <sys/resource.h>
+ #endif
+ #include <string>
+ #include <vector>
+
+ #include "platform.h"
+
+ #if defined(__linux__) && !defined(__ANDROID__)
+ #include <fcntl.h>
+ #include <spawn.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+ extern char** environ;
+ #endif
+ #if defined(__ANDROID__)
+ #include <dlfcn.h>
+ #include <sched.h>
+ #include <unistd.h>
+ #endif
+
+ #include <nx/runtime.h>
+
+ namespace nx::plat {
+
+ namespace {
+
+ uint64_t thread_cpu_ns() {
+-#if defined(CLOCK_THREAD_CPUTIME_ID)
++#if defined(_WIN32) && defined(NX_ASTRAL_STRICT)
++    FILETIME created{}, exited{}, kernel{}, user{};
++    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return 0;
++    auto ticks = [](const FILETIME& t) { return (uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
++    return (ticks(kernel) + ticks(user)) * 100;  // FILETIME's 100 ns units, not wall time
++#elif defined(CLOCK_THREAD_CPUTIME_ID)
+     timespec ts{};
+     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+     return uint64_t(ts.tv_sec) * 1'000'000'000ull + uint64_t(ts.tv_nsec);
+ #else
+     return 0;
+ #endif
+ }
+
+ #if defined(__ANDROID__)
+ // Cluster of each CPU, 0 = slowest, from cpufreq's highest clock.
+ struct Cpus {
+     std::vector<int> cluster;
+     int clusters = 0;
+ };
+
+ const Cpus& cpus() {
+     static const Cpus c = [] {
+         Cpus x;
+@@ -218,34 +226,34 @@
+         "thermal headroom %.2f",
+         r.name, (long long)current_thread_id(), (unsigned long long)r.on[0], (unsigned long long)r.on[1],
+         (unsigned long long)r.on[2], (unsigned long long)r.on[3], busy, double(thermal_headroom()));
+ #else
+     log("threads: %s (tid %lld) on a CPU %.0f%% of the time", r.name, (long long)current_thread_id(), busy);
+ #endif
+     for (auto& o : r.on) o = 0;
+     r.wall_from = now, r.cpu_from = cpu_ns;
+ }
+
+ void frame_presented() {
+     frame_thread_tick(0);
+     static uint64_t last = 0, n = 0, bins[7] = {};
+     uint64_t now = monotonic_ns();
+     if (last) {
+         double ms = double(now - last) / 1e6;
+         bins[ms < 14 ? 0 : ms < 19 ? 1 : ms < 25 ? 2 : ms < 31 ? 3 : ms < 36 ? 4 : ms < 50 ? 5 : 6]++;
+     }
+-#if defined(NX_ASTRAL_STRICT) && defined(__APPLE__)
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32))
+     if (std::getenv("NX_FRAME_LOG"))
+         log("shader-cache frame index=%llu ts_ns=%llu interval_ms=%.6f", (unsigned long long)n,
+             (unsigned long long)now, last ? double(now - last) / 1e6 : 0.0);
+ #endif
+     last = now;
+     if (++n % 600) return;
+     log("present intervals over 600: <14 ms %llu, 14-19 %llu, 19-25 %llu, 25-31 %llu, 31-36 %llu, 36-50 %llu, "
+         "more %llu",
+         (unsigned long long)bins[0], (unsigned long long)bins[1], (unsigned long long)bins[2],
+         (unsigned long long)bins[3], (unsigned long long)bins[4], (unsigned long long)bins[5],
+         (unsigned long long)bins[6]);
+     for (auto& b : bins) b = 0;
+ }
+
+ }  // namespace nx::plat
+diff --git a/runtime/src/nvn/nvn_vk.cpp b/runtime/src/nvn/nvn_vk.cpp
+--- a/runtime/src/nvn/nvn_vk.cpp
++++ b/runtime/src/nvn/nvn_vk.cpp
+@@ -607,37 +607,37 @@
+     g_timing.upload_bytes += async ? frame_upload_used() : g_upload_used;
+     gpu_profile_mark(g_cb, "end");
+     if (async)  // the profile, zero-draw queries and snapshots read this submit's results right below: waited for
+         frame_submit(VK_NULL_HANDLE, VK_NULL_HANDLE, draw_take_write_backs(),
+                      gpu_profile_on() || zero_draws_on() || debug_snapshots_pending());
+     else
+         end_and_wait(VK_NULL_HANDLE, VK_NULL_HANDLE);
+     draw_end_submit();  // not waited for: snapshots only (the write-backs went with the submit)
+     gpu_profile_collect(), zero_draws_collect();
+     debug_dump_requested(draw_take_dump_request());  // reads back in a submit of its own, which it waits for
+     const FrameTimes f2 = frame_times();
+     g_timing.encode_ns += f2.encode_ns - f_in.encode_ns, g_timing.fence_ns += f2.fence_ns - f_in.fence_ns;
+     g_timing.submit_ns += plat::monotonic_ns() - t_in;
+ }
+
+ // Headless: the presented texture is only counted, logged and dumped (no swapchain). Nothing is submitted unless a
+ // frame dump is due: the empty submit was a Metal command buffer and a fence wait per frame.
+ void present_headless(uint64_t texture) {
+-#if defined(NX_ASTRAL_STRICT) && defined(__APPLE__)
++#if defined(NX_ASTRAL_STRICT) && (defined(__APPLE__) || defined(_WIN32))
+     // Headless has no vkQueuePresentKHR path, but measurements still need every interval.
+     if (std::getenv("NX_FRAME_LOG")) plat::frame_presented();
+ #endif
+     GpuImage* src = image_of(texture);  // made here if new, as before (the targets rendered into it share it, #44)
+     static uint64_t presents = 0;
+     presents++;
+ #if defined(NX_ASTRAL_STRICT)
+     hud::on_present(src ? src->width : 0, src ? src->height : 0, 0, 0);  // NX_PERF_HUD: dumped frames show it
+ #endif
+     if (presents % (presents < 300 ? 60 : 300) == 0) draw_log_stats();
+     if (presents % 60 == 0) log_timing(60), gpu_profile_log(60);
+     if (presents % 300 == 0) zero_draws_log();
+     // NX_PRESENT_TEST_ALL=1 (with NX_PRESENT_TEST): the present pass runs for every frame, and its submit is timed.
+     static const bool every = std::getenv("NX_PRESENT_TEST_ALL") != nullptr;
+     bool due = frame_dump_due(presents);
+     if (!due && !every) return;
+     static uint64_t timed_ns = 0, timed = 0;
+     const uint64_t t0 = plat::monotonic_ns();
+diff --git a/runtime/src/platform_win.cpp b/runtime/src/platform_win.cpp
+--- a/runtime/src/platform_win.cpp
++++ b/runtime/src/platform_win.cpp
+@@ -639,43 +639,53 @@
+
+ }  // namespace
+
+ // NX_THROW_TRACE=1: log the host call stack of every C++ throw that is not a guest longjmp (first chance).
+ LONG WINAPI throw_tracer(EXCEPTION_POINTERS* e) {
+     if (e->ExceptionRecord->ExceptionCode != 0xE06D7363) return EXCEPTION_CONTINUE_SEARCH;
+     void* frames[24];
+     USHORT n = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
+     std::string s = "C++ throw, host stack:";
+     for (USHORT k = 0; k < n; k++) {
+         char b[32];
+         std::snprintf(b, sizeof b, " %llx", (unsigned long long)exe_va(frames[k]));
+         s += b;
+     }
+     nx::log("%s", s.c_str());
+     return EXCEPTION_CONTINUE_SEARCH;
+ }
+
++#if defined(NX_ASTRAL_STRICT)
++// The launcher uses SDL gamepads; gameplay polls XInput directly. Leaving SDL's independent joystick worker
++// alive can spin on its mutex on Windows (WIN-PERF-020), wasting a whole core. Video stays initialized for key
++// mapping. Keep the old lifetime only for same-binary diagnosis; setting the presence flag to 0 also keeps it.
++static void quit_launcher_gamepads() {
++    if (!std::getenv("NX_WIN_KEEP_SDL_GAMEPAD")) SDL_QuitSubSystem(SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK);
++}
++#endif
++
+ int main() {
+ #if defined(NX_ASTRAL_STRICT)
+     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+         nx::log("launcher: SDL init failed: %s", SDL_GetError());
+         return 1;
+     }
+     if (!nx::launcher::start()) { SDL_Quit(); return 0; }
++    quit_launcher_gamepads();
+ #endif
+     nx::plat::start_memory_guard();  // before anything can grow: a leak must never freeze the machine (memguard_win.cpp)
+     SetUnhandledExceptionFilter(crash_handler);
+     if (const char* t = std::getenv("NX_THROW_TRACE"); t && *t == '1') AddVectoredExceptionHandler(1, throw_tracer);
+     if (const char* w = std::getenv("NX_WATCH")) {
+         g_watch = std::strtoull(w, nullptr, 16);
+         AddVectoredExceptionHandler(1, watch_handler);
+         arm_watch(GetCurrentThread());
+         nx::log("watching writes to %llx", (unsigned long long)g_watch);
+     }
+     try {
+         nx::boot();
+     } catch (const nx::LongJmp& j) {
+         nx::fatal("longjmp to buffer %llx with no setjmp frame", (unsigned long long)j.buf);
+     } catch (const std::exception& e) {
+         nx::fatal("host exception: %s", e.what());
+     }
+     return 0;

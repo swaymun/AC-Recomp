@@ -1,13 +1,77 @@
-# Building AC-Recomp from your own game files (macOS)
+# Building AC-Recomp from your own game files (macOS and Windows x64)
 
 AC-Recomp releases contain **none of Astral Chain's code or data**. A release is a set of tools, runtime patches,
 launcher art and documentation. You supply your own legally dumped game and keys, and `tools/acr_build.py`
-recompiles the game on your Mac. Everything it produces is derived from your dump: keep it to yourself.
+recompiles the game on your Mac or Windows PC. Everything it produces is derived from your dump: keep it to yourself.
 
 This works like [LASRecomp](https://github.com/peiikai/LASRecomp)'s "bring your own game files" setup, except that
 the game's code is lifted and compiled locally instead of being shipped.
 
-## What you need
+## Windows x64: build locally from your dump
+
+Windows imports your own Astral Chain 1.0.0 NSP and extracts verified control metadata locally.
+No Mac is required. Supply your console's `prod.keys` (and `title.keys` when needed) from a private
+folder on this PC. Only the native importer reads their contents; the tools never print, copy or
+upload keys. Imported game files and generated code remain private beneath `--out`.
+Use an output folder with access restricted to your Windows account: Windows inherits its ACLs
+from that folder; POSIX permission bits do not establish a private Windows ACL.
+
+The guided [Windows setup](../ports/windows/README.md) asks for these paths and checks prerequisites.
+It enables Python UTF-8 mode and decodes build output as UTF-8 automatically, including on
+Windows accounts whose default text encoding is cp1252; no encoding environment variables need setting.
+For a command-line build, use the instructions below. Keep the kit in a permanent folder and prefer
+a short build path (for example `C:\ACR\player`): native import supports Unicode and long paths,
+but Git, the compiler and later dependency tools can impose their own path limits.
+
+Install Python 3.11+, Git for Windows, and Visual Studio 2022 Build Tools with the C++ workload, Windows SDK,
+and **C++ Clang tools for Windows** (clang-cl). CMake and Ninja bundled with VS are discovered automatically via
+`vswhere` and `VsDevCmd.bat`; a developer prompt is unnecessary. Install a Vulkan 1.3+ graphics driver.
+The build fetches the pinned Vulkan-Headers and builds static libopus 1.5.2 at commit
+`ddbe48383984d56acd9e1ab6a090c54ca6b735a6` with clang-cl and intrinsics disabled. Dependencies stay inside `--out`.
+
+From PowerShell (the input paths below are examples):
+
+```powershell
+python tools/acr_build.py --nsp "C:\Games\Astral Chain.nsp" `
+  --keys C:\Private\prod.keys --title-keys C:\Private\title.keys `
+  --fonts C:\Private\shared-fonts --out C:\acr\player --jobs 4
+C:\acr\player\run-ac-recomp.cmd
+```
+
+`--title-keys` and `--fonts` are optional. `--to-stage control` checks import and control metadata
+without lifting or compiling the game. Rerun the same command without it to continue.
+
+An existing private import can still be reused with `--import-dir C:\acr\data
+--control-receipt C:\acr\control-receipt.json`, instead of `--nsp`/`--keys`/`--title-keys`.
+Copy only `exefs`, `analysis`, and `extract` from the original import and its `work/control/receipt.json`;
+keep their layout beneath one input directory. The receipt's application/program IDs and NPDM hash
+are checked against those files. This continuation trusts the original import's provenance audit;
+it does not independently decrypt the NSP. Module, flat-image and receipt hashes invalidate its cache
+when changed. Keep that input directory in place: the data root uses directory junctions to it.
+Saves always live in the output's own `data/user`.
+
+`--spirv-dir` reuses privately translated shaders from an earlier build's `data/spirv` and records their digest.
+Without it, the same .NET shader harness runs natively; install the .NET 10 SDK, SPIRV-Tools (`spirv-val`), and
+`zstd.dll` discoverable on PATH first. `--no-shader-validation` disables only the SPIR-V validator.
+`--fonts` accepts the same six fonts as macOS; omitting it uses the replacement fonts described below.
+
+The command runs every stage natively, including import, control metadata, both lifts and compilation. It applies
+`runtime/patches/series.windows`, writes `astral.exe`, `astral-60fps.exe`, `assets/launcher`,
+`run-ac-recomp.cmd` and `run-ac-recomp.ps1` under `--out`, and mirrors the macOS data layout. The Windows runtime
+currently starts the game directly; copying launcher art does not add the macOS SDL launcher UI.
+`NX_FPS=60` (PowerShell: `$env:NX_FPS='60'`) or `fps = 60` in `data/settings.ini` selects the second executable.
+`--fps 30` or `--fps 60` builds only the selected rate as `astral.exe`. `--render-res` applies before lifting
+on Windows too. Because the Windows runtime's reviewed CMake series excludes the shared-object variant target,
+the two rates compile in separate build directories; the macOS optimization remains unchanged.
+
+Compilation runs below normal priority on Windows and uses available physical memory to pick jobs. Under low
+memory, the watchdog terminates only its own compiler process tree and resumes with fewer jobs. All stages
+record wall time in `acr-state.json`; command logs are under `logs`. Rerun the **same command** to resume.
+For a short graphics check, set `NX_HEADLESS=1` and `NX_DUMP_FRAMES=120` before invoking the run script; frames
+are private PPM files in `data/frames`. See [ASTRAL_WINDOWS.md](ASTRAL_WINDOWS.md) for runtime details and the
+manual recipe. Windowed presentation, audible output and controller behavior require separate acceptance.
+
+## What you need on macOS
 
 - A Mac with Apple silicon, macOS 13 or newer, and about **25 GB** of free disk space.
 - Your own **Astral Chain** dump as an **NSP** (cartridge or eShop, base game 1.0.0).
